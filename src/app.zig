@@ -1256,8 +1256,11 @@ pub const App = struct {
             try self.sim.sync(&self.world);
             for (self.sim.feeders.items) |*f| f.food = 20;
         } else if (std.mem.eql(u8, verb, "newzoo")) {
-            self.nz_size = @intFromFloat(try num(it.next()));
-            self.nz_biome = @intFromFloat(try num(it.next()));
+            const size: usize = @intFromFloat(try num(it.next()));
+            const biome: usize = @intFromFloat(try num(it.next()));
+            if (size >= zoo_sizes.len or biome >= zoo_biomes.len) return error.NotFound;
+            self.nz_size = @intCast(size);
+            self.nz_biome = @intCast(biome);
             self.startBlankZoo();
         } else if (std.mem.eql(u8, verb, "pathz")) {
             var lo: f32 = 1e9;
@@ -1275,6 +1278,15 @@ pub const App = struct {
             for (self.sim.agents.items) |*ag| if (ag.is_guest) {
                 ag.needs[0] = 95;
             };
+        } else if (std.mem.eql(u8, verb, "thirsty")) {
+            try self.sim.sync(&self.world);
+            for (self.sim.agents.items) |*ag| if (ag.brain) |*b| {
+                b.needs[6] = 95;
+            };
+        } else if (std.mem.eql(u8, verb, "waterat")) {
+            const x = try num(it.next());
+            const y = try num(it.next());
+            std.debug.print("water depth at {d:.0},{d:.0}: {d:.2} (ground {d:.2})\n", .{ x, y, self.world.terrain.waterDepth(x, y), self.world.terrain.zAt(x, y) });
         } else if (std.mem.eql(u8, verb, "hungry")) {
             try self.sim.sync(&self.world);
             for (self.sim.agents.items) |*ag| if (ag.brain) |*b| {

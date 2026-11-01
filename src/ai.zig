@@ -209,6 +209,9 @@ fn parseBeh(a: std.mem.Allocator, e: *const xml.Element) !Beh {
         } };
     }
     if (eq(n, "BFBehEnter")) return .enter;
+    // Drinking from a bank: the walk there is done; the animal then holds
+    // the pose the data names while it drinks.
+    if (eq(n, "ZTBehDockWater")) return .{ .animate = .{ .anim = e.attr("targetAnim") orelse return .enter, .play_time = 0 } };
     const ignorable = [_][]const u8{ "BFBehAttachObject", "BFBehDetachObject", "BFBehExit", "ZTBehFeedback", "ZTBehViewEvent", "BFBehHeadLook", "BFBehFaceTarget", "BFBehSendToken", "BFBehSetAttribute", "BFBehSendTrigger", "ZTBehMorph", "ZTBehEconomy" };
     for (ignorable) |i| if (eq(n, i)) return .ignore;
     return .unsupported;

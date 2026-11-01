@@ -39,6 +39,9 @@ pub const Terrain = struct {
     stride: usize,
     /// Lakes, rivers and seas (see `WaterBody`).
     water: []const WaterBody = &.{},
+    /// Water surface height at each vertex (negative infinity where dry),
+    /// derived from `water`; empty when the map has no water.
+    wlevel: []const f32 = &.{},
 
     pub fn deinit(self: *Terrain) void {
         self.arena.deinit();
@@ -50,6 +53,27 @@ pub const Terrain = struct {
 
     pub fn spacingY(self: *const Terrain) f32 {
         return self.world_height / @as(f32, @floatFromInt(self.height - 1));
+    }
+
+    /// Rebuilds `wlevel` after `water` or the covered vertices change.
+    pub fn buildWaterLevels(self: *Terrain) !void {
+        const a = self.arena.allocator();
+        const out = try a.alloc(f32, self.z.len);
+        @memset(out, -std.math.inf(f32));
+        for (self.water) |b| for (b.verts) |v| if (v < out.len) {
+            out[v] = @max(out[v], b.level);
+        };
+        self.wlevel = out;
+    }
+
+    /// How deep the water is at a position (0 on dry ground).
+    pub fn waterDepth(self: *const Terrain, x: f32, y: f32) f32 {
+        if (self.wlevel.len == 0) return 0;
+        const ix: u32 = @intFromFloat(std.math.clamp(@round(x / self.spacingX()), 0, @as(f32, @floatFromInt(self.width - 1))));
+        const iy: u32 = @intFromFloat(std.math.clamp(@round(y / self.spacingY()), 0, @as(f32, @floatFromInt(self.height - 1))));
+        const lvl = self.wlevel[iy * self.width + ix];
+        if (!std.math.isFinite(lvl)) return 0;
+        return @max(0, lvl - self.zAt(x, y));
     }
 
     /// The terrain file with the current heights written into it.
@@ -196,7 +220,7 @@ pub fn parse(gpa: std.mem.Allocator, data: []const u8) Error!Terrain {
     const water = try bodies.toOwnedSlice(a);
     // Allocate everything before copying the arena into the result.
     const raw = try a.dupe(u8, data);
-    return .{
+    var result: Terrain = .{
         .arena = arena,
         .width = w,
         .height = h,
@@ -210,6 +234,8 @@ pub fn parse(gpa: std.mem.Allocator, data: []const u8) Error!Terrain {
         .stride = stride,
         .water = water,
     };
+    result.buildWaterLevels() catch return error.OutOfMemory;
+    return result;
 }
 
 /// Biomes a blank map can be painted with (the order of the stock maps).

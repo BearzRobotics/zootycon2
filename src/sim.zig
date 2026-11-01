@@ -65,6 +65,7 @@ const OracleCtx = struct {
     id: u32,
     binder: []const u8,
     pos: [2]f32,
+    world: *const world_mod.World,
 
     fn duration(ctx: *anyopaque, name: []const u8) ?f32 {
         const c: *OracleCtx = @ptrCast(@alignCast(ctx));
@@ -80,6 +81,7 @@ const OracleCtx = struct {
     /// (no fence in between).
     fn findTarget(ctx: *anyopaque, class: []const u8) ?ai.Target {
         const c: *OracleCtx = @ptrCast(@alignCast(ctx));
+        if (std.ascii.eqlIgnoreCase(class, "shore")) return c.sim.findShore(c.world, c.pos);
         var best: ?ai.Target = null;
         var best_d: f32 = 30 * 30;
         for (c.sim.feeders.items) |f| {
@@ -1232,6 +1234,54 @@ pub const Sim = struct {
 
     const Move = enum { moving, arrived, blocked };
 
+    /// Water deeper than this stops animals that cannot swim.
+    const wade_depth: f32 = 1.0;
+
+    /// Whether an animal is at home in water: species whose habitat is
+    /// aquatic (benthic, reef, pelagic, coastal, wetlands biomes).
+    fn swims(ag: *const Agent) bool {
+        const h = ag.habitat orelse return false;
+        for ([_][]const u8{ "benthic", "reef", "pelagic", "coastal", "wetlands" }) |n| {
+            const i = biomeIndex(n) orelse continue;
+            if (h.sens[i] >= 5) return true;
+        }
+        return false;
+    }
+
+    /// The nearest bank an animal can drink from: dry ground next to water
+    /// at most 25 units away with no fence in between. The target is a
+    /// point on the bank a little back from the edge.
+    fn findShore(self: *const Sim, w: *const world_mod.World, from: [2]f32) ?ai.Target {
+        const t = &w.terrain;
+        if (t.wlevel.len == 0) return null;
+        var best: ?ai.Target = null;
+        var best_d: f32 = 25 * 25;
+        var dy: f32 = -24;
+        while (dy <= 24) : (dy += 2) {
+            var dx: f32 = -24;
+            while (dx <= 24) : (dx += 2) {
+                const d2 = dx * dx + dy * dy;
+                if (d2 >= best_d) continue;
+                const px = from[0] + dx;
+                const py = from[1] + dy;
+                if (px < 1 or py < 1 or px > t.world_width - 1 or py > t.world_height - 1) continue;
+                if (t.waterDepth(px, py) > 0.05) continue; // must be dry
+                // Water within two units in some direction.
+                var wet = false;
+                const dirs = [_][2]f32{ .{ 2, 0 }, .{ -2, 0 }, .{ 0, 2 }, .{ 0, -2 }, .{ 1.5, 1.5 }, .{ -1.5, 1.5 }, .{ 1.5, -1.5 }, .{ -1.5, -1.5 } };
+                for (dirs) |o| if (t.waterDepth(px + o[0], py + o[1]) > 0.3) {
+                    wet = true;
+                    break;
+                };
+                if (!wet) continue;
+                if (self.blocked(from, .{ px, py })) continue;
+                best_d = d2;
+                best = .{ .id = 0, .pos = .{ px, py }, .kind = "shore" };
+            }
+        }
+        return best;
+    }
+
     /// Turns towards the agent's target and moves along the heading at
     /// `speed`. Animals stop at fences.
     fn moveToward(self: *Sim, ag: *Agent, w: *const world_mod.World, dt: f32, speed: f32) Move {
@@ -1253,6 +1303,8 @@ pub const Sim = struct {
             const ny = ag.pos[1] + dy / dist * step;
             // Animals cannot walk through fences.
             if (ag.kind == .animal and self.blocked(.{ ag.pos[0], ag.pos[1] }, .{ nx, ny })) return .blocked;
+            // Land animals turn back at deep water.
+            if (ag.kind == .animal and !swims(ag) and w.terrain.waterDepth(nx, ny) > wade_depth and w.terrain.waterDepth(ag.pos[0], ag.pos[1]) <= wade_depth) return .blocked;
             ag.pos[0] = nx;
             ag.pos[1] = ny;
             ag.pos[2] = w.terrain.zAt(ag.pos[0], ag.pos[1]) + ag.ground_offset;
@@ -1273,7 +1325,7 @@ pub const Sim = struct {
     /// Runs an animal's data-driven brain and carries out what it asks for.
     fn thinkAnimal(self: *Sim, ag: *Agent, w: *const world_mod.World, dt: f32) void {
         const h = self.hooks.?;
-        var oc: OracleCtx = .{ .sim = self, .hooks = h, .id = ag.id, .binder = ag.binder, .pos = .{ ag.pos[0], ag.pos[1] } };
+        var oc: OracleCtx = .{ .sim = self, .hooks = h, .id = ag.id, .binder = ag.binder, .pos = .{ ag.pos[0], ag.pos[1] }, .world = w };
         const brain = &ag.brain.?;
         brain.update(dt, .{
             .ctx = &oc,
