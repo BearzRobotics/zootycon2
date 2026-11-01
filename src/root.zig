@@ -7,6 +7,7 @@ pub const config = @import("config.zig");
 pub const xml = @import("xml.zig");
 pub const entity = @import("entity.zig");
 pub const platform = @import("platform.zig");
+pub const nif = @import("nif.zig");
 
 test {
     _ = archive;
@@ -15,4 +16,5 @@ test {
     _ = xml;
     _ = entity;
     _ = platform;
+    _ = nif;
 }

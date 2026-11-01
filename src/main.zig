@@ -18,6 +18,7 @@ const usage =
     \\  entities                    load entity definitions and show statistics
     \\  entity <name>                show an entity's inheritance chain and data
     \\  window [seconds]             open a test window (Esc or close to quit)
+    \\  nifcheck [prefix]           parse every .nif/.kf and report coverage
     \\  xmlcheck [prefix]            parse every .xml and report failures
     \\
 ;
@@ -175,6 +176,56 @@ pub fn main(init: std.process.Init) !void {
                 }
             }
         }
+    } else if (std.mem.eql(u8, cmd, "nifcheck")) {
+        const prefix = if (rest.len > 0) rest[0] else "";
+        var names: std.ArrayList([]const u8) = .empty;
+        defer names.deinit(gpa);
+        const Collect = struct {
+            list: *std.ArrayList([]const u8),
+            gpa: std.mem.Allocator,
+            prefix: []const u8,
+            fn add(c: @This(), name: []const u8) anyerror!void {
+                if (std.mem.startsWith(u8, name, c.prefix) and (std.mem.endsWith(u8, name, ".nif") or std.mem.endsWith(u8, name, ".kf")))
+                    try c.list.append(c.gpa, name);
+            }
+        };
+        try vfs.forEach(Collect{ .list = &names, .gpa = gpa, .prefix = prefix }, Collect.add);
+        var ok: usize = 0;
+        // Failures keyed by "<error> @ <block type>".
+        var failures: std.StringHashMapUnmanaged(usize) = .empty;
+        defer {
+            var kit = failures.keyIterator();
+            while (kit.next()) |k| gpa.free(k.*);
+            failures.deinit(gpa);
+        }
+        var examples: std.StringHashMapUnmanaged([]const u8) = .empty;
+        defer examples.deinit(gpa);
+        var other_err: usize = 0;
+        for (names.items) |n| {
+            const data = try vfs.read(gpa, n);
+            defer gpa.free(data);
+            var diag: zootycon2.nif.Diagnostic = .{};
+            if (rest.len > 1) std.debug.print("{s}\n", .{n});
+            var parsed = zootycon2.nif.parseDiag(gpa, data, &diag) catch |err| {
+                other_err += 1;
+                if (rest.len > 1) std.debug.print("  {s} at block {d} ({s}) offset {d}\n", .{ @errorName(err), diag.block_index, diag.blockType(), diag.block_start });
+                const key = try std.fmt.allocPrint(gpa, "{s} @ {s}", .{ @errorName(err), diag.blockType() });
+                const gop = try failures.getOrPut(gpa, key);
+                if (gop.found_existing) {
+                    gpa.free(key);
+                    gop.value_ptr.* += 1;
+                } else {
+                    gop.value_ptr.* = 1;
+                    try examples.put(gpa, gop.key_ptr.*, n);
+                }
+                continue;
+            };
+            parsed.deinit();
+            ok += 1;
+        }
+        var fit = failures.iterator();
+        while (fit.next()) |e| try out.print("{d:>5}  {s}   e.g. {s}\n", .{ e.value_ptr.*, e.key_ptr.*, examples.get(e.key_ptr.*).? });
+        try out.print("{d} files: {d} parsed, {d} failed\n", .{ names.items.len, ok, other_err });
     } else if (std.mem.eql(u8, cmd, "xmlcheck")) {
         const prefix = if (rest.len > 0) rest[0] else "";
         var names: std.ArrayList([]const u8) = .empty;
