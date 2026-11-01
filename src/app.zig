@@ -28,6 +28,7 @@ const Mat4 = viewer.Mat4;
 // SDL scancodes used by the tools.
 const sc = struct {
     const c: u32 = 6;
+    const g: u32 = 10;
     const p: u32 = 19;
     const r: u32 = 21;
     const x: u32 = 27;
@@ -148,6 +149,7 @@ pub const App = struct {
     day_len: f32 = 480,
 
     synced_rev: u32 = std.math.maxInt(u32),
+    synced_actor_rev: u32 = std.math.maxInt(u32),
     synced_terrain_rev: u32 = std.math.maxInt(u32),
     last_terrain_secs: f32 = -1,
 
@@ -197,6 +199,9 @@ pub const App = struct {
     path_i: usize = 0,
     actor_names: std.ArrayList([]const u8) = .empty,
     actor_i: usize = 0,
+    /// Entity names visitors are made from (adults and children with a model).
+    guest_names: std.ArrayList([]const u8) = .empty,
+    arrivals_on: bool = true,
     catalog_arena: std.heap.ArenaAllocator,
 
     pub fn deinit(self: *App) void {
@@ -208,6 +213,7 @@ pub const App = struct {
         self.fence_kinds.deinit(self.gpa);
         self.path_textures.deinit(self.gpa);
         self.actor_names.deinit(self.gpa);
+        self.guest_names.deinit(self.gpa);
         self.catalog_arena.deinit();
         var it = self.actor_defs.keyIterator();
         while (it.next()) |k| self.gpa.free(k.*);
@@ -294,6 +300,13 @@ pub const App = struct {
             if (is_actor and is_creature) try self.actor_names.append(self.gpa, try ca.dupe(u8, bd.name));
         }
         std.mem.sort([]const u8, self.actor_names.items, {}, lessStr);
+        for (self.actor_names.items) |n| {
+            if (!sim_mod.isGuest(n)) continue;
+            // Only whole-person guest types (not abstract groups) with a model.
+            if (std.mem.indexOf(u8, n, "Adult") == null and std.mem.indexOf(u8, n, "Young") == null) continue;
+            if (self.actorDef(n) != null) try self.guest_names.append(self.gpa, n);
+        }
+        self.sim.guest_binders = self.guest_names.items;
         // Start on a sensible default: the first path texture that is a concrete path.
         for (self.path_textures.items, 0..) |t, i| if (std.mem.indexOf(u8, t, "concrete") != null) {
             self.path_i = i;
@@ -389,8 +402,13 @@ pub const App = struct {
     }
 
     fn syncScene(self: *App, secs: f32) !void {
-        if (self.synced_rev != self.world.revision) {
+        const statics_changed = self.synced_rev != self.world.revision;
+        const actors_changed = self.synced_actor_rev != self.world.actors_revision;
+        if (statics_changed) {
             try self.rebuildStatic();
+            self.synced_rev = self.world.revision;
+        }
+        if (statics_changed or actors_changed) {
             try self.rebuildActors();
             try self.sim.sync(&self.world);
             // Match walking speed to the walk animation so feet do not slide.
@@ -398,7 +416,7 @@ pub const App = struct {
                 const ag = self.sim.agentFor(id) orelse continue;
                 if (self.scene.walkSpeed(i)) |sp| ag.speed = sp * self.actor_scales.items[i];
             }
-            self.synced_rev = self.world.revision;
+            self.synced_actor_rev = self.world.actors_revision;
         }
         if (self.synced_terrain_rev != self.world.terrain_revision and secs - self.last_terrain_secs > 0.1) {
             try self.rebuildTerrain();
@@ -703,6 +721,7 @@ pub const App = struct {
         self.selected = null;
         self.fence_start = null;
         self.synced_rev = std.math.maxInt(u32);
+        self.synced_actor_rev = std.math.maxInt(u32);
         self.synced_terrain_rev = std.math.maxInt(u32);
         self.sim.deinit();
         self.sim = sim_mod.Sim.init(self.gpa, self.opts.seed);
@@ -875,6 +894,8 @@ pub const App = struct {
 
     fn installHooks(self: *App) void {
         self.sim.hooks = .{ .ctx = self, .brain = hookBrain, .anim_len = hookAnimLen };
+        self.sim.guest_binders = self.guest_names.items;
+        self.sim.max_guests = if (self.arrivals_on) 50 else 0;
     }
 
     // ------------------------------------------------------- virtual input
@@ -983,6 +1004,9 @@ pub const App = struct {
                 std.debug.print("agent #{d}: {s} speed={d:.2} state={s} anim={s} brain={}\n", .{ ag.id, @tagName(ag.kind), ag.speed, @tagName(ag.state), ag.anim_name, ag.brain != null });
             }
             std.debug.print("perf: {d:.1} fps ({d} static draws, {d} actor draws)\n", .{ if (ctx.dt > 0) 1.0 / ctx.dt else 0.0, self.scene.draws.items.len, self.scene.actor_draws.items.len });
+            std.debug.print("zoo: guests={d} total={d} left={d} income={d:.0} views={d} happy={d:.0}\n", .{
+                self.sim.liveGuests(), self.sim.zoo.guests_total, self.sim.zoo.guests_left, self.sim.zoo.income, self.sim.zoo.views, self.sim.happiness(),
+            });
             std.debug.print("cam: yaw={d:.3} pitch={d:.3} dist={d:.2} center=({d:.1},{d:.1})\n", .{ ctx.cam.yaw, ctx.cam.pitch, ctx.cam.dist, ctx.cam.center[0], ctx.cam.center[1] });
         } else if (std.mem.eql(u8, verb, "shot")) {
             ctx.shot_request = true;
@@ -1072,6 +1096,11 @@ pub const App = struct {
                     sc.t => {
                         self.tod_auto = !self.tod_auto;
                         self.say("time of day {s}", .{if (self.tod_auto) "running" else "stopped"});
+                    },
+                    sc.g => {
+                        self.arrivals_on = !self.arrivals_on;
+                        self.sim.max_guests = if (self.arrivals_on) 50 else 0;
+                        self.say("guest arrivals {s}", .{if (self.arrivals_on) "on" else "off"});
                     },
                     sc.f2 => self.jumpPhase(-1),
                     sc.f3 => self.jumpPhase(1),
@@ -1383,11 +1412,19 @@ pub const App = struct {
         self.hits.clearRetainingCapacity();
         if (self.opts.tools) try self.drawControls(ui, scale, pad, line);
 
+        // Zoo statistics: guests, takings, how happy they are.
+        const z = &self.sim.zoo;
+        const stats = std.fmt.bufPrint(&buf, "GUESTS {d}   TAKINGS ${d:.0}   VIEWS {d}   HAPPY {d:.0}", .{
+            self.sim.liveGuests(), z.income, z.views, self.sim.happiness(),
+        }) catch "";
+        const stw = viewer.Ui.textWidth(stats, scale);
+        try ui.label(ui.width - stw - pad, pad + line + 2 * scale, scale, stats, white);
+
         // Selection.
         if (self.selected) |sel| {
             const t = std.fmt.bufPrint(&buf, "SELECTED {s} #{d}", .{ @tagName(sel.kind), sel.id }) catch "";
             const w2 = viewer.Ui.textWidth(t, scale);
-            try ui.label(ui.width - w2 - pad, pad + line + 2 * scale, scale, t, yellow);
+            try ui.label(ui.width - w2 - pad, pad + 2 * (line + 2 * scale), scale, t, yellow);
         }
 
         // Key reference.
@@ -1395,7 +1432,7 @@ pub const App = struct {
             const lines = if (self.opts.tools) [_][]const u8{
                 "1 SELECT  2 OBJECT  3 FENCE  4 PATH  5 RAISE  6 LOWER  7 FLATTEN  8 ANIMAL/PERSON",
                 "[ ] CHOOSE (SHIFT: x10)  R ROTATE  Z UNDO  TAB PAUSE  , . SPEED  F5 SAVE  F9 LOAD",
-                "T RUN/STOP CLOCK   F2 F3 PREVIOUS/NEXT TIME OF DAY",
+                "T RUN/STOP CLOCK   F2 F3 PREVIOUS/NEXT TIME OF DAY   G GUEST ARRIVALS",
                 "RIGHT-DRAG ORBIT   WHEEL ZOOM   WASD PAN   F1 HIDE THIS   ESC QUIT",
             } else [_][]const u8{
                 "TAB PAUSE  , . SPEED   T RUN/STOP CLOCK   F2 F3 TIME OF DAY",
@@ -1452,7 +1489,7 @@ pub const App = struct {
         const max_chars = 30;
         const panel_w = (max_chars + 1) * 6 * scale;
         const x = ui.width - panel_w - pad;
-        const top = pad + line * 2.5;
+        const top = pad + line * 4.2;
         var title_buf: [48]u8 = undefined;
         const title = std.fmt.bufPrint(&title_buf, "{s} {d}/{d}", .{ self.tool.label(), cur + 1, n }) catch "";
         try ui.rect(x - 2 * scale, top - 2 * scale, panel_w + 4 * scale, line * @as(f32, @floatFromInt(shown + 1)) + 4 * scale, .{ 0, 0, 0, 0.55 });

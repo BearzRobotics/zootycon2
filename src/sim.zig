@@ -42,10 +42,36 @@ const OracleCtx = struct {
     }
 };
 
+/// What a guest is currently heading for.
+pub const Goal = enum { none, view, wander, leave };
+
+/// Zoo-wide numbers shown to the player.
+pub const Zoo = struct {
+    guests_total: u32 = 0,
+    guests_left: u32 = 0,
+    /// Admission taken so far.
+    income: f64 = 0,
+    /// Times a guest has stopped to watch an animal.
+    views: u32 = 0,
+};
+
 pub const Agent = struct {
     /// Behaviour driven by game data (animals); null uses the built-in
     /// idle/walk loop.
     brain: ?ai.Brain = null,
+    /// Visitors follow routes along the paths, watch animals and leave.
+    is_guest: bool = false,
+    goal: Goal = .none,
+    /// Path nodes still to visit, in order, from `route_i`.
+    route: std.ArrayList(u32) = .empty,
+    route_i: usize = 0,
+    /// The animal a guest is walking to or watching.
+    view_target: ?u32 = null,
+    /// Seconds before the guest heads for the exit.
+    tour_left: f32 = std.math.inf(f32),
+    /// 0..100, rises when watching animals.
+    happiness: f32 = 50,
+    leave_done: bool = false,
     /// Animation the agent is playing, by manifest name.
     anim_name: []const u8 = "Stand_Idle",
     /// Id of the world actor this agent drives.
@@ -107,6 +133,67 @@ pub const Graph = struct {
         return .{ .nodes = nodes, .adj = adj, .arena = arena };
     }
 
+    /// Shortest walk from node `from` to node `to` (A*), excluding `from`.
+    /// Empty if they are the same node or not connected. Caller owns the result.
+    pub fn route(self: *const Graph, gpa: std.mem.Allocator, from: u32, to: u32) ![]u32 {
+        const n = self.nodes.len;
+        if (from == to or from >= n or to >= n) return gpa.alloc(u32, 0);
+        const inf = std.math.inf(f32);
+        const g_cost = try gpa.alloc(f32, n);
+        defer gpa.free(g_cost);
+        const f_cost = try gpa.alloc(f32, n);
+        defer gpa.free(f_cost);
+        const came = try gpa.alloc(i32, n);
+        defer gpa.free(came);
+        const open = try gpa.alloc(bool, n);
+        defer gpa.free(open);
+        @memset(g_cost, inf);
+        @memset(f_cost, inf);
+        @memset(came, -1);
+        @memset(open, false);
+        const h = struct {
+            fn dist(a: [2]f32, b: [2]f32) f32 {
+                return @sqrt((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]));
+            }
+        };
+        g_cost[from] = 0;
+        f_cost[from] = h.dist(self.nodes[from], self.nodes[to]);
+        open[from] = true;
+        while (true) {
+            // Open node with the lowest estimate (linear scan: graphs are small).
+            var cur: ?usize = null;
+            var best: f32 = inf;
+            for (open, 0..) |is_open, i| if (is_open and f_cost[i] < best) {
+                best = f_cost[i];
+                cur = i;
+            };
+            const c = cur orelse return gpa.alloc(u32, 0); // not connected
+            if (c == to) break;
+            open[c] = false;
+            for (self.adj[c]) |nb| {
+                const cost = g_cost[c] + h.dist(self.nodes[c], self.nodes[nb]);
+                if (cost < g_cost[nb]) {
+                    g_cost[nb] = cost;
+                    f_cost[nb] = cost + h.dist(self.nodes[nb], self.nodes[to]);
+                    came[nb] = @intCast(c);
+                    open[nb] = true;
+                }
+            }
+        }
+        var len: usize = 0;
+        var at: i32 = @intCast(to);
+        while (at >= 0 and at != @as(i32, @intCast(from))) : (at = came[@intCast(at)]) len += 1;
+        const out = try gpa.alloc(u32, len);
+        at = @intCast(to);
+        var i = len;
+        while (i > 0) {
+            i -= 1;
+            out[i] = @intCast(at);
+            at = came[@intCast(at)];
+        }
+        return out;
+    }
+
     /// The node nearest to (x, y) within `max_dist`, if any.
     pub fn nearest(self: *const Graph, x: f32, y: f32, max_dist: f32) ?u32 {
         var best: ?u32 = null;
@@ -148,6 +235,19 @@ fn blocksMovement(kind: []const u8) bool {
     return std.mem.indexOf(u8, k, "curb") == null and std.mem.indexOf(u8, k, "gate") == null;
 }
 
+pub fn isGuest(binder: []const u8) bool {
+    var buf: [128]u8 = undefined;
+    if (binder.len > buf.len) return false;
+    return std.mem.indexOf(u8, std.ascii.lowerString(&buf, binder), "guest") != null;
+}
+
+pub fn isChild(binder: []const u8) bool {
+    var buf: [128]u8 = undefined;
+    if (binder.len > buf.len) return false;
+    const l = std.ascii.lowerString(&buf, binder);
+    return std.mem.indexOf(u8, l, "young") != null or std.mem.indexOf(u8, l, "child") != null;
+}
+
 pub fn classify(binder: []const u8) Kind {
     const people = [_][]const u8{ "guest", "staff", "keeper", "maintenance", "vet", "tour", "worker", "photographer", "specialist" };
     var buf: [128]u8 = undefined;
@@ -169,6 +269,21 @@ pub const Sim = struct {
     /// World revision the walkway graph was built from.
     graph_paths: usize = std.math.maxInt(usize),
     hooks: ?Hooks = null,
+    zoo: Zoo = .{},
+    /// Entity names guests are made from.
+    guest_binders: []const []const u8 = &.{},
+    max_guests: u32 = 50,
+    /// Seconds between arrivals (min, max), and how long a visit lasts.
+    spawn_delay: [2]f32 = .{ 1, 6 },
+    tour_secs: [2]f32 = .{ 150, 300 },
+    adult_price: f32 = 24,
+    child_price: f32 = 12,
+    spawn_timer: f32 = 3,
+    want_spawn: bool = false,
+    entrance: ?[2]f32 = null,
+    entrance_node: ?u32 = null,
+    entrance_key: usize = std.math.maxInt(usize),
+    to_remove: std.ArrayList(u32) = .empty,
     /// Fixed step and leftover time for `advance`.
     step_len: f32 = 1.0 / 30.0,
     accum: f32 = 0,
@@ -178,7 +293,8 @@ pub const Sim = struct {
     }
 
     pub fn deinit(self: *Sim) void {
-        for (self.agents.items) |*a| if (a.brain) |*b| b.deinit();
+        self.to_remove.deinit(self.gpa);
+        for (self.agents.items) |*a| self.freeAgent(a);
         self.agents.deinit(self.gpa);
         self.walls.deinit(self.gpa);
         self.graph.deinit();
@@ -210,33 +326,13 @@ pub const Sim = struct {
                 i += 1;
             } else {
                 var gone = self.agents.orderedRemove(i);
-                if (gone.brain) |*b| b.deinit();
+                self.freeAgent(&gone);
             }
         }
         // Add agents for new actors.
         for (w.actors.items) |a| {
             if (self.agentFor(a.id) != null) continue;
-            const kind = classify(a.binder);
-            const ground = w.terrain.zAt(a.position[0], a.position[1]);
-            // The rotation matrix's first column is the model's +x axis in
-            // the world; models face -y, so heading follows from yaw.
-            const yaw = std.math.atan2(a.rotation[3], a.rotation[0]);
-            var brain: ?ai.Brain = null;
-            if (kind == .animal) if (self.hooks) |h| if (h.brain(h.ctx, a.binder)) |setup| {
-                brain = try ai.Brain.init(self.gpa, setup.lib, setup.groups, self.rng.random().int(u64));
-            };
-            try self.agents.append(self.gpa, .{
-                .brain = brain,
-                .id = a.id,
-                .kind = kind,
-                .pos = a.position,
-                .ground_offset = a.position[2] - ground,
-                .yaw = yaw,
-                .speed = if (kind == .person) 0.85 else 1.1,
-                .home = .{ a.position[0], a.position[1] },
-                .target = .{ a.position[0], a.position[1] },
-                .timer = self.rng.random().float(f32) * 3.0,
-            });
+            try self.agents.append(self.gpa, try self.makeAgent(a, w));
         }
         if (self.walls_for != w.fences.items.len) {
             self.walls.clearRetainingCapacity();
@@ -258,8 +354,88 @@ pub const Sim = struct {
             for (self.agents.items) |*ag| {
                 ag.node = null;
                 ag.prev_node = null;
+                ag.route.clearRetainingCapacity();
+                ag.route_i = 0;
+                if (ag.is_guest and ag.goal != .none) ag.goal = .none;
             }
+            self.entrance_key = std.math.maxInt(usize);
         }
+        self.findEntrance(w);
+    }
+
+    fn makeAgent(self: *Sim, a: world_mod.Actor, w: *const world_mod.World) !Agent {
+        const kind = classify(a.binder);
+        const ground = w.terrain.zAt(a.position[0], a.position[1]);
+        // The rotation matrix's first column is the model's +x axis in
+        // the world; models face -y, so heading follows from yaw.
+        const yaw = std.math.atan2(a.rotation[3], a.rotation[0]);
+        var brain: ?ai.Brain = null;
+        if (kind == .animal) if (self.hooks) |h| if (h.brain(h.ctx, a.binder)) |setup| {
+            brain = try ai.Brain.init(self.gpa, setup.lib, setup.groups, self.rng.random().int(u64));
+        };
+        const guest = kind == .person and isGuest(a.binder);
+        const rnd = self.rng.random();
+        return .{
+            .brain = brain,
+            .is_guest = guest,
+            .tour_left = if (guest) self.tour_secs[0] + rnd.float(f32) * (self.tour_secs[1] - self.tour_secs[0]) else std.math.inf(f32),
+            .happiness = 45 + rnd.float(f32) * 20,
+            .id = a.id,
+            .kind = kind,
+            .pos = a.position,
+            .ground_offset = a.position[2] - ground,
+            .yaw = yaw,
+            .speed = if (kind == .person) 0.85 else 1.1,
+            .home = .{ a.position[0], a.position[1] },
+            .target = .{ a.position[0], a.position[1] },
+            .timer = rnd.float(f32) * 3.0,
+        };
+    }
+
+    fn freeAgent(self: *Sim, a: *Agent) void {
+        if (a.brain) |*b| b.deinit();
+        a.route.deinit(self.gpa);
+    }
+
+    /// Finds the entrance gate (a front-gate prop) and the path node beside
+    /// it, which is where guests arrive and leave.
+    fn findEntrance(self: *Sim, w: *const world_mod.World) void {
+        const key = w.props.items.len * 7919 + w.paths.items.len;
+        if (key == self.entrance_key) return;
+        self.entrance_key = key;
+        self.entrance = null;
+        self.entrance_node = null;
+        for (w.props.items) |p| {
+            var buf: [160]u8 = undefined;
+            if (p.model.len > buf.len) continue;
+            const l = std.ascii.lowerString(&buf, p.model);
+            if (std.mem.indexOf(u8, l, "gate") == null) continue;
+            if (std.mem.indexOf(u8, l, "front") == null and std.mem.indexOf(u8, l, "entrance") == null) continue;
+            self.entrance = .{ p.position[0], p.position[1] };
+            break;
+        }
+        const e = self.entrance orelse return;
+        self.entrance_node = self.graph.nearest(e[0], e[1], 40);
+    }
+
+    /// How many guests are in the zoo and not yet on their way out the door.
+    pub fn liveGuests(self: *const Sim) u32 {
+        var n: u32 = 0;
+        for (self.agents.items) |a| if (a.is_guest and !a.leave_done) {
+            n += 1;
+        };
+        return n;
+    }
+
+    /// Mean guest happiness, 0..100.
+    pub fn happiness(self: *const Sim) f32 {
+        var sum: f32 = 0;
+        var n: f32 = 0;
+        for (self.agents.items) |a| if (a.is_guest and !a.leave_done) {
+            sum += a.happiness;
+            n += 1;
+        };
+        return if (n > 0) sum / n else 0;
     }
 
     /// Advances by wall-clock `dt` in fixed steps and writes agent
@@ -269,6 +445,18 @@ pub const Sim = struct {
         while (self.accum >= self.step_len) {
             self.accum -= self.step_len;
             self.stepOnce(w, self.step_len);
+            if (self.want_spawn) {
+                self.want_spawn = false;
+                self.spawnGuest(w) catch {};
+            }
+        }
+        // Guests who reached the exit leave the world.
+        if (self.to_remove.items.len > 0) {
+            for (self.to_remove.items) |id| {
+                _ = w.remove(id);
+                self.zoo.guests_left += 1;
+            }
+            self.to_remove.clearRetainingCapacity();
         }
         for (self.agents.items) |ag| {
             for (w.actors.items) |*a| if (a.id == ag.id) {
@@ -280,10 +468,21 @@ pub const Sim = struct {
 
     fn stepOnce(self: *Sim, w: *const world_mod.World, dt: f32) void {
         self.time += dt;
+        // Arrivals: a new guest every so often while there is room.
+        self.spawn_timer -= dt;
+        if (self.spawn_timer <= 0) {
+            const rnd = self.rng.random();
+            self.spawn_timer = self.spawn_delay[0] + rnd.float(f32) * (self.spawn_delay[1] - self.spawn_delay[0]);
+            if (self.entrance_node != null and self.guest_binders.len > 0 and self.liveGuests() < self.max_guests) self.want_spawn = true;
+        }
         for (self.agents.items) |*ag| {
             ag.anim_time += dt;
             if (ag.brain != null and self.hooks != null) {
                 self.thinkAnimal(ag, w, dt);
+                continue;
+            }
+            if (ag.is_guest) {
+                self.guestStep(ag, w, dt);
                 continue;
             }
             switch (ag.state) {
@@ -349,6 +548,160 @@ pub const Sim = struct {
         ag.anim = .walk;
         ag.anim_name = "Walk_Ahead";
         ag.anim_time = 0;
+    }
+
+    // ---------------------------------------------------------------- guests
+
+    /// A guest arrives at the entrance and pays admission.
+    fn spawnGuest(self: *Sim, w: *world_mod.World) !void {
+        const node = self.entrance_node orelse return;
+        const rnd = self.rng.random();
+        const binder = self.guest_binders[rnd.uintLessThan(usize, self.guest_binders.len)];
+        const p = self.graph.nodes[node];
+        const z = w.terrain.zAt(p[0], p[1]);
+        _ = try w.addActor(binder, .{ p[0], p[1], z }, world_mod.yawRotation(rnd.float(f32) * std.math.tau), &.{});
+        // The new actor gets its agent now so the tour starts at once.
+        const a = w.actors.items[w.actors.items.len - 1];
+        try self.agents.append(self.gpa, try self.makeAgent(a, w));
+        self.agents.items[self.agents.items.len - 1].node = node;
+        self.zoo.guests_total += 1;
+        self.zoo.income += if (isChild(binder)) self.child_price else self.adult_price;
+    }
+
+    /// Sets the guest's route to `to` from the node it stands on.
+    fn routeTo(self: *Sim, ag: *Agent, to: u32) bool {
+        const here = ag.node orelse self.graph.nearest(ag.pos[0], ag.pos[1], 8.0) orelse return false;
+        ag.node = here;
+        const r = self.graph.route(self.gpa, here, to) catch return false;
+        defer self.gpa.free(r);
+        if (r.len == 0) return false;
+        ag.route.clearRetainingCapacity();
+        ag.route.appendSlice(self.gpa, r) catch return false;
+        ag.route_i = 0;
+        return true;
+    }
+
+    fn guestRest(self: *Sim, ag: *Agent, lo: f32, hi: f32) void {
+        ag.state = .idle;
+        ag.anim = .idle;
+        ag.anim_name = "Stand_Idle";
+        ag.timer = lo + self.rng.random().float(f32) * (hi - lo);
+        ag.goal = .none;
+    }
+
+    fn guestStep(self: *Sim, ag: *Agent, w: *const world_mod.World, dt: f32) void {
+        if (ag.leave_done) return;
+        ag.tour_left -= dt;
+        ag.happiness = @max(0, ag.happiness - 0.01 * dt);
+        switch (ag.state) {
+            .idle => {
+                ag.timer -= dt;
+                if (ag.timer <= 0) self.guestDecide(ag);
+            },
+            .walk => {
+                if (ag.route_i >= ag.route.items.len) return self.guestArrive(ag);
+                const node = ag.route.items[ag.route_i];
+                ag.target = self.graph.nodes[node];
+                switch (self.moveToward(ag, w, dt, ag.speed)) {
+                    .moving => {},
+                    .arrived => {
+                        ag.node = node;
+                        ag.route_i += 1;
+                        if (ag.route_i >= ag.route.items.len) self.guestArrive(ag);
+                    },
+                    .blocked => self.guestRest(ag, 1, 3),
+                }
+            },
+        }
+    }
+
+    /// Reached the end of a route.
+    fn guestArrive(self: *Sim, ag: *Agent) void {
+        switch (ag.goal) {
+            .leave => {
+                ag.leave_done = true;
+                self.to_remove.append(self.gpa, ag.id) catch {};
+            },
+            .view => {
+                // Face the animal and watch it for a while.
+                if (ag.view_target) |tid| if (self.agentFor(tid)) |target| {
+                    const dx = target.pos[0] - ag.pos[0];
+                    const dy = target.pos[1] - ag.pos[1];
+                    ag.yaw = std.math.atan2(dy, dx) + std.math.pi / 2.0;
+                };
+                self.zoo.views += 1;
+                ag.happiness = @min(100, ag.happiness + 6 + self.rng.random().float(f32) * 4);
+                self.guestRest(ag, 8, 18);
+            },
+            else => self.guestRest(ag, 2, 6),
+        }
+    }
+
+    /// Picks what the guest does next.
+    fn guestDecide(self: *Sim, ag: *Agent) void {
+        const rnd = self.rng.random();
+        if (self.graph.nodes.len == 0) return self.guestRest(ag, 3, 6);
+        // Time to go home?
+        if (ag.tour_left <= 0) if (self.entrance_node) |exit| {
+            if (ag.goal != .leave) {
+                if (self.routeTo(ag, exit)) {
+                    ag.goal = .leave;
+                    ag.state = .walk;
+                    ag.anim = .walk;
+                    ag.anim_name = "Walk_Ahead";
+                    return;
+                }
+                // Already at the exit, or cut off from it: leave from here.
+                if ((ag.node orelse 0) == exit) {
+                    ag.goal = .leave;
+                    return self.guestArrive(ag);
+                }
+            }
+        };
+        // Otherwise: go and watch an animal, or just stroll.
+        var animals: usize = 0;
+        for (self.agents.items) |a| if (a.kind == .animal) {
+            animals += 1;
+        };
+        if (animals > 0 and rnd.float(f32) < 0.75) {
+            var tries: usize = 0;
+            while (tries < 5) : (tries += 1) {
+                var pick = rnd.uintLessThan(usize, animals);
+                var target: ?*const Agent = null;
+                for (self.agents.items) |*a| if (a.kind == .animal) {
+                    if (pick == 0) {
+                        target = a;
+                        break;
+                    }
+                    pick -= 1;
+                };
+                const t = target orelse break;
+                // A viewing spot: the walkway node nearest the animal.
+                const spot = self.graph.nearest(t.pos[0], t.pos[1], 30) orelse continue;
+                if (self.routeTo(ag, spot)) {
+                    ag.goal = .view;
+                    ag.view_target = t.id;
+                    ag.state = .walk;
+                    ag.anim = .walk;
+                    ag.anim_name = "Walk_Ahead";
+                    return;
+                }
+                // Already standing at that spot: watch from here.
+                if ((ag.node orelse 0) == spot) {
+                    ag.goal = .view;
+                    ag.view_target = t.id;
+                    return self.guestArrive(ag);
+                }
+            }
+        }
+        // Stroll to a random walkway node.
+        const dest: u32 = rnd.uintLessThan(u32, @intCast(self.graph.nodes.len));
+        if (self.routeTo(ag, dest)) {
+            ag.goal = .wander;
+            ag.state = .walk;
+            ag.anim = .walk;
+            ag.anim_name = "Walk_Ahead";
+        } else self.guestRest(ag, 2, 5);
     }
 
     const Move = enum { moving, arrived, blocked };
@@ -626,6 +979,85 @@ test "animals run data-driven tasks: they wander inside the pen and rest" {
     try testing.expect(walked);
     try testing.expect(slept);
     try testing.expect(travelled > 5.0);
+}
+
+test "routes follow the walkway and avoid gaps" {
+    const gpa = testing.allocator;
+    // Two rows of tiles joined at the left end: a U shape.
+    var tiles: std.ArrayList(world_mod.PathTile) = .empty;
+    defer tiles.deinit(gpa);
+    for (0..5) |i| try tiles.append(gpa, .{ .id = 0, .texture = "", .position = .{ @as(f32, @floatFromInt(i)) * 3, 0 }, .width = 6, .height = 6 });
+    try tiles.append(gpa, .{ .id = 0, .texture = "", .position = .{ 0, 3 }, .width = 6, .height = 6 });
+    try tiles.append(gpa, .{ .id = 0, .texture = "", .position = .{ 0, 6 }, .width = 6, .height = 6 });
+    for (0..5) |i| try tiles.append(gpa, .{ .id = 0, .texture = "", .position = .{ @as(f32, @floatFromInt(i)) * 3, 6 }, .width = 6, .height = 6 });
+    try tiles.append(gpa, .{ .id = 0, .texture = "", .position = .{ 100, 100 }, .width = 6, .height = 6 }); // isolated
+    var g = try Graph.build(gpa, tiles.items, 3.6);
+    defer g.deinit();
+    // from the end of the bottom row (node 4) to the end of the top row (node 11)
+    const r = try g.route(gpa, 4, 11);
+    defer gpa.free(r);
+    try testing.expectEqual(@as(u32, 11), r[r.len - 1]);
+    // along 4 tiles, up the end (two tiles share one spot), back along 4
+    try testing.expect(r.len >= 10 and r.len <= 11);
+    // consecutive nodes are neighbours
+    var prev: u32 = 4;
+    for (r) |n| {
+        var linked = false;
+        for (g.adj[prev]) |nb| if (nb == n) {
+            linked = true;
+        };
+        try testing.expect(linked);
+        prev = n;
+    }
+    // the isolated tile cannot be reached
+    const none = try g.route(gpa, 0, 12);
+    defer gpa.free(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "guests arrive, pay, watch animals and leave" {
+    const gpa = testing.allocator;
+    var w = world_mod.World.init(gpa, try testTerrain(gpa));
+    defer w.deinit();
+    for (0..11) |i| _ = try w.addPath("t", .{ 3.0 * @as(f32, @floatFromInt(i)) + 10, 30 }, 6, 6);
+    _ = try w.addProp("entities/objects/buildings/frontgate_df/frontgate_df", .{ 10, 28, 6 }, world_mod.identity_rotation, 1, &.{});
+    const ground = w.terrain.zAt(30, 36);
+    _ = try w.addActor("Lion_Adult_F", .{ 30, 36, ground }, world_mod.identity_rotation, &.{});
+    _ = try w.addActor("Tiger_Adult_M", .{ 20, 36, ground }, world_mod.identity_rotation, &.{});
+    var sim = Sim.init(gpa, 5);
+    defer sim.deinit();
+    const binders = [_][]const u8{ "Guest_Adult_F_05", "Guest_Young_M_01" };
+    sim.guest_binders = &binders;
+    sim.max_guests = 4;
+    sim.spawn_delay = .{ 0.5, 1.0 };
+    sim.tour_secs = .{ 20, 30 };
+    try sim.sync(&w);
+    try testing.expect(sim.entrance_node != null);
+    var peak: u32 = 0;
+    var synced_rev = w.actors_revision;
+    for (0..12000) |_| { // 400 simulated seconds
+        sim.advance(&w, 1.0 / 30.0);
+        if (w.actors_revision != synced_rev) {
+            try sim.sync(&w);
+            synced_rev = w.actors_revision;
+        }
+        peak = @max(peak, sim.liveGuests());
+        try testing.expect(sim.liveGuests() <= 4);
+        for (sim.agents.items) |ag| if (ag.is_guest and !ag.leave_done) {
+            try testing.expect(ag.pos[1] > 28.9 and ag.pos[1] < 31.1);
+            try testing.expect(ag.pos[0] > 8.5 and ag.pos[0] < 41.5);
+        };
+    }
+    try testing.expect(sim.zoo.guests_total >= 8);
+    try testing.expect(sim.zoo.guests_left > 0);
+    try testing.expectEqual(@as(u32, 4), peak);
+    try testing.expect(sim.zoo.views > 3);
+    // admission: every guest paid either 24 or 12
+    const total: f64 = @floatFromInt(sim.zoo.guests_total);
+    try testing.expect(sim.zoo.income >= 12 * total and sim.zoo.income <= 24 * total);
+    // agents and world actors agree once synced
+    try sim.sync(&w);
+    try testing.expectEqual(w.actors.items.len, sim.agents.items.len);
 }
 
 test "curbs and gates do not block" {

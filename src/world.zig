@@ -78,6 +78,9 @@ pub const World = struct {
     next_id: u32 = 1,
     /// Bumped on every edit so views know to rebuild.
     revision: u32 = 0,
+    /// Bumped when actors are added or removed (separately from `revision`,
+    /// so people arriving does not rebuild every static mesh).
+    actors_revision: u32 = 0,
     terrain_revision: u32 = 0,
 
     /// Takes ownership of `terrain`.
@@ -133,6 +136,7 @@ pub const World = struct {
             _ = id;
         }
         w.revision = 0;
+        w.actors_revision = 0;
         return w;
     }
 
@@ -173,20 +177,25 @@ pub const World = struct {
             .rotation = rot,
             .swaps = try self.swapsCopy(swaps),
         });
-        self.revision += 1;
+        self.actors_revision += 1;
         return id;
     }
 
     /// Removes the record with this id from whichever list holds it.
     /// Returns false if no such record exists.
     pub fn remove(self: *World, id: u32) bool {
-        inline for (.{ &self.props, &self.fences, &self.paths, &self.actors }) |list| {
+        inline for (.{ &self.props, &self.fences, &self.paths }) |list| {
             for (list.items, 0..) |item, i| if (item.id == id) {
                 _ = list.orderedRemove(i);
                 self.revision += 1;
                 return true;
             };
         }
+        for (self.actors.items, 0..) |a, i| if (a.id == id) {
+            _ = self.actors.orderedRemove(i);
+            self.actors_revision += 1;
+            return true;
+        };
         return false;
     }
 
