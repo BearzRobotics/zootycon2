@@ -113,7 +113,7 @@ pub const Gl = struct {
 
     /// Resolves every entry point. Returns the first missing symbol's name.
     pub fn load(self: *Gl, get: GetProc) ?[]const u8 {
-        inline for (std.meta.fieldNames(Gl)) |name| {
+        inline for (@typeInfo(Gl).@"struct".field_names) |name| {
             const sym = comptime symbolName(name);
             const p = get(sym) orelse return name;
             @field(self, name) = @ptrCast(p);

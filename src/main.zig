@@ -21,6 +21,7 @@ const usage =
     \\  modelcheck [prefix]         parse every .bfm manifest and .bfmat material
     \\  ddscheck [prefix]           parse every .dds texture and report formats
     \\  nifinfo <path>               print a NIF's scene graph
+    \\  view <model> [--shot]       view a .nif/.bfm model (--shot: PPM to stdout)
     \\  nifcheck [prefix]           parse every .nif/.kf and report coverage
     \\  xmlcheck [prefix]            parse every .xml and report failures
     \\
@@ -260,6 +261,9 @@ pub fn main(init: std.process.Init) !void {
             gpa.free(px);
         }
         try out.print("{d} textures: dxt1 {d}, dxt3 {d}, dxt5 {d}, rgba8 {d}; {d} cube maps; {d} with partial mip chains; {d} failed\n", .{ names.items.len, counts[0], counts[1], counts[2], counts[3], cubes, short_mips, failed });
+    } else if (std.mem.eql(u8, cmd, "view") and rest.len > 0) {
+        const shot = rest.len > 1 and std.mem.eql(u8, rest[1], "--shot");
+        try zootycon2.viewer.run(gpa, &vfs, rest[0], .{ .screenshot = if (shot) out else null });
     } else if (std.mem.eql(u8, cmd, "nifinfo") and rest.len > 0) {
         const data = try vfs.read(gpa, rest[0]);
         defer gpa.free(data);

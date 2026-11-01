@@ -11,6 +11,7 @@ pub const gl = @import("gl.zig");
 pub const nif = @import("nif.zig");
 pub const dds = @import("dds.zig");
 pub const model = @import("model.zig");
+pub const viewer = @import("viewer.zig");
 
 test {
     _ = archive;
@@ -23,4 +24,5 @@ test {
     _ = nif;
     _ = dds;
     _ = model;
+    _ = viewer;
 }

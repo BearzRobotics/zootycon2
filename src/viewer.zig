@@ -1,0 +1,557 @@
+//! Static model viewer: flattens a NIF scene graph into draw calls and
+//! renders it with OpenGL 3.3 under an orbit camera. Skinning and animation
+//! are not applied yet; skinned meshes are drawn in their bind pose.
+
+const std = @import("std");
+const Gl = @import("gl.zig").Gl;
+const gl = @import("gl.zig");
+const nif = @import("nif.zig");
+const dds = @import("dds.zig");
+const model = @import("model.zig");
+const vfs_mod = @import("vfs.zig");
+const platform = @import("platform.zig");
+
+// ------------------------------------------------------------------ math
+
+pub const Mat4 = [16]f32; // column-major
+
+const identity: Mat4 = .{ 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+
+fn mul(a: Mat4, b: Mat4) Mat4 {
+    var r: Mat4 = undefined;
+    for (0..4) |col| for (0..4) |row| {
+        var s: f32 = 0;
+        for (0..4) |k| s += a[k * 4 + row] * b[col * 4 + k];
+        r[col * 4 + row] = s;
+    };
+    return r;
+}
+
+/// The NIF stores a row-major rotation R; a point maps to `scale * R * p + t`.
+fn fromTransform(t: nif.Transform) Mat4 {
+    var m = identity;
+    for (0..3) |col| for (0..3) |row| {
+        m[col * 4 + row] = t.rotation[row * 3 + col] * t.scale;
+    };
+    m[12] = t.translation[0];
+    m[13] = t.translation[1];
+    m[14] = t.translation[2];
+    return m;
+}
+
+fn transformPoint(m: Mat4, p: nif.Vec3) nif.Vec3 {
+    return .{
+        m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12],
+        m[1] * p[0] + m[5] * p[1] + m[9] * p[2] + m[13],
+        m[2] * p[0] + m[6] * p[1] + m[10] * p[2] + m[14],
+    };
+}
+
+fn perspective(fovy: f32, aspect: f32, near: f32, far: f32) Mat4 {
+    const f = 1.0 / @tan(fovy / 2.0);
+    var m = std.mem.zeroes(Mat4);
+    m[0] = f / aspect;
+    m[5] = f;
+    m[10] = (far + near) / (near - far);
+    m[11] = -1;
+    m[14] = 2 * far * near / (near - far);
+    return m;
+}
+
+fn normalize3(v: [3]f32) [3]f32 {
+    const l = @sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (l == 0) return v;
+    return .{ v[0] / l, v[1] / l, v[2] / l };
+}
+
+fn cross(a: [3]f32, b: [3]f32) [3]f32 {
+    return .{ a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0] };
+}
+
+fn lookAt(eye: [3]f32, target: [3]f32, up: [3]f32) Mat4 {
+    const f = normalize3(.{ target[0] - eye[0], target[1] - eye[1], target[2] - eye[2] });
+    const s = normalize3(cross(f, up));
+    const u = cross(s, f);
+    var m = identity;
+    m[0] = s[0];
+    m[4] = s[1];
+    m[8] = s[2];
+    m[1] = u[0];
+    m[5] = u[1];
+    m[9] = u[2];
+    m[2] = -f[0];
+    m[6] = -f[1];
+    m[10] = -f[2];
+    m[12] = -(s[0] * eye[0] + s[1] * eye[1] + s[2] * eye[2]);
+    m[13] = -(u[0] * eye[0] + u[1] * eye[1] + u[2] * eye[2]);
+    m[14] = (f[0] * eye[0] + f[1] * eye[1] + f[2] * eye[2]);
+    return m;
+}
+
+// ---------------------------------------------------------------- shaders
+
+const vs_src: [:0]const u8 =
+    \\#version 330 core
+    \\layout(location=0) in vec3 aPos;
+    \\layout(location=1) in vec3 aNormal;
+    \\layout(location=2) in vec2 aUv;
+    \\uniform mat4 uModel;
+    \\uniform mat4 uViewProj;
+    \\out vec3 vN;
+    \\out vec3 vP;
+    \\out vec2 vUv;
+    \\void main() {
+    \\  vec4 w = uModel * vec4(aPos, 1.0);
+    \\  vP = w.xyz;
+    \\  vN = mat3(uModel) * aNormal;
+    \\  vUv = aUv;
+    \\  gl_Position = uViewProj * w;
+    \\}
+;
+
+const fs_src: [:0]const u8 =
+    \\#version 330 core
+    \\in vec3 vN;
+    \\in vec3 vP;
+    \\in vec2 vUv;
+    \\uniform sampler2D uTex;
+    \\uniform vec4 uTint;
+    \\uniform float uAlphaCut;
+    \\out vec4 outColor;
+    \\void main() {
+    \\  vec4 c = texture(uTex, vUv) * uTint;
+    \\  if (c.a < uAlphaCut) discard;
+    \\  vec3 n = dot(vN, vN) > 1e-6 ? normalize(vN) : normalize(cross(dFdx(vP), dFdy(vP)));
+    \\  vec3 l = normalize(vec3(0.4, -0.5, 0.8));
+    \\  float d = abs(dot(n, l));
+    \\  outColor = vec4(c.rgb * (0.4 + 0.6 * d), c.a);
+    \\}
+;
+
+fn compile(g: *const Gl, kind: gl.Enum, src: [:0]const u8) !gl.Uint {
+    const sh = g.createShader(kind);
+    const srcs = [_][*:0]const u8{src.ptr};
+    g.shaderSource(sh, 1, &srcs, null);
+    g.compileShader(sh);
+    var ok: gl.Int = 0;
+    g.getShaderiv(sh, gl.COMPILE_STATUS, &ok);
+    if (ok == 0) {
+        var log: [1024]u8 = undefined;
+        var n: gl.Sizei = 0;
+        g.getShaderInfoLog(sh, log.len, &n, &log);
+        std.debug.print("shader error: {s}\n", .{log[0..@intCast(n)]});
+        return error.ShaderCompile;
+    }
+    return sh;
+}
+
+fn makeProgram(g: *const Gl) !gl.Uint {
+    const vs = try compile(g, gl.VERTEX_SHADER, vs_src);
+    const fs = try compile(g, gl.FRAGMENT_SHADER, fs_src);
+    const p = g.createProgram();
+    g.attachShader(p, vs);
+    g.attachShader(p, fs);
+    g.linkProgram(p);
+    var ok: gl.Int = 0;
+    g.getProgramiv(p, gl.LINK_STATUS, &ok);
+    if (ok == 0) {
+        var log: [1024]u8 = undefined;
+        var n: gl.Sizei = 0;
+        g.getProgramInfoLog(p, log.len, &n, &log);
+        std.debug.print("link error: {s}\n", .{log[0..@intCast(n)]});
+        return error.ShaderLink;
+    }
+    g.deleteShader(vs);
+    g.deleteShader(fs);
+    return p;
+}
+
+// ------------------------------------------------------------------ scene
+
+const Draw = struct {
+    vao: gl.Uint,
+    index_count: gl.Sizei,
+    world: Mat4,
+    texture: gl.Uint,
+    tint: [4]f32,
+    blend: bool,
+    alpha_cut: f32,
+};
+
+pub const Scene = struct {
+    gpa: std.mem.Allocator,
+    g: *const Gl,
+    vfs: *vfs_mod.Vfs,
+    draws: std.ArrayList(Draw) = .empty,
+    /// lowercase basename -> VFS path of a .dds file
+    dds_index: std.StringHashMapUnmanaged([]const u8) = .empty,
+    /// lowercase basename -> GL texture
+    textures: std.StringHashMapUnmanaged(gl.Uint) = .empty,
+    white: gl.Uint = 0,
+    min: nif.Vec3 = .{ 1e30, 1e30, 1e30 },
+    max: nif.Vec3 = .{ -1e30, -1e30, -1e30 },
+    missing_textures: u32 = 0,
+
+    const Index = struct {
+        scene: *Scene,
+        fn add(self: Index, path: []const u8) anyerror!void {
+            if (!std.mem.endsWith(u8, path, ".dds")) return;
+            const base = std.fs.path.basename(path);
+            const s = self.scene;
+            const gop = try s.dds_index.getOrPut(s.gpa, base);
+            // Prefer full-resolution textures over those under a `low/` dir.
+            if (gop.found_existing) {
+                const old_low = std.mem.indexOf(u8, gop.value_ptr.*, "/low/") != null;
+                const new_low = std.mem.indexOf(u8, path, "/low/") != null;
+                if (!old_low or new_low) return;
+            }
+            gop.key_ptr.* = base;
+            gop.value_ptr.* = path;
+        }
+    };
+
+    pub fn init(gpa: std.mem.Allocator, g: *const Gl, vfs: *vfs_mod.Vfs) !Scene {
+        var s: Scene = .{ .gpa = gpa, .g = g, .vfs = vfs };
+        try vfs.forEach(Index{ .scene = &s }, Index.add);
+        // 1x1 white fallback texture.
+        const px = [4]u8{ 255, 255, 255, 255 };
+        g.genTextures(1, @ptrCast(&s.white));
+        g.bindTexture(gl.TEXTURE_2D, s.white);
+        g.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+        g.texImage2D(gl.TEXTURE_2D, 0, @intCast(gl.RGBA8), 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, &px);
+        g.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, @intCast(gl.LINEAR));
+        g.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, @intCast(gl.LINEAR));
+        return s;
+    }
+
+    pub fn deinit(self: *Scene) void {
+        self.draws.deinit(self.gpa);
+        var it = self.textures.keyIterator();
+        while (it.next()) |k| self.gpa.free(k.*);
+        self.textures.deinit(self.gpa);
+        self.dds_index.deinit(self.gpa);
+    }
+
+    fn loadTexture(self: *Scene, file_name: []const u8) gl.Uint {
+        var lower_buf: [256]u8 = undefined;
+        var name = file_name;
+        if (std.mem.lastIndexOfAny(u8, name, "/\\")) |i| name = name[i + 1 ..];
+        if (name.len == 0 or name.len > lower_buf.len) return self.white;
+        const lower = std.ascii.lowerString(&lower_buf, name);
+        if (self.textures.get(lower)) |t| return t;
+
+        const tex = self.loadTextureUncached(lower) orelse blk: {
+            self.missing_textures += 1;
+            break :blk self.white;
+        };
+        const key = self.gpa.dupe(u8, lower) catch return tex;
+        self.textures.put(self.gpa, key, tex) catch self.gpa.free(key);
+        return tex;
+    }
+
+    fn loadTextureUncached(self: *Scene, lower: []const u8) ?gl.Uint {
+        const path = self.dds_index.get(lower) orelse return null;
+        const bytes = self.vfs.read(self.gpa, path) catch return null;
+        defer self.gpa.free(bytes);
+        var img = dds.parse(self.gpa, bytes) catch return null;
+        defer img.deinit();
+        return upload(self.g, &img);
+    }
+
+    fn upload(g: *const Gl, img: *const dds.Image) gl.Uint {
+        var id: gl.Uint = 0;
+        g.genTextures(1, @ptrCast(&id));
+        g.bindTexture(gl.TEXTURE_2D, id);
+        g.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+        for (0..img.mip_count) |m| {
+            const lvl = img.level(0, @intCast(m));
+            const data = img.levelData(0, @intCast(m));
+            const w: gl.Sizei = @intCast(lvl.width);
+            const h: gl.Sizei = @intCast(lvl.height);
+            switch (img.format) {
+                .dxt1 => g.compressedTexImage2D(gl.TEXTURE_2D, @intCast(m), gl.COMPRESSED_RGBA_S3TC_DXT1_EXT, w, h, 0, @intCast(data.len), data.ptr),
+                .dxt3 => g.compressedTexImage2D(gl.TEXTURE_2D, @intCast(m), gl.COMPRESSED_RGBA_S3TC_DXT3_EXT, w, h, 0, @intCast(data.len), data.ptr),
+                .dxt5 => g.compressedTexImage2D(gl.TEXTURE_2D, @intCast(m), gl.COMPRESSED_RGBA_S3TC_DXT5_EXT, w, h, 0, @intCast(data.len), data.ptr),
+                .rgba8 => g.texImage2D(gl.TEXTURE_2D, @intCast(m), @intCast(gl.RGBA8), w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, data.ptr),
+            }
+        }
+        // Only use mips when the chain reaches 1x1; otherwise the texture
+        // would be incomplete (some game textures ship truncated chains).
+        const last = img.level(0, img.mip_count - 1);
+        const complete = img.mip_count > 1 and last.width <= 1 and last.height <= 1;
+        g.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAX_LEVEL, if (complete) @intCast(img.mip_count - 1) else 0);
+        g.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, @intCast(if (complete) gl.LINEAR_MIPMAP_LINEAR else gl.LINEAR));
+        g.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, @intCast(gl.LINEAR));
+        g.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, @intCast(gl.REPEAT));
+        g.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, @intCast(gl.REPEAT));
+        return id;
+    }
+
+    /// Walks the scene graph from every root, adding a draw per geometry.
+    pub fn addNif(self: *Scene, nf: *const nif.Nif) !void {
+        for (nf.roots) |r| try self.walk(nf, r, identity);
+    }
+
+    fn walk(self: *Scene, nf: *const nif.Nif, ref: nif.Ref, parent: Mat4) !void {
+        if (ref < 0) return;
+        switch (nf.blocks[@intCast(ref)]) {
+            .node => |n| {
+                if (n.av.flags & 1 != 0) return; // hidden
+                const world = mul(parent, fromTransform(n.av.transform));
+                if (n.kind == .lod) {
+                    // Child 0 is the most detailed level.
+                    if (n.children.len > 0) try self.walk(nf, n.children[0], world);
+                    return;
+                }
+                for (n.children) |c| try self.walk(nf, c, world);
+            },
+            .geometry => |geo| {
+                if (geo.av.flags & 1 != 0) return;
+                try self.addGeometry(nf, geo, mul(parent, fromTransform(geo.av.transform)));
+            },
+            else => {},
+        }
+    }
+
+    fn addGeometry(self: *Scene, nf: *const nif.Nif, geo: nif.Geometry, world: Mat4) !void {
+        if (geo.data < 0) return;
+        const md = switch (nf.blocks[@intCast(geo.data)]) {
+            .mesh_data => |m| m,
+            else => return,
+        };
+        if (md.indices.len == 0 or md.vertices.len == 0) return;
+
+        var tex = self.white;
+        var tint = [4]f32{ 1, 1, 1, 1 };
+        var blend = false;
+        var alpha_cut: f32 = 0;
+        for (geo.av.properties) |pr| {
+            if (pr < 0) continue;
+            switch (nf.blocks[@intCast(pr)]) {
+                .texturing => |t| if (t.base) |bt| if (bt.source >= 0) switch (nf.blocks[@intCast(bt.source)]) {
+                    .source_texture => |st| if (st.file_name) |fnm| {
+                        tex = self.loadTexture(fnm);
+                    },
+                    else => {},
+                },
+                .material => |m| {
+                    tint = .{ m.diffuse[0], m.diffuse[1], m.diffuse[2], m.alpha };
+                },
+                .alpha => |a| {
+                    if (a.flags & 1 != 0) blend = true;
+                    if (a.flags & 0x200 != 0) alpha_cut = @as(f32, @floatFromInt(a.threshold)) / 255.0;
+                },
+                else => {},
+            }
+        }
+
+        // Interleave position, normal, uv.
+        const n = md.vertices.len;
+        const buf = try self.gpa.alloc(f32, n * 8);
+        defer self.gpa.free(buf);
+        const have_n = md.normals.len == n;
+        const have_uv = md.uv_sets.len > 0 and md.uv_sets[0].len == n;
+        for (0..n) |i| {
+            const v = md.vertices[i];
+            buf[i * 8 + 0] = v[0];
+            buf[i * 8 + 1] = v[1];
+            buf[i * 8 + 2] = v[2];
+            const nr: nif.Vec3 = if (have_n) md.normals[i] else .{ 0, 0, 0 };
+            buf[i * 8 + 3] = nr[0];
+            buf[i * 8 + 4] = nr[1];
+            buf[i * 8 + 5] = nr[2];
+            const uv: [2]f32 = if (have_uv) md.uv_sets[0][i] else .{ 0, 0 };
+            buf[i * 8 + 6] = uv[0];
+            buf[i * 8 + 7] = uv[1];
+            const wp = transformPoint(world, v);
+            for (0..3) |k| {
+                self.min[k] = @min(self.min[k], wp[k]);
+                self.max[k] = @max(self.max[k], wp[k]);
+            }
+        }
+
+        const g = self.g;
+        var vao: gl.Uint = 0;
+        var bufs: [2]gl.Uint = undefined;
+        g.genVertexArrays(1, @ptrCast(&vao));
+        g.bindVertexArray(vao);
+        g.genBuffers(2, &bufs);
+        g.bindBuffer(gl.ARRAY_BUFFER, bufs[0]);
+        g.bufferData(gl.ARRAY_BUFFER, @intCast(buf.len * 4), buf.ptr, gl.STATIC_DRAW);
+        const stride: gl.Sizei = 32;
+        g.enableVertexAttribArray(0);
+        g.vertexAttribPointer(0, 3, gl.FLOAT, 0, stride, @ptrFromInt(0));
+        g.enableVertexAttribArray(1);
+        g.vertexAttribPointer(1, 3, gl.FLOAT, 0, stride, @ptrFromInt(12));
+        g.enableVertexAttribArray(2);
+        g.vertexAttribPointer(2, 2, gl.FLOAT, 0, stride, @ptrFromInt(24));
+        g.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, bufs[1]);
+        g.bufferData(gl.ELEMENT_ARRAY_BUFFER, @intCast(md.indices.len * 2), md.indices.ptr, gl.STATIC_DRAW);
+        g.bindVertexArray(0);
+
+        try self.draws.append(self.gpa, .{
+            .vao = vao,
+            .index_count = @intCast(md.indices.len),
+            .world = world,
+            .texture = tex,
+            .tint = tint,
+            .blend = blend,
+            .alpha_cut = alpha_cut,
+        });
+    }
+};
+
+// ----------------------------------------------------------------- viewer
+
+pub const Options = struct {
+    /// When set, render a few frames, write the framebuffer as a binary PPM
+    /// to this writer, and return (no interactive loop).
+    screenshot: ?*std.Io.Writer = null,
+    width: u32 = 1280,
+    height: u32 = 720,
+};
+
+pub fn run(gpa: std.mem.Allocator, vfs: *vfs_mod.Vfs, path: []const u8, opts: Options) !void {
+    // Accept a .bfm manifest as well as a .nif.
+    var nif_path: []const u8 = path;
+    var manifest: ?model.Manifest = null;
+    defer if (manifest) |*m| m.deinit();
+    if (std.ascii.endsWithIgnoreCase(path, ".bfm")) {
+        const data = try vfs.read(gpa, path);
+        defer gpa.free(data);
+        manifest = try model.parseManifest(gpa, data);
+        nif_path = manifest.?.model_name;
+    }
+    const nif_bytes = try vfs.read(gpa, nif_path);
+    defer gpa.free(nif_bytes);
+    var nf = try nif.parse(gpa, nif_bytes);
+    defer nf.deinit();
+
+    const plat = platform.Platform.init() catch {
+        std.debug.print("SDL init failed: {s}\n", .{platform.lastError()});
+        return error.PlatformInit;
+    };
+    defer plat.deinit();
+    const win = platform.Window.createGl("zootycon2 viewer", opts.width, opts.height) catch {
+        std.debug.print("window creation failed: {s}\n", .{platform.lastError()});
+        return error.PlatformWindow;
+    };
+    defer win.destroy();
+    const ctx = win.glCreateContext() catch {
+        std.debug.print("OpenGL 3.3 context failed: {s}\n", .{platform.lastError()});
+        return error.GlContext;
+    };
+    defer ctx.destroy();
+
+    var g: Gl = .{};
+    if (g.load(platform.glGetProcAddress)) |missing| {
+        std.debug.print("missing OpenGL function: {s}\n", .{missing});
+        return error.GlMissing;
+    }
+    if (opts.screenshot == null) {
+        if (g.getString(gl.RENDERER)) |r| std.debug.print("renderer: {s}\n", .{r});
+    }
+
+    const prog = try makeProgram(&g);
+    const u_model = g.getUniformLocation(prog, "uModel");
+    const u_vp = g.getUniformLocation(prog, "uViewProj");
+    const u_tex = g.getUniformLocation(prog, "uTex");
+    const u_tint = g.getUniformLocation(prog, "uTint");
+    const u_cut = g.getUniformLocation(prog, "uAlphaCut");
+
+    var scene = try Scene.init(gpa, &g, vfs);
+    defer scene.deinit();
+    try scene.addNif(&nf);
+    if (scene.draws.items.len == 0) return error.NothingToDraw;
+    std.debug.print("{d} meshes, {d} textures missing\n", .{ scene.draws.items.len, scene.missing_textures });
+
+    const center = [3]f32{
+        (scene.min[0] + scene.max[0]) / 2,
+        (scene.min[1] + scene.max[1]) / 2,
+        (scene.min[2] + scene.max[2]) / 2,
+    };
+    const ext = [3]f32{ scene.max[0] - scene.min[0], scene.max[1] - scene.min[1], scene.max[2] - scene.min[2] };
+    const radius = @max(0.001, @sqrt(ext[0] * ext[0] + ext[1] * ext[1] + ext[2] * ext[2]) / 2);
+
+    var yaw: f32 = -0.8;
+    var pitch: f32 = 0.45;
+    var dist: f32 = radius * 2.4;
+    var dragging = false;
+    var last_x: f32 = 0;
+    var last_y: f32 = 0;
+    var size = win.pixelSize();
+
+    g.enable(gl.DEPTH_TEST);
+    g.depthFunc(gl.LEQUAL);
+    g.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+    var frame: u32 = 0;
+    main: while (true) {
+        while (plat.pollEvent()) |ev| switch (ev) {
+            .quit => break :main,
+            .key_down => |k| if (k.scancode == platform.scancode_escape) break :main,
+            .resized => |r| size = .{ .width = @max(r.width, 1), .height = @max(r.height, 1) },
+            .mouse_button => |b| if (b.button == 1) {
+                dragging = b.down;
+                last_x = b.x;
+                last_y = b.y;
+            },
+            .mouse_move => |m| {
+                if (dragging) {
+                    yaw -= (m.x - last_x) * 0.01;
+                    pitch = std.math.clamp(pitch + (m.y - last_y) * 0.01, -1.5, 1.5);
+                }
+                last_x = m.x;
+                last_y = m.y;
+            },
+            .mouse_wheel => |w| dist = std.math.clamp(dist * std.math.pow(f32, 0.9, w.dy), radius * 0.2, radius * 20),
+            else => {},
+        };
+
+        g.viewport(0, 0, @intCast(size.width), @intCast(size.height));
+        g.clearColor(0.18, 0.2, 0.24, 1);
+        g.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+        const eye = [3]f32{
+            center[0] + dist * @cos(pitch) * @cos(yaw),
+            center[1] + dist * @cos(pitch) * @sin(yaw),
+            center[2] + dist * @sin(pitch),
+        };
+        const aspect = @as(f32, @floatFromInt(size.width)) / @as(f32, @floatFromInt(size.height));
+        const vp = mul(perspective(0.8, aspect, radius * 0.01, dist + radius * 10), lookAt(eye, center, .{ 0, 0, 1 }));
+
+        g.useProgram(prog);
+        g.uniformMatrix4fv(u_vp, 1, 0, &vp);
+        g.uniform1i(u_tex, 0);
+        g.activeTexture(gl.TEXTURE0);
+        for (scene.draws.items) |d| {
+            g.uniformMatrix4fv(u_model, 1, 0, &d.world);
+            g.uniform4f(u_tint, d.tint[0], d.tint[1], d.tint[2], d.tint[3]);
+            g.uniform1f(u_cut, d.alpha_cut);
+            g.bindTexture(gl.TEXTURE_2D, d.texture);
+            if (d.blend) g.enable(gl.BLEND) else g.disable(gl.BLEND);
+            g.bindVertexArray(d.vao);
+            g.drawElements(gl.TRIANGLES, d.index_count, gl.UNSIGNED_SHORT, null);
+        }
+
+        frame += 1;
+        if (opts.screenshot) |w| {
+            if (frame < 3) {
+                ctx.swap();
+                continue;
+            }
+            const px = try gpa.alloc(u8, size.width * size.height * 4);
+            defer gpa.free(px);
+            g.pixelStorei(gl.PACK_ALIGNMENT, 1);
+            g.readPixels(0, 0, @intCast(size.width), @intCast(size.height), gl.RGBA, gl.UNSIGNED_BYTE, px.ptr);
+            try w.print("P6\n{d} {d}\n255\n", .{ size.width, size.height });
+            var y: usize = size.height;
+            while (y > 0) {
+                y -= 1;
+                for (0..size.width) |x| try w.writeAll(px[(y * size.width + x) * 4 ..][0..3]);
+            }
+            return;
+        }
+        ctx.swap();
+    }
+}
