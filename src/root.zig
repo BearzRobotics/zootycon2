@@ -18,6 +18,7 @@ pub const map = @import("map.zig");
 pub const world = @import("world.zig");
 pub const sim = @import("sim.zig");
 pub const app = @import("app.zig");
+pub const font = @import("font.zig");
 
 test {
     _ = archive;
@@ -37,4 +38,5 @@ test {
     _ = world;
     _ = sim;
     _ = app;
+    _ = font;
 }

@@ -36,6 +36,7 @@ const sc = struct {
     const rbracket: u32 = 48;
     const comma: u32 = 54;
     const period: u32 = 55;
+    const f1: u32 = 58;
     const f5: u32 = 62;
     const f9: u32 = 66;
     const delete: u32 = 76;
@@ -144,6 +145,7 @@ pub const App = struct {
     brush_touched: bool = false,
     brush_center: [2]f32 = .{ 0, 0 },
     paused: bool = false,
+    show_help: bool = true,
     speed: f32 = 1.0,
     message: [96]u8 = undefined,
     message_len: usize = 0,
@@ -914,6 +916,7 @@ pub const App = struct {
                         self.speed = @max(self.speed / 2, 0.25);
                         self.title_dirty = true;
                     },
+                    sc.f1 => self.show_help = !self.show_help,
                     sc.f5 => self.saveWorld() catch |e| self.say("save failed: {s}", .{@errorName(e)}),
                     sc.f9 => self.loadSaved() catch |e| self.say("load failed: {s}", .{@errorName(e)}),
                     else => if (self.opts.tools) self.toolKey(k.scancode),
@@ -1055,6 +1058,97 @@ pub const App = struct {
             },
             .path => {},
         };
+    }
+
+    fn toolHint(self: *const App) []const u8 {
+        return switch (self.tool) {
+            .select => "CLICK AN OBJECT, ANIMAL OR PERSON. DEL OR X REMOVES IT",
+            .prop => "CLICK THE GROUND TO PLACE. [ ] CHANGE OBJECT, R ROTATES",
+            .fence => "CLICK WHERE THE FENCE STARTS, THEN CLICK EACH CORNER. C ENDS THE LINE",
+            .path => "CLICK OR DRAG TO PAINT PATH TILES. [ ] CHANGE PATH",
+            .raise => "HOLD LEFT MOUSE TO RAISE THE GROUND",
+            .lower => "HOLD LEFT MOUSE TO LOWER THE GROUND",
+            .flatten => "CLICK TO PICK A HEIGHT, THEN HOLD TO FLATTEN TO IT",
+            .actor => "CLICK THE GROUND TO PLACE. [ ] CHANGE ANIMAL OR PERSON",
+        };
+    }
+
+    /// The on-screen display, drawn over the scene each frame.
+    pub fn overlay(self: *App, ui: *viewer.Ui, ctx: *viewer.FrameCtx) !void {
+        const scale: f32 = @max(1, @floor(ui.height / 360));
+        const pad = 6 * scale;
+        const line = 10 * scale;
+        const white = [4]f32{ 1, 1, 1, 1 };
+        const yellow = [4]f32{ 1, 0.92, 0.5, 1 };
+        const grey = [4]f32{ 0.8, 0.85, 0.9, 1 };
+        var buf: [256]u8 = undefined;
+        var y = pad;
+
+        // Top left: what the tool is doing.
+        var detail: []const u8 = "";
+        switch (self.tool) {
+            .prop => if (self.props.items.len > 0) {
+                detail = std.fs.path.basename(self.props.items[self.prop_i]);
+            },
+            .fence => if (self.fence_kinds.items.len > 0) {
+                detail = self.fence_kinds.items[self.fence_i];
+            },
+            .path => if (self.path_textures.items.len > 0) {
+                detail = std.fs.path.basename(self.path_textures.items[self.path_i]);
+            },
+            .actor => if (self.actor_names.items.len > 0) {
+                detail = self.actor_names.items[self.actor_i];
+            },
+            else => {},
+        }
+        const head = if (self.opts.tools)
+            std.fmt.bufPrint(&buf, "{s}{s}{s}", .{ self.tool.label(), if (detail.len > 0) ": " else "", detail }) catch ""
+        else
+            "VIEW";
+        try ui.label(pad, y, scale, head, white);
+        y += line + 2 * scale;
+        if (self.opts.tools and self.show_help) {
+            try ui.label(pad, y, scale, self.toolHint(), grey);
+            y += line + 2 * scale;
+        }
+        if (self.message_len > 0) {
+            try ui.label(pad, y, scale, self.message[0..self.message_len], yellow);
+        }
+
+        // Top right: simulation status.
+        const status = std.fmt.bufPrint(&buf, "{s} X{d:.2}   {d} AGENTS", .{
+            if (self.paused) "PAUSED" else "RUNNING",
+            self.speed,
+            self.sim.agents.items.len,
+        }) catch "";
+        const sw = viewer.Ui.textWidth(status, scale);
+        try ui.label(ui.width - sw - pad, pad, scale, status, white);
+
+        // Selection.
+        if (self.selected) |sel| {
+            const t = std.fmt.bufPrint(&buf, "SELECTED {s} #{d}", .{ @tagName(sel.kind), sel.id }) catch "";
+            const w2 = viewer.Ui.textWidth(t, scale);
+            try ui.label(ui.width - w2 - pad, pad + line + 2 * scale, scale, t, yellow);
+        }
+
+        // Key reference.
+        if (self.show_help) {
+            const lines = if (self.opts.tools) [_][]const u8{
+                "1 SELECT  2 OBJECT  3 FENCE  4 PATH  5 RAISE  6 LOWER  7 FLATTEN  8 ANIMAL/PERSON",
+                "[ ] CHOOSE (SHIFT: x10)  R ROTATE  Z UNDO  TAB PAUSE  , . SPEED  F5 SAVE  F9 LOAD",
+                "RIGHT-DRAG ORBIT   WHEEL ZOOM   WASD PAN   F1 HIDE THIS   ESC QUIT",
+            } else [_][]const u8{
+                "TAB PAUSE  , . SPEED",
+                "RIGHT OR LEFT-DRAG ORBIT   WHEEL ZOOM   WASD PAN   ESC QUIT",
+                "",
+            };
+            var by = ui.height - pad - line * @as(f32, @floatFromInt(lines.len));
+            for (lines) |l| {
+                if (l.len > 0) try ui.label(pad, by, scale, l, grey);
+                by += line;
+            }
+        }
+        _ = ctx;
     }
 
     fn updateTitle(self: *App, win: platform.Window) void {

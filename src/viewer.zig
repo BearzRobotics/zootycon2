@@ -11,6 +11,7 @@ const model = @import("model.zig");
 const terrain_mod = @import("terrain.zig");
 const map_mod = @import("map.zig");
 const entity = @import("entity.zig");
+const font = @import("font.zig");
 const bf = @import("bf.zig");
 const vfs_mod = @import("vfs.zig");
 const platform = @import("platform.zig");
@@ -200,8 +201,12 @@ fn compile(g: *const Gl, kind: gl.Enum, src: [:0]const u8) !gl.Uint {
 }
 
 fn makeProgram(g: *const Gl) !gl.Uint {
-    const vs = try compile(g, gl.VERTEX_SHADER, vs_src);
-    const fs = try compile(g, gl.FRAGMENT_SHADER, fs_src);
+    return makeProgramFrom(g, vs_src, fs_src);
+}
+
+fn makeProgramFrom(g: *const Gl, vs_text: [:0]const u8, fs_text: [:0]const u8) !gl.Uint {
+    const vs = try compile(g, gl.VERTEX_SHADER, vs_text);
+    const fs = try compile(g, gl.FRAGMENT_SHADER, fs_text);
     const p = g.createProgram();
     g.attachShader(p, vs);
     g.attachShader(p, fs);
@@ -261,6 +266,93 @@ fn poseNode(world: []Mat4, nf: *const nif.Nif, ref: nif.Ref, parent: Mat4, anim:
         else => {},
     }
 }
+
+const ui_vs: [:0]const u8 =
+    \\#version 330 core
+    \\layout(location=0) in vec2 aPos;
+    \\layout(location=1) in vec2 aUv;
+    \\layout(location=2) in vec4 aColor;
+    \\uniform vec2 uScreen;
+    \\out vec2 vUv;
+    \\out vec4 vColor;
+    \\void main() {
+    \\  vUv = aUv;
+    \\  vColor = aColor;
+    \\  gl_Position = vec4(aPos.x / uScreen.x * 2.0 - 1.0, 1.0 - aPos.y / uScreen.y * 2.0, 0.0, 1.0);
+    \\}
+;
+
+const ui_fs: [:0]const u8 =
+    \\#version 330 core
+    \\in vec2 vUv;
+    \\in vec4 vColor;
+    \\uniform sampler2D uAtlas;
+    \\out vec4 outColor;
+    \\void main() {
+    \\  outColor = vec4(vColor.rgb, vColor.a * texture(uAtlas, vUv).a);
+    \\}
+;
+
+/// Builds a frame's 2D overlay: rectangles and text in pixel coordinates
+/// (origin top-left). Filled by a hook's `overlay`, drawn after the scene.
+pub const Ui = struct {
+    gpa: std.mem.Allocator,
+    /// Per vertex: x, y, u, v, r, g, b, a.
+    verts: std.ArrayList(f32) = .empty,
+    /// Pixel size of the viewport.
+    width: f32 = 1,
+    height: f32 = 1,
+
+    pub fn deinit(self: *Ui) void {
+        self.verts.deinit(self.gpa);
+    }
+
+    fn quad(self: *Ui, x: f32, y: f32, w: f32, h: f32, ua: f32, va: f32, ub: f32, vb: f32, c: [4]f32) !void {
+        const v = [_][8]f32{
+            .{ x, y, ua, va, c[0], c[1], c[2], c[3] },
+            .{ x + w, y, ub, va, c[0], c[1], c[2], c[3] },
+            .{ x + w, y + h, ub, vb, c[0], c[1], c[2], c[3] },
+            .{ x, y, ua, va, c[0], c[1], c[2], c[3] },
+            .{ x + w, y + h, ub, vb, c[0], c[1], c[2], c[3] },
+            .{ x, y + h, ua, vb, c[0], c[1], c[2], c[3] },
+        };
+        for (v) |vert| try self.verts.appendSlice(self.gpa, &vert);
+    }
+
+    pub fn rect(self: *Ui, x: f32, y: f32, w: f32, h: f32, color: [4]f32) !void {
+        const sx: f32 = @floatFromInt((font.solid_cell % font.cols) * font.cell + font.cell / 2);
+        const sy: f32 = @floatFromInt((font.solid_cell / font.cols) * font.cell + font.cell / 2);
+        const u = sx / font.atlas_w;
+        const v = sy / font.atlas_h;
+        try self.quad(x, y, w, h, u, v, u, v, color);
+    }
+
+    pub fn textWidth(str: []const u8, scale: f32) f32 {
+        return @as(f32, @floatFromInt(str.len)) * 6 * scale;
+    }
+
+    /// Draws `text` with its top-left at (x, y); returns the width drawn.
+    pub fn text(self: *Ui, x: f32, y: f32, scale: f32, str: []const u8, color: [4]f32) !f32 {
+        var cx = x;
+        for (str) |ch| {
+            if (ch != ' ') {
+                const ci = font.cellFor(ch);
+                const gx: f32 = @floatFromInt((ci % font.cols) * font.cell);
+                const gy: f32 = @floatFromInt((ci / font.cols) * font.cell);
+                try self.quad(cx, y, 5 * scale, 7 * scale, gx / font.atlas_w, gy / font.atlas_h, (gx + 5) / font.atlas_w, (gy + 7) / font.atlas_h, color);
+            }
+            cx += 6 * scale;
+        }
+        return cx - x;
+    }
+
+    /// Text on a translucent background.
+    pub fn label(self: *Ui, x: f32, y: f32, scale: f32, str: []const u8, color: [4]f32) !void {
+        const pad = 2 * scale;
+        try self.rect(x - pad, y - pad, textWidth(str, scale) + pad * 2 - scale, 7 * scale + pad * 2, .{ 0, 0, 0, 0.55 });
+        _ = try self.text(x, y, scale, str, color);
+    }
+};
 
 // ------------------------------------------------------------------ scene
 
@@ -1281,6 +1373,13 @@ pub const Gfx = struct {
     u_decal: gl.Int,
     u_decal_mode: gl.Int,
     u_flat: [3]gl.Int,
+    // 2D overlay
+    ui_prog: gl.Uint,
+    ui_screen: gl.Int,
+    ui_atlas_loc: gl.Int,
+    ui_vao: gl.Uint,
+    ui_vbo: gl.Uint,
+    ui_tex: gl.Uint,
 
     pub fn open(self: *Gfx, opts: Options) !void {
         self.plat = platform.Platform.init() catch {
@@ -1324,6 +1423,57 @@ pub const Gfx = struct {
             g.getUniformLocation(self.prog, "uFlat2"),
             g.getUniformLocation(self.prog, "uFlat3"),
         };
+        try self.initUi();
+    }
+
+    fn initUi(self: *Gfx) !void {
+        const g = &self.g;
+        self.ui_prog = try makeProgramFrom(g, ui_vs, ui_fs);
+        self.ui_screen = g.getUniformLocation(self.ui_prog, "uScreen");
+        self.ui_atlas_loc = g.getUniformLocation(self.ui_prog, "uAtlas");
+        var atlas: [font.atlas_w * font.atlas_h * 4]u8 = undefined;
+        font.buildAtlas(&atlas);
+        g.genTextures(1, @ptrCast(&self.ui_tex));
+        g.bindTexture(gl.TEXTURE_2D, self.ui_tex);
+        g.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+        g.texImage2D(gl.TEXTURE_2D, 0, @intCast(gl.RGBA8), font.atlas_w, font.atlas_h, 0, gl.RGBA, gl.UNSIGNED_BYTE, &atlas);
+        g.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, @intCast(gl.NEAREST));
+        g.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, @intCast(gl.NEAREST));
+        g.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, @intCast(gl.CLAMP_TO_EDGE));
+        g.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, @intCast(gl.CLAMP_TO_EDGE));
+        g.genVertexArrays(1, @ptrCast(&self.ui_vao));
+        g.genBuffers(1, @ptrCast(&self.ui_vbo));
+        g.bindVertexArray(self.ui_vao);
+        g.bindBuffer(gl.ARRAY_BUFFER, self.ui_vbo);
+        const stride: gl.Sizei = 8 * 4;
+        g.enableVertexAttribArray(0);
+        g.vertexAttribPointer(0, 2, gl.FLOAT, 0, stride, @ptrFromInt(0));
+        g.enableVertexAttribArray(1);
+        g.vertexAttribPointer(1, 2, gl.FLOAT, 0, stride, @ptrFromInt(8));
+        g.enableVertexAttribArray(2);
+        g.vertexAttribPointer(2, 4, gl.FLOAT, 0, stride, @ptrFromInt(16));
+        g.bindVertexArray(0);
+    }
+
+    /// Draws the overlay built in `ui` over the finished scene.
+    fn drawUi(self: *Gfx, ui: *const Ui) void {
+        if (ui.verts.items.len == 0) return;
+        const g = &self.g;
+        g.disable(gl.DEPTH_TEST);
+        g.enable(gl.BLEND);
+        g.depthMask(0);
+        g.useProgram(self.ui_prog);
+        g.uniform2f(self.ui_screen, ui.width, ui.height);
+        g.uniform1i(self.ui_atlas_loc, 0);
+        g.activeTexture(gl.TEXTURE0);
+        g.bindTexture(gl.TEXTURE_2D, self.ui_tex);
+        g.bindVertexArray(self.ui_vao);
+        g.bindBuffer(gl.ARRAY_BUFFER, self.ui_vbo);
+        g.bufferData(gl.ARRAY_BUFFER, @intCast(ui.verts.items.len * 4), ui.verts.items.ptr, gl.DYNAMIC_DRAW);
+        g.drawArrays(gl.TRIANGLES, 0, @intCast(ui.verts.items.len / 8));
+        g.bindVertexArray(0);
+        g.depthMask(1);
+        g.enable(gl.DEPTH_TEST);
     }
 
     pub fn close(self: *Gfx) void {
@@ -1473,6 +1623,8 @@ pub fn loopWith(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Came
     var last_y: f32 = 0;
     var size = gfx.win.pixelSize();
     var held = [4]bool{ false, false, false, false }; // w a s d
+    var ui: Ui = .{ .gpa = gpa };
+    defer ui.deinit();
     var ctx: FrameCtx = .{ .cam = &cam, .win = gfx.win, .width = size.width, .height = size.height, .plat = plat };
 
     g.enable(gl.DEPTH_TEST);
@@ -1580,6 +1732,14 @@ pub fn loopWith(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Came
         for (scene.draws.items) |d| drawItem(gfx, scene, d);
         for (scene.actor_draws.items) |d| drawItem(gfx, scene, d);
         for (scene.overlay.items) |d| drawItem(gfx, scene, d);
+        const Hk = @typeInfo(@TypeOf(hooks)).pointer.child;
+        if (comptime @hasDecl(Hk, "overlay")) {
+            ui.verts.clearRetainingCapacity();
+            ui.width = @floatFromInt(size.width);
+            ui.height = @floatFromInt(size.height);
+            try hooks.overlay(&ui, &ctx);
+            gfx.drawUi(&ui);
+        }
 
         frame += 1;
         if (opts.screenshot) |w| {
