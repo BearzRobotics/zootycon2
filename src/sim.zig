@@ -39,6 +39,8 @@ pub const Hooks = struct {
     wage: ?*const fn (ctx: *anyopaque, binder: []const u8) f32 = null,
     /// If an entity is a shop or facility guests can use.
     venue: ?*const fn (ctx: *anyopaque, binder: []const u8) ?VenueInfo = null,
+    /// An animal species' habitat requirements.
+    habitat: ?*const fn (ctx: *anyopaque, binder: []const u8) ?Habitat = null,
 };
 
 /// A food or water container placed in the world.
@@ -107,6 +109,28 @@ pub const need_count = 5;
 const need_rate = [need_count]f32{ 0.35, 0.5, 0.3, 0.22, 0.12 };
 const need_seek = [need_count]f32{ 55, 55, 60, 75, 85 };
 
+/// Biomes in the order of `Habitat.sens`; names match the terrain's biome
+/// names and the tags of an entity's `BFGBiomeData`.
+pub const habitat_biomes = [_][]const u8{
+    "alpine",          "benthic",  "borealforest",  "coastal", "desert",  "grassland", "reef",
+    "pelagic",         "temperateforest", "tropicalrainforest", "tundra", "savannah", "scrub", "wetlands",
+};
+
+/// What a species needs from its enclosure.
+pub const Habitat = struct {
+    /// Sensitivity to each biome, -10 (hates) to 10 (home).
+    sens: [habitat_biomes.len]f32 = @splat(0),
+    /// Tiles for the first animal, and for each further one of the species.
+    space_first: f32 = 0,
+    space_more: f32 = 0,
+    species: []const u8 = "",
+};
+
+fn biomeIndex(name: []const u8) ?usize {
+    for (habitat_biomes, 0..) |b, i| if (std.ascii.eqlIgnoreCase(b, name)) return i;
+    return null;
+}
+
 /// What a shop or facility sells.
 pub const VenueInfo = struct { need: Need, price: f32, upkeep: f32 };
 
@@ -168,6 +192,17 @@ pub const Agent = struct {
     /// Hunger, thirst, bathroom, dessert and gift urges, 0..100.
     needs: [need_count]f32 = @splat(0),
     shop_prop: u32 = 0,
+    /// Habitat requirements (animals), and how the enclosure measures up.
+    habitat: ?Habitat = null,
+    hab_timer: f32 = 0,
+    /// 0..100 overall, and its parts.
+    hab_score: f32 = 100,
+    hab_biome: f32 = 100,
+    hab_space: f32 = 100,
+    /// Enclosure area and what the animals in it need, in tiles.
+    hab_area: f32 = 0,
+    hab_need: f32 = 0,
+    hab_open: bool = false,
     /// Animation the agent is playing, by manifest name.
     anim_name: []const u8 = "Stand_Idle",
     /// Id of the world actor this agent drives.
@@ -353,6 +388,16 @@ pub fn classify(binder: []const u8) Kind {
     return .animal;
 }
 
+/// The biome painted on the terrain vertex nearest (x, y), as an index into
+/// `habitat_biomes`, or null for non-natural paints.
+fn biomeAt(t: *const @import("terrain.zig").Terrain, x: f32, y: f32) ?usize {
+    const gx: u32 = @intFromFloat(std.math.clamp(@round(x / t.spacingX()), 0, @as(f32, @floatFromInt(t.width - 1))));
+    const gy: u32 = @intFromFloat(std.math.clamp(@round(y / t.spacingY()), 0, @as(f32, @floatFromInt(t.height - 1))));
+    const idx = t.paint[gy * t.width + gx];
+    if (idx >= t.biomes.len) return null;
+    return biomeIndex(t.biomes[idx]);
+}
+
 pub const Sim = struct {
     gpa: std.mem.Allocator,
     rng: std.Random.DefaultPrng,
@@ -520,7 +565,7 @@ pub const Sim = struct {
         var sum: f32 = 0;
         var n: f32 = 0;
         for (self.agents.items) |a| if (a.kind == .animal) if (a.brain) |b| {
-            sum += 100 - @max(b.needs[5], b.needs[6]);
+            sum += (100 - @max(b.needs[5], b.needs[6])) * (0.5 + 0.5 * a.hab_score / 100.0);
             n += 1;
         };
         return if (n > 0) sum / n else 0;
@@ -538,12 +583,18 @@ pub const Sim = struct {
         };
         const guest = kind == .person and isGuest(a.binder);
         const rnd = self.rng.random();
+        var hab: ?Habitat = null;
+        if (kind == .animal) if (self.hooks) |h| if (h.habitat) |hf| {
+            hab = hf(h.ctx, a.binder);
+        };
         const keeper = kind == .person and std.ascii.findIgnoreCase(a.binder, "keeper") != null;
         var wage: f32 = 0;
         if (kind == .person and !guest) if (self.hooks) |h| if (h.wage) |wf| {
             wage = wf(h.ctx, a.binder);
         };
         return .{
+            .habitat = hab,
+            .hab_timer = rnd.float(f32) * 4.0,
             .is_keeper = keeper,
             .wage = wage,
             .brain = brain,
@@ -665,6 +716,13 @@ pub const Sim = struct {
         }
         for (self.agents.items) |*ag| {
             ag.anim_time += dt;
+            if (ag.habitat != null) {
+                ag.hab_timer -= dt;
+                if (ag.hab_timer <= 0) {
+                    ag.hab_timer = 6;
+                    self.assessHabitat(ag, w);
+                }
+            }
             if (ag.brain != null and self.hooks != null) {
                 self.thinkAnimal(ag, w, dt);
                 continue;
@@ -685,6 +743,74 @@ pub const Sim = struct {
                 .walk => self.walk(ag, w, dt),
             }
         }
+    }
+
+    /// Measures the animal's enclosure (a flood fill over 3x3 unit tiles that
+    /// fences block) and scores biome fit and space. An enclosure bigger than
+    /// `max_cells` counts as open ground.
+    fn assessHabitat(self: *Sim, ag: *Agent, w: *const world_mod.World) void {
+        const hab = ag.habitat orelse return;
+        const max_cells = 700;
+        const tile: f32 = 3.0;
+        const Key = struct { x: i32, y: i32 };
+        var seen: std.AutoHashMapUnmanaged(Key, void) = .empty;
+        defer seen.deinit(self.gpa);
+        var queue: std.ArrayList(Key) = .empty;
+        defer queue.deinit(self.gpa);
+        const start = Key{ .x = @intFromFloat(@floor(ag.pos[0] / tile)), .y = @intFromFloat(@floor(ag.pos[1] / tile)) };
+        seen.put(self.gpa, start, {}) catch return;
+        queue.append(self.gpa, start) catch return;
+        var head: usize = 0;
+        var open = false;
+        const t = &w.terrain;
+        while (head < queue.items.len) : (head += 1) {
+            if (queue.items.len > max_cells) {
+                open = true;
+                break;
+            }
+            const c = queue.items[head];
+            const cx = (@as(f32, @floatFromInt(c.x)) + 0.5) * tile;
+            const cy = (@as(f32, @floatFromInt(c.y)) + 0.5) * tile;
+            const dirs = [4][2]i32{ .{ 1, 0 }, .{ -1, 0 }, .{ 0, 1 }, .{ 0, -1 } };
+            for (dirs) |d| {
+                const nk = Key{ .x = c.x + d[0], .y = c.y + d[1] };
+                const nx = (@as(f32, @floatFromInt(nk.x)) + 0.5) * tile;
+                const ny = (@as(f32, @floatFromInt(nk.y)) + 0.5) * tile;
+                // The edge of the map is a boundary too.
+                if (nx < 0 or ny < 0 or nx > t.world_width or ny > t.world_height) continue;
+                if (seen.contains(nk)) continue;
+                if (self.blocked(.{ cx, cy }, .{ nx, ny })) continue;
+                seen.put(self.gpa, nk, {}) catch return;
+                queue.append(self.gpa, nk) catch return;
+            }
+        }
+        const cells: f32 = @floatFromInt(queue.items.len);
+        // Biome fit: average sensitivity over the enclosure's tiles.
+        var sens_sum: f32 = 0;
+        var sens_n: f32 = 0;
+        for (queue.items) |c| {
+            const px = (@as(f32, @floatFromInt(c.x)) + 0.5) * tile;
+            const py = (@as(f32, @floatFromInt(c.y)) + 0.5) * tile;
+            const bi = biomeAt(t, px, py) orelse continue;
+            sens_sum += hab.sens[bi];
+            sens_n += 1;
+        }
+        const avg = if (sens_n > 0) sens_sum / sens_n else 0;
+        ag.hab_biome = std.math.clamp(50 + avg * 5, 0, 100);
+        // Space: the species' animals in the same enclosure share it.
+        var mates: f32 = 0;
+        for (self.agents.items) |o| {
+            if (o.kind != .animal or o.habitat == null) continue;
+            if (!std.mem.eql(u8, o.habitat.?.species, hab.species)) continue;
+            const k = Key{ .x = @intFromFloat(@floor(o.pos[0] / tile)), .y = @intFromFloat(@floor(o.pos[1] / tile)) };
+            if (open or seen.contains(k)) mates += 1;
+        }
+        const need = hab.space_first + hab.space_more * @max(0, mates - 1);
+        ag.hab_area = cells;
+        ag.hab_need = need;
+        ag.hab_open = open;
+        ag.hab_space = if (open or need <= 0) 100 else std.math.clamp(cells / need, 0, 1) * 100;
+        ag.hab_score = 0.55 * ag.hab_biome + 0.45 * ag.hab_space;
     }
 
     fn feederById(self: *Sim, id: u32) ?*Feeder {
@@ -906,7 +1032,7 @@ pub const Sim = struct {
                 // A hungry, thirsty animal is less fun to watch.
                 var welfare: f32 = 100;
                 if (ag.view_target) |tid| if (self.agentFor(tid)) |target| if (target.brain) |b| {
-                    welfare = 100 - @max(b.needs[5], b.needs[6]);
+                    welfare = (100 - @max(b.needs[5], b.needs[6])) * (0.5 + 0.5 * target.hab_score / 100.0);
                 };
                 const worth = 0.3 + 0.7 * welfare / 100.0;
                 ag.happiness = @min(100, ag.happiness + (6 + self.rng.random().float(f32) * 4) * worth);

@@ -1210,6 +1210,56 @@ pub const App = struct {
         return .{ .need = need, .price = price, .upkeep = upkeep };
     }
 
+    fn findElem(e: *const xml.Element, name: []const u8) ?*const xml.Element {
+        if (std.ascii.eqlIgnoreCase(e.name, name)) return e;
+        for (e.children) |c| if (findElem(c, name)) |v| return v;
+        return null;
+    }
+
+    /// A species' biome sensitivities and space needs from its entity data.
+    fn hookHabitat(ctx: *anyopaque, binder: []const u8) ?sim_mod.Habitat {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        const b = self.reg.get(binder) orelse return null;
+        const ch = self.reg.chain(self.gpa, b) catch return null;
+        defer self.gpa.free(ch);
+        var h: sim_mod.Habitat = .{};
+        var found = false;
+        var got_first = false;
+        var got_more = false;
+        var got_species = false;
+        var i = ch.len;
+        // Most specific binder first; each value is taken once.
+        while (i > 0) {
+            i -= 1;
+            const root = ch[i].root;
+            if (!found) if (findElem(root, "BFGBiomeData")) |bd| {
+                found = true;
+                for (bd.children, 0..) |_, ci| {
+                    const c = bd.children[ci];
+                    for (sim_mod.habitat_biomes, 0..) |name, bi| if (std.ascii.eqlIgnoreCase(c.name, name)) {
+                        if (c.attr("sensitivity")) |sv| h.sens[bi] = std.fmt.parseFloat(f32, sv) catch 0;
+                    };
+                }
+            };
+            if (findElem(root, "BFAIEntityDataShared")) |sh| {
+                if (!got_first) if (sh.attr("f_RequiredInitialSpace")) |v| {
+                    h.space_first = std.fmt.parseFloat(f32, v) catch 0;
+                    got_first = true;
+                };
+                if (!got_more) if (sh.attr("f_RequiredAdditionalSpace")) |v| {
+                    h.space_more = std.fmt.parseFloat(f32, v) catch 0;
+                    got_more = true;
+                };
+                if (!got_species) if (sh.attr("s_Species")) |v| {
+                    h.species = v;
+                    got_species = true;
+                };
+            }
+        }
+        if (!found and !got_first) return null;
+        return h;
+    }
+
     fn hookWage(ctx: *anyopaque, binder: []const u8) f32 {
         const self: *App = @ptrCast(@alignCast(ctx));
         const b = self.reg.get(binder) orelse return 0;
@@ -1265,7 +1315,7 @@ pub const App = struct {
     }
 
     fn installHooks(self: *App) void {
-        self.sim.hooks = .{ .ctx = self, .brain = hookBrain, .anim_len = hookAnimLen, .flag = hookFlag, .feeder = hookFeeder, .wage = hookWage, .venue = hookVenue };
+        self.sim.hooks = .{ .ctx = self, .brain = hookBrain, .anim_len = hookAnimLen, .flag = hookFlag, .feeder = hookFeeder, .wage = hookWage, .venue = hookVenue, .habitat = hookHabitat };
         self.sim.guest_binders = self.guest_names.items;
         self.updateGuestCap();
     }
@@ -1381,6 +1431,7 @@ pub const App = struct {
             });
             for (self.sim.agents.items[0..@min(self.sim.agents.items.len, 6)]) |ag| {
                 std.debug.print("agent #{d}: {s} speed={d:.2} state={s} anim={s} brain={}\n", .{ ag.id, @tagName(ag.kind), ag.speed, @tagName(ag.state), ag.anim_name, ag.brain != null });
+                if (ag.habitat != null) std.debug.print("  habitat {d:.0} biome {d:.0} space {d:.0} ({d:.0}/{d:.0} tiles, open={})\n", .{ ag.hab_score, ag.hab_biome, ag.hab_space, ag.hab_area, ag.hab_need, ag.hab_open });
             }
             for (self.sim.feeders.items) |f| std.debug.print("feeder #{d} {s}: food {d:.0}\n", .{ f.prop_id, f.binder, f.food });
             std.debug.print("animal welfare: {d:.0}\n", .{self.sim.animalWelfare()});
@@ -2165,6 +2216,13 @@ pub const App = struct {
                                 .color = needColor(b.needs[i]),
                                 .is_bar = true,
                             });
+                        }
+                        if (ag.habitat != null) {
+                            try rows.append(self.gpa, .{ .text = "HABITAT", .frac = ag.hab_score / 100.0, .color = .{ 0.45, 0.8, 0.5, 1 }, .is_bar = true });
+                            try rows.append(self.gpa, .{ .text = "BIOME FIT", .frac = ag.hab_biome / 100.0, .color = .{ 0.45, 0.8, 0.5, 1 }, .is_bar = true });
+                            if (ag.hab_open) {
+                                try rows.append(self.gpa, .{ .text = "SPACE: OPEN GROUND", .frac = 0, .color = grey, .is_bar = false });
+                            } else try rows.append(self.gpa, .{ .text = try std.fmt.allocPrint(a, "SPACE {d:.0}/{d:.0} TILES", .{ ag.hab_area, ag.hab_need }), .frac = 0, .color = grey, .is_bar = false });
                         }
                         try rows.append(self.gpa, .{ .text = try std.fmt.allocPrint(a, "DOING {s}", .{ag.anim_name}), .frac = 0, .color = grey, .is_bar = false });
                         try rows.append(self.gpa, .{ .text = try std.fmt.allocPrint(a, "WELFARE {d:.0}", .{100 - @max(b.needs[5], b.needs[6])}), .frac = 0, .color = grey, .is_bar = false });
