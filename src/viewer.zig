@@ -120,6 +120,7 @@ const vs_src: [:0]const u8 =
     \\layout(location=4) in vec4 aWeight;
     \\layout(location=5) in vec2 aUv2;
     \\out vec2 vUv2;
+    \\out vec4 vW;
     \\uniform mat4 uBones[96];
     \\uniform int uSkinned;
     \\uniform mat4 uModel;
@@ -138,6 +139,7 @@ const vs_src: [:0]const u8 =
     \\  vN = mat3(m) * aNormal;
     \\  vUv = aUv;
     \\  vUv2 = aUv2;
+    \\  vW = aWeight;
     \\  gl_Position = uViewProj * w;
     \\}
 ;
@@ -148,6 +150,10 @@ const fs_src: [:0]const u8 =
     \\in vec3 vP;
     \\in vec2 vUv;
     \\in vec2 vUv2;
+    \\in vec4 vW;
+    \\uniform sampler2D uFlat1;
+    \\uniform sampler2D uFlat2;
+    \\uniform sampler2D uFlat3;
     \\uniform sampler2D uDecal;
     \\uniform int uDecalMode; // 0 none, 1 decal on uv set 0, 2 decal on uv set 1
     \\uniform sampler2D uTex;
@@ -166,7 +172,8 @@ const fs_src: [:0]const u8 =
     \\  if (uTerrain == 1) {
     \\    // Flat ground shows the cover texture, steep slopes the cliff texture.
     \\    float steep = smoothstep(0.2, 0.5, 1.0 - n.z);
-    \\    c = mix(c, texture(uTex2, vUv * 0.5), steep);
+    \\    vec4 flat_c = c * vW.x + texture(uFlat1, vUv) * vW.y + texture(uFlat2, vUv) * vW.z + texture(uFlat3, vUv) * vW.w;
+    \\    c = mix(flat_c, texture(uTex2, vUv * 0.5), steep);
     \\  }
     \\  if (c.a < uAlphaCut) discard;
     \\  vec3 l = normalize(vec3(0.4, -0.5, 0.8));
@@ -285,6 +292,8 @@ const Draw = struct {
     inst: ?u32 = null,
     /// Decals blend over what is behind them without writing depth.
     depth_write: bool = true,
+    /// Further biome ground textures for terrain, bound to units 3 to 5.
+    flat_extra: [3]gl.Uint = .{ 0, 0, 0 },
     /// Second texture for terrain (steep slopes); 0 for ordinary draws.
     texture2: gl.Uint = 0,
     /// Pose-driven draws read `Scene.world[block]` each frame; others use `world`.
@@ -682,7 +691,7 @@ pub const Scene = struct {
     }
 
     /// Adds a terrain mesh: one vertex per grid point, shaded by normals.
-    pub fn addTerrain(self: *Scene, t: *const terrain_mod.Terrain, tint: [4]f32, flat_tex: gl.Uint, steep_tex: gl.Uint) !void {
+    pub fn addTerrain(self: *Scene, t: *const terrain_mod.Terrain, tint: [4]f32, flat_tex: [4]gl.Uint, steep_tex: gl.Uint, slot_of: []const u8) !void {
         const w = t.width;
         const h = t.height;
         const sx = t.spacingX();
@@ -710,6 +719,7 @@ pub const Scene = struct {
             buf[o + 7] = @as(f32, @floatFromInt(j)) / 4.0;
             buf[o + 16] = buf[o + 6];
             buf[o + 17] = buf[o + 7];
+            buf[o + 12 + @min(slot_of[j * w + i], 3)] = 1; // biome slot weight
         };
         const idx = try self.gpa.alloc(u32, @as(usize, w - 1) * (h - 1) * 6);
         defer self.gpa.free(idx);
@@ -731,7 +741,8 @@ pub const Scene = struct {
             .vao = vao,
             .index_count = @intCast(idx.len),
             .world = identity,
-            .texture = flat_tex,
+            .texture = flat_tex[0],
+            .flat_extra = .{ flat_tex[1], flat_tex[2], flat_tex[3] },
             .texture2 = steep_tex,
             .tint = tint,
             .blend = false,
@@ -1122,6 +1133,7 @@ const Gfx = struct {
     u_terrain: gl.Int,
     u_decal: gl.Int,
     u_decal_mode: gl.Int,
+    u_flat: [3]gl.Int,
 
     fn open(self: *Gfx, opts: Options) !void {
         self.plat = platform.Platform.init() catch {
@@ -1160,6 +1172,11 @@ const Gfx = struct {
         self.u_terrain = g.getUniformLocation(self.prog, "uTerrain");
         self.u_decal = g.getUniformLocation(self.prog, "uDecal");
         self.u_decal_mode = g.getUniformLocation(self.prog, "uDecalMode");
+        self.u_flat = .{
+            g.getUniformLocation(self.prog, "uFlat1"),
+            g.getUniformLocation(self.prog, "uFlat2"),
+            g.getUniformLocation(self.prog, "uFlat3"),
+        };
     }
 
     fn close(self: *Gfx) void {
@@ -1279,10 +1296,15 @@ fn loop(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Camera, play
         g.uniform1i(gfx.u_tex, 0);
         g.uniform1i(gfx.u_tex2, 1);
         g.uniform1i(gfx.u_decal, 2);
+        for (gfx.u_flat, 0..) |loc, i| g.uniform1i(loc, @intCast(3 + i));
         for (scene.draws.items) |d| {
             g.activeTexture(gl.TEXTURE0 + 1);
             g.bindTexture(gl.TEXTURE_2D, d.texture2);
             g.uniform1i(gfx.u_terrain, if (d.texture2 != 0) 1 else 0);
+            if (d.texture2 != 0) for (d.flat_extra, 0..) |tx, i| {
+                g.activeTexture(gl.TEXTURE0 + 3 + @as(gl.Enum, @intCast(i)));
+                g.bindTexture(gl.TEXTURE_2D, tx);
+            };
             g.activeTexture(gl.TEXTURE0 + 2);
             g.bindTexture(gl.TEXTURE_2D, d.decal);
             g.uniform1i(gfx.u_decal_mode, if (d.decal != 0) d.decal_mode else 0);
@@ -1437,23 +1459,52 @@ pub fn runMap(gpa: std.mem.Allocator, vfs: *vfs_mod.Vfs, path: []const u8, opts:
     scene.interactive = false;
     scene.want_skin = false;
     scene.dynamic_draws = false;
-    // Ground textures come from the map's biome definition.
-    var flat_tex = scene.white;
+    // Ground textures come from the biome definitions: the (up to four) most
+    // painted biomes each get a slot, and every vertex blends towards its own.
+    var flat_tex = [4]gl.Uint{ scene.white, scene.white, scene.white, scene.white };
     var steep_tex = scene.white;
+    const slot_of = try gpa.alloc(u8, terr.paint.len);
+    defer gpa.free(slot_of);
     {
-        var biome_path_buf: [128]u8 = undefined;
-        const biome_path = std.fmt.bufPrint(&biome_path_buf, "biomes/{s}.xml", .{mp.biome}) catch "";
-        if (vfs.read(gpa, biome_path)) |bytes| {
+        var counts: [256]usize = @splat(0);
+        for (terr.paint) |b| counts[b] += 1;
+        var slots: [4]?u8 = .{ null, null, null, null };
+        for (&slots) |*sl| {
+            var best: ?u8 = null;
+            for (terr.biomes, 0..) |_, bi| {
+                if (counts[bi] == 0) continue;
+                if (std.mem.indexOfScalar(?u8, &slots, @as(u8, @intCast(bi))) != null) continue;
+                if (best == null or counts[bi] > counts[best.?]) best = @intCast(bi);
+            }
+            sl.* = best;
+        }
+        for (slots, 0..) |sl, si| {
+            const bi = sl orelse continue;
+            if (bi >= terr.biomes.len) continue;
+            var path_buf: [128]u8 = undefined;
+            const bpath = std.fmt.bufPrint(&path_buf, "biomes/{s}.xml", .{terr.biomes[bi]}) catch continue;
+            const bytes = vfs.read(gpa, bpath) catch continue;
             defer gpa.free(bytes);
             var arena: std.heap.ArenaAllocator = .init(gpa);
             defer arena.deinit();
-            if (@import("xml.zig").parse(arena.allocator(), bytes, null)) |root| {
-                if (root.attr("groundCoverTexture")) |t| flat_tex = scene.loadTexturePath(t);
-                if (root.attr("cliffHoriz")) |t| steep_tex = scene.loadTexturePath(t);
-            } else |_| {}
-        } else |_| {}
+            const root = @import("xml.zig").parse(arena.allocator(), bytes, null) catch continue;
+            if (root.attr("groundCoverTexture")) |t| flat_tex[si] = scene.loadTexturePath(t);
+            if (si == 0) if (root.attr("cliffHoriz")) |t| {
+                steep_tex = scene.loadTexturePath(t);
+            };
+        }
+        // Slots with no texture fall back to the main biome's.
+        for (&flat_tex) |*t| if (t.* == scene.white) {
+            t.* = flat_tex[0];
+        };
+        for (terr.paint, slot_of) |b, *out| {
+            out.* = 0;
+            for (slots, 0..) |sl, si| if (sl != null and sl.? == b) {
+                out.* = @intCast(si);
+            };
+        }
     }
-    try scene.addTerrain(&terr, .{ 1, 1, 1, 1 }, flat_tex, steep_tex);
+    try scene.addTerrain(&terr, .{ 1, 1, 1, 1 }, flat_tex, steep_tex, slot_of);
 
     var placed: usize = 0;
     var missing: usize = 0;

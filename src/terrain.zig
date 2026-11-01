@@ -8,7 +8,8 @@
 //!   that can be painted on the map.
 //!   Then grid_w * grid_h vertex records, row-major with x varying fastest.
 //!   Every record starts with the same 26 bytes:
-//!     f32 height; f32 a (0..0.2, meaning unknown); u32 b; u32 c; u16 d;
+//!     f32 height; f32 a (0..0.2, meaning unknown); u32 b (the biome painted
+//!     here, an index into the name table); u32 c; u16 d;
 //!     f32 base (6.0); f32 top (26.0)
 //!   followed by 1 to 4 more bytes whose count depends on the file version
 //!   (record sizes of 27, 28, 29 and 30 occur), so the stride is detected
@@ -29,6 +30,8 @@ pub const Terrain = struct {
     biomes: []const []const u8,
     /// World-space z for each vertex, row-major, x fastest.
     z: []const f32,
+    /// Biome painted on each vertex: an index into `biomes`.
+    paint: []const u8,
 
     pub fn deinit(self: *Terrain) void {
         self.arena.deinit();
@@ -129,9 +132,11 @@ pub fn parse(gpa: std.mem.Allocator, data: []const u8) Error!Terrain {
     const count = @as(usize, w) * h;
     const stride = detectStride(data, pos, count) orelse return error.BadTerrain;
     const z = try a.alloc(f32, count);
-    for (z, 0..) |*out, i| {
+    const paint = try a.alloc(u8, count);
+    for (z, paint, 0..) |*out, *pt, i| {
         const rec = pos + i * stride;
         out.* = f32le(data, rec) + f32le(data, rec + 18);
+        pt.* = @intCast(@min(u32le(data, rec + 8), 255));
     }
     return .{
         .arena = arena,
@@ -141,6 +146,7 @@ pub fn parse(gpa: std.mem.Allocator, data: []const u8) Error!Terrain {
         .world_height = world_h,
         .biomes = names,
         .z = z,
+        .paint = paint,
     };
 }
 
