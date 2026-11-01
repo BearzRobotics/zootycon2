@@ -114,6 +114,8 @@ const MenuAction = enum {
     rot_left,
     rot_right,
     toggle_hud,
+    ui_size,
+    toggle_delete,
     close_selection,
     track_camera,
     back,
@@ -290,6 +292,9 @@ pub const App = struct {
     /// The game's own HUD, drawn from its layout files.
     hud: ?struct { shell: uilayout.Layout, bucks: ?uilayout.Layout, info: ?uilayout.Layout = null } = null,
     hud_on: bool = true,
+    /// Interface size multiplier (settings: UI SIZE).
+    ui_zoom: f32 = 1.0,
+    delete_mode: bool = false,
     hud_text: [64]u8 = undefined,
     /// The buy panel: which main category is open (0 construction, 1 animals,
     /// 2 terraform, 3 staff; null = closed), its tab, and scroll position.
@@ -1082,6 +1087,11 @@ pub const App = struct {
         } else if (std.mem.eql(u8, verb, "drain")) {
             try self.sim.sync(&self.world);
             for (self.sim.feeders.items) |*f| f.food = 20;
+        } else if (std.mem.eql(u8, verb, "needy")) {
+            try self.sim.sync(&self.world);
+            for (self.sim.agents.items) |*ag| if (ag.is_guest) {
+                ag.needs[0] = 95;
+            };
         } else if (std.mem.eql(u8, verb, "hungry")) {
             try self.sim.sync(&self.world);
             for (self.sim.agents.items) |*ag| if (ag.brain) |*b| {
@@ -1790,6 +1800,17 @@ pub const App = struct {
                 ctx.cam.yaw += 0.35;
                 ctx.snap_camera = true;
             },
+            .ui_size => {
+                self.ui_zoom = if (self.ui_zoom < 1.2) 1.25 else if (self.ui_zoom < 1.4) 1.5 else if (self.ui_zoom < 1.8) 2.0 else 1.0;
+            },
+            .toggle_delete => {
+                self.delete_mode = !self.delete_mode;
+                if (self.delete_mode) {
+                    self.tool = .select;
+                    self.buy_cat = null;
+                    self.say("delete mode: click something to remove it", .{});
+                }
+            },
             .close_selection => {
                 self.selected = null;
                 self.track_id = null;
@@ -1937,6 +1958,7 @@ pub const App = struct {
                 y += try self.menuButton(ui, y, scale, std.fmt.bufPrint(&b, "HELP TEXT: {s}", .{if (self.show_help) "ON" else "OFF"}) catch "", .{ .menu = .toggle_help }, self.show_help);
                 y += try self.menuButton(ui, y, scale, std.fmt.bufPrint(&b, "GUEST ARRIVALS: {s}", .{if (self.arrivals_on) "ON" else "OFF"}) catch "", .{ .menu = .toggle_arrivals }, self.arrivals_on);
                 y += try self.menuButton(ui, y, scale, std.fmt.bufPrint(&b, "DAY/NIGHT CLOCK: {s}", .{if (self.tod_auto) "RUNNING" else "STOPPED"}) catch "", .{ .menu = .toggle_clock }, self.tod_auto);
+ y += try self.menuButton(ui, y, scale, std.fmt.bufPrint(&b, "UI SIZE: {d:.0}%  (CLICK TO CHANGE)", .{self.ui_zoom * 100}) catch "", .{ .menu = .ui_size }, false);
                 y += try self.menuButton(ui, y, scale, std.fmt.bufPrint(&b, "GAME HUD: {s}", .{if (self.hud_on) "ON" else "OFF"}) catch "", .{ .menu = .toggle_hud }, self.hud_on);
                 y += try self.menuButton(ui, y, scale, std.fmt.bufPrint(&b, "SOUND: {s}", .{if (self.soundOn()) "ON" else "OFF"}) catch "", .{ .menu = .toggle_sound }, self.soundOn());
                 y += try self.menuButton(ui, y, scale, std.fmt.bufPrint(&b, "MODERN LIGHTING: {s}", .{if (self.scene.fx.modern) "ON" else "OFF"}) catch "", .{ .menu = .toggle_modern }, self.scene.fx.modern);
@@ -1955,7 +1977,7 @@ pub const App = struct {
 
     /// How far the right-hand panels move down to clear the game's money display.
     fn hudRightShift(self: *const App, ui: *const viewer.Ui) f32 {
-        return if (self.hudActive()) 58 * uilayout.Canvas.fit(ui.width, ui.height).scale else 0;
+        return if (self.hudActive()) 58 * self.canvas(ui).scale else 0;
     }
 
 
@@ -1972,7 +1994,9 @@ pub const App = struct {
         for (0..self.path_textures.items.len) |i| add(self, .path, i);
         for (0..self.props.items.len) |i| add(self, .scenery, i);
         for (self.food_names.items, 0..) |n, i| {
-            if (self.feederKind(n) != null) add(self, .food, i);
+            // Water-only feeders (reefs, buoys) need a water surface we do not have yet.
+            const aquatic = std.ascii.startsWithIgnoreCase(n, "artificialreef") or std.ascii.startsWithIgnoreCase(n, "buoy");
+            if (self.feederKind(n) != null and !aquatic) add(self, .food, i);
             if (self.reg.get(n)) |b| if (venueNeed(b) != null) add(self, .building, i);
         }
         for (self.actor_names.items, 0..) |n, i| {
@@ -2038,6 +2062,7 @@ pub const App = struct {
     }
 
     fn openBuyCat(self: *App, cat: u8) void {
+        self.delete_mode = false;
         if (self.buy_cat != null and self.buy_cat.? == cat) {
             self.buy_cat = null;
             return;
@@ -2353,6 +2378,44 @@ pub const App = struct {
         };
     }
 
+    fn canvas(self: *const App, ui: *const viewer.Ui) uilayout.Canvas {
+        var c = uilayout.Canvas.fit(ui.width, ui.height);
+        c.scale *= self.ui_zoom;
+        c.off_x = ui.width - uilayout.canvas_w * c.scale;
+        c.off_y = ui.height - uilayout.canvas_h * c.scale;
+        return c;
+    }
+
+    /// Thought icons over guests' heads: a need that has become urgent, or
+    /// whether the guest is delighted or miserable.
+    fn drawEmotes(self: *App, ui: *viewer.Ui, ctx: *viewer.FrameCtx) void {
+        if (ctx.cam.dist > 90) return;
+        const size = @max(18, ui.height / 24) * self.ui_zoom;
+        var shown: usize = 0;
+        for (self.sim.agents.items) |ag| {
+            if (!ag.is_guest or ag.leave_done) continue;
+            var path: ?[]const u8 = null;
+            var worst: f32 = 80;
+            const icons = [3][]const u8{ "ui/icon_needs/all_hunger.dds", "ui/icon_needs/all_thirst.dds", "ui/icon_needs/guest_bathroom.dds" };
+            for (ag.needs[0..3], icons) |v, ip| if (v >= worst) {
+                worst = v;
+                path = ip;
+            };
+            if (path == null) {
+                if (ag.happiness >= 80) path = "ui/icon_needs/all_good.dds" else if (ag.happiness <= 20) path = "ui/icon_needs/all_bad.dds";
+            }
+            const ip = path orelse continue;
+            const head = [3]f32{ ag.pos[0], ag.pos[1], ag.pos[2] + 2.6 };
+            const sp = ctx.cam.project(head, ui.width, ui.height) orelse continue;
+            if (sp[0] < -size or sp[0] > ui.width + size or sp[1] < -size or sp[1] > ui.height + size) continue;
+            const spr = ui.sprite(ip) orelse continue;
+            const bob = @sin(@as(f32, @floatCast(self.sim.time)) * 3 + @as(f32, @floatFromInt(ag.id))) * size * 0.06;
+            ui.image(spr, sp[0] - size / 2, sp[1] - size * 0.95 + bob, size, size, .{ 0, 0, spr.w, spr.h }, .{ 1, 1, 1, 0.95 }) catch {};
+            shown += 1;
+            if (shown >= 60) break;
+        }
+    }
+
     fn hudActive(self: *const App) bool {
         return self.hud != null and self.hud_on and self.opts.tools;
     }
@@ -2397,7 +2460,7 @@ pub const App = struct {
         if (eq(name, "flatten")) return .{ .tool = .flatten };
         if (eq(name, "Zoofinance")) return .{ .menu = .open_finances };
         if (eq(name, "undo")) return .{ .menu = .undo };
-        if (eq(name, "delete")) return .{ .menu = .delete_selected };
+        if (eq(name, "delete")) return .{ .menu = .toggle_delete };
         if (eq(name, "options")) return .{ .menu = .open_pause };
         if (eq(name, "pause")) return .{ .menu = .toggle_pause };
         if (eq(name, "Zoom In")) return .{ .menu = .zoom_in };
@@ -2437,6 +2500,7 @@ pub const App = struct {
             if (eq(n.name, "valley")) info.on = self.tool == .lower;
             if (eq(n.name, "flatten")) info.on = self.tool == .flatten;
             if (eq(n.name, "pause")) info.on = self.paused;
+            if (eq(n.name, "delete")) info.on = self.delete_mode;
         }
         return info;
     }
@@ -2452,7 +2516,7 @@ pub const App = struct {
         const h = &(self.hud orelse return);
         var d: uilayout.Draw = .{
             .ui = ui,
-            .canvas = uilayout.Canvas.fit(ui.width, ui.height),
+            .canvas = self.canvas(ui),
             .hooks = .{ .ctx = self, .info = hudInfo, .button = hudButton },
             .mouse = toPixels(ctx, ctx.mouse[0], ctx.mouse[1]),
             .pressed = self.lmb,
@@ -2682,6 +2746,7 @@ pub const App = struct {
             .select => {
                 self.selected = self.pick(r.origin, r.dir);
                 self.title_dirty = true;
+                if (self.delete_mode and self.selected != null) self.deleteSelected();
             },
             .prop => if (hit) |h| self.placeProp(h) catch {},
             .actor => if (hit) |h| self.placeActor(h) catch {},
@@ -2799,7 +2864,7 @@ pub const App = struct {
 
     /// The on-screen display, drawn over the scene each frame.
     pub fn overlay(self: *App, ui: *viewer.Ui, ctx: *viewer.FrameCtx) !void {
-        const scale: f32 = @max(1, @round(ui.height / 360));
+        const scale: f32 = @max(1, @round(ui.height / 360 * self.ui_zoom));
         const pad = 6 * scale;
         const line = 10 * scale;
         const white = [4]f32{ 1, 1, 1, 1 };
@@ -2839,7 +2904,7 @@ pub const App = struct {
         else
             "VIEW";
         // The game's date bar and stars take the top-left corner.
-        const lx = if (self.hudActive()) pad + 300 * uilayout.Canvas.fit(ui.width, ui.height).scale else pad;
+        const lx = if (self.hudActive()) pad + 300 * self.canvas(ui).scale else pad;
         try ui.label(lx, y, scale, head, white);
         y += line + 2 * scale;
         // The right-hand statistics take the same row, so clip the hint to fit.
@@ -2865,8 +2930,10 @@ pub const App = struct {
             if (self.tod_auto) "+" else "",
         }) catch "";
         const sw = viewer.Ui.textWidth(status, scale);
-        const ry = if (self.hudActive()) pad + 58 * uilayout.Canvas.fit(ui.width, ui.height).scale else pad;
+        const ry = if (self.hudActive()) pad + 58 * self.canvas(ui).scale else pad;
         try ui.label(ui.width - sw - pad, ry, scale, status, white);
+
+        self.drawEmotes(ui, ctx);
 
         // Clickable interface.
         if (self.opts.tools) try self.drawControls(ui, scale, pad, line);
@@ -3146,6 +3213,13 @@ pub const App = struct {
     }
 
     /// Terrain height for the camera to follow.
+    /// The camera stays over the map.
+    pub fn clampCenter(self: *App, c: *[3]f32) void {
+        const t = &self.world.terrain;
+        c[0] = std.math.clamp(c[0], 0, t.world_width);
+        c[1] = std.math.clamp(c[1], 0, t.world_height);
+    }
+
     pub fn groundZ(self: *App, x: f32, y: f32) f32 {
         return self.world.terrain.zAt(x, y);
     }
@@ -3228,7 +3302,12 @@ pub const App = struct {
                 self.audio_biome_dirty = false;
                 if (a.enabled) a.setBiome(self.dominantBiome());
             }
-            a.setListener(ctx.cam.center, ctx.cam.yaw);
+            const cm = ctx.cam;
+            a.setListener(.{
+                cm.center[0] + cm.dist * @cos(cm.pitch) * @cos(cm.yaw),
+                cm.center[1] + cm.dist * @cos(cm.pitch) * @sin(cm.yaw),
+                cm.center[2] + cm.dist * @sin(cm.pitch),
+            }, cm.yaw);
             a.update(ctx.dt);
         }
 

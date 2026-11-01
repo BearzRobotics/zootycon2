@@ -276,7 +276,7 @@ pub const Engine = struct {
     volume: f32 = 0.8,
     enabled: bool = true,
     /// Our distances are larger than the game's (the camera is higher up).
-    dist_scale: f32 = 2.5,
+    dist_scale: f32 = 1.0,
     time: f64 = 0,
     /// (tag hash, time) of recent sounds, to stop one tag machine-gunning.
     recent: [16]struct { h: u64 = 0, t: f64 = -1 } = @splat(.{}),
@@ -367,7 +367,8 @@ pub const Engine = struct {
         if (is3d or s.maxdist > 0) if (pos) |p| {
             const dx = p[0] - self.listener.pos[0];
             const dy = p[1] - self.listener.pos[1];
-            const d = @sqrt(dx * dx + dy * dy) / self.dist_scale;
+            const dz = p[2] - self.listener.pos[2];
+            const d = @sqrt(dx * dx + dy * dy + dz * dz) / self.dist_scale;
             const maxd = if (s.maxdist > 0) s.maxdist else 40;
             if (d >= maxd) return false;
             const mind = s.mindist;

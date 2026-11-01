@@ -2929,7 +2929,7 @@ pub fn loopWith(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Came
                 // Zoom towards what is under the pointer: the look-at point
                 // moves part of the way to it as the camera comes closer.
                 const old = goal.dist;
-                const next = std.math.clamp(old * std.math.pow(f32, 0.88, w.dy), @max(3.0, goal.radius * 0.02), goal.radius * 20);
+                const next = std.math.clamp(old * std.math.pow(f32, 0.88, w.dy), @max(3.0, goal.radius * 0.02), goal.radius * 2.6);
                 if (next < old) {
                     const r = goal.ray(ctx.mouse[0], ctx.mouse[1], @floatFromInt(ctx.win_width), @floatFromInt(ctx.win_height));
                     if (r.dir[2] < -0.02) {
@@ -2979,12 +2979,27 @@ pub fn loopWith(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Came
         if (rot_e) goal.yaw -= 1.6 * cdt;
         // Stay over the ground when the hook knows its height.
         if (comptime @hasDecl(Hk, "groundZ")) goal.center[2] = hooks.groundZ(goal.center[0], goal.center[1]);
+        // Keep the view over the map.
+        if (comptime @hasDecl(Hk, "clampCenter")) hooks.clampCenter(&goal.center);
         const ease = 1 - @exp(-16 * cdt);
         const ease_zoom = 1 - @exp(-11 * cdt);
         for (0..3) |i| cam.center[i] += (goal.center[i] - cam.center[i]) * ease;
         cam.yaw += (goal.yaw - cam.yaw) * ease;
         cam.pitch += (goal.pitch - cam.pitch) * ease;
         cam.dist += (goal.dist - cam.dist) * ease_zoom;
+        // Never let the eye sink into the ground: tilt up until it clears it.
+        if (comptime @hasDecl(Hk, "groundZ")) {
+            var iter: usize = 0;
+            while (iter < 4) : (iter += 1) {
+                const ex = cam.center[0] + cam.dist * @cos(cam.pitch) * @cos(cam.yaw);
+                const ey = cam.center[1] + cam.dist * @cos(cam.pitch) * @sin(cam.yaw);
+                const need = hooks.groundZ(ex, ey) + 1.5 - cam.center[2];
+                if (cam.dist * @sin(cam.pitch) >= need or cam.dist <= 0) break;
+                const want = std.math.asin(std.math.clamp(need / cam.dist, -1, 1));
+                cam.pitch = std.math.clamp(want + 0.01, cam.pitch, max_pitch);
+                goal.pitch = @max(goal.pitch, cam.pitch);
+            }
+        }
 
         g.viewport(0, 0, @intCast(size.width), @intCast(size.height));
         // Beyond the map edge shows the fog colour, like distant haze.
