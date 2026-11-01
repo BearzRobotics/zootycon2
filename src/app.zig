@@ -47,6 +47,7 @@ const sc = struct {
     const t: u32 = 23;
     const m: u32 = 16;
     const b: u32 = 5;
+    const i: u32 = 12;
     const esc: u32 = 41;
     const f1: u32 = 58;
     const f2: u32 = 59;
@@ -90,7 +91,16 @@ const Hit = struct {
     y: f32,
     w: f32,
     h: f32,
-    action: union(enum) { tool: Tool, pick: usize, none, menu: MenuAction, entry: usize, buy_cat: u8, buy_tab: BuyTab, buy_item: usize, info_tab: u8, del_save: usize },
+    action: union(enum) { tool: Tool, pick: usize, none, menu: MenuAction, entry: usize, buy_cat: u8, buy_tab: BuyTab, buy_item: usize, info_tab: u8, del_save: usize, status_tab: u8 },
+};
+
+/// A short message in the top message bar.
+const Alert = struct {
+    text: [72]u8 = undefined,
+    len: usize = 0,
+    /// 0 normal, 1 good, 2 bad.
+    kind: u8 = 0,
+    t: f64 = -1000,
 };
 
 /// Tabs of the buy panel, as in the game's own panel.
@@ -116,6 +126,9 @@ const MenuAction = enum {
     toggle_hud,
     open_new_zoo,
     open_save_as,
+    price_up,
+    price_down,
+    open_status,
     confirm_save_as,
     new_zoo_size,
     new_zoo_biome,
@@ -299,7 +312,7 @@ pub const App = struct {
     audio: ?audio_mod.Engine = null,
     audio_biome_dirty: bool = true,
     /// The game's own HUD, drawn from its layout files.
-    hud: ?struct { shell: uilayout.Layout, bucks: ?uilayout.Layout, info: ?uilayout.Layout = null } = null,
+    hud: ?struct { shell: uilayout.Layout, bucks: ?uilayout.Layout, info: ?uilayout.Layout = null, status: ?uilayout.Layout = null } = null,
     hud_on: bool = true,
     /// A name the player gave the zoo's save (empty: derived from the map).
     custom_name: [48]u8 = undefined,
@@ -308,6 +321,14 @@ pub const App = struct {
     name_buf: [40]u8 = undefined,
     name_len: usize = 0,
     blink: u32 = 0,
+    status_tab: u8 = 1,
+    app_time: f64 = 0,
+    alerts: [4]Alert = @splat(.{}),
+    alert_cool: [8]f64 = @splat(-1000),
+    alert_check: f64 = 0,
+    last_stars: f32 = 0,
+    last_months: u32 = 0,
+    cur_ctx: ?*viewer.FrameCtx = null,
     nz_size: u8 = 1,
     nz_biome: u8 = 6,
     /// Interface size multiplier (settings: UI SIZE).
@@ -338,6 +359,7 @@ pub const App = struct {
             h.shell.deinit();
             if (h.bucks) |*b| b.deinit();
             if (h.info) |*b| b.deinit();
+            if (h.status) |*b| b.deinit();
         }
         for (self.undo.items) |op| if (op == .added) self.gpa.free(op.added.ids);
         self.undo.deinit(self.gpa);
@@ -1728,7 +1750,14 @@ pub const App = struct {
                     },
                     sc.f1 => self.show_help = !self.show_help,
                     sc.m => self.toggleSound(),
-                    sc.b => self.openMenu(if (self.menu == .finances) .none else .finances),
+                    sc.b => {
+                        self.status_tab = 1;
+                        self.openMenu(if (self.menu == .finances) .none else .finances);
+                    },
+                    sc.i => {
+                        self.status_tab = 0;
+                        self.openMenu(if (self.menu == .finances) .none else .finances);
+                    },
                     sc.t => {
                         self.tod_auto = !self.tod_auto;
                         self.say("time of day {s}", .{if (self.tod_auto) "running" else "stopped"});
@@ -1909,6 +1938,15 @@ pub const App = struct {
                 self.saveWorld() catch |e| self.say("save failed: {s}", .{@errorName(e)});
                 self.openMenu(.none);
             },
+            .price_up => {
+                self.sim.adult_price = @min(100, self.sim.adult_price + 2);
+                self.sim.child_price = @round(self.sim.adult_price / 2);
+            },
+            .price_down => {
+                self.sim.adult_price = @max(0, self.sim.adult_price - 2);
+                self.sim.child_price = @round(self.sim.adult_price / 2);
+            },
+            .open_status => self.openMenu(.finances),
             .open_save_as => {
                 var nb: [64]u8 = undefined;
                 const cur = self.saveName(&nb);
@@ -1927,7 +1965,10 @@ pub const App = struct {
             .open_saves => self.openMenu(.saves),
             .open_maps => self.openMenu(.maps),
             .open_settings => self.openMenu(.settings),
-            .open_finances => self.openMenu(.finances),
+            .open_finances => {
+                self.status_tab = 1;
+                self.openMenu(.finances);
+            },
             .open_pause => self.openMenu(.pause),
             .toggle_pause => {
                 self.paused = !self.paused;
@@ -2607,6 +2648,94 @@ pub const App = struct {
         };
     }
 
+    fn pushAlert(self: *App, kind: u8, comptime fmt: []const u8, args: anytype) void {
+        // Newest first.
+        var i: usize = self.alerts.len - 1;
+        while (i > 0) : (i -= 1) self.alerts[i] = self.alerts[i - 1];
+        var a: Alert = .{ .kind = kind, .t = self.app_time };
+        const text = std.fmt.bufPrint(&a.text, fmt, args) catch a.text[0..0];
+        a.len = text.len;
+        self.alerts[0] = a;
+        if (kind == 2) self.sfx("message_alert");
+    }
+
+    fn alertReady(self: *App, slot: usize, cooldown: f64) bool {
+        if (self.app_time - self.alert_cool[slot] < cooldown) return false;
+        self.alert_cool[slot] = self.app_time;
+        return true;
+    }
+
+    /// Looks for things the player should hear about.
+    fn checkAlerts(self: *App) void {
+        const z = &self.sim.zoo;
+        if (self.last_stars == 0) {
+            self.last_stars = self.stars();
+            self.last_months = z.months;
+        }
+        for (self.sim.feeders.items) |f| if (f.food < 10) {
+            if (self.alertReady(0, 45)) self.pushAlert(2, "A FEEDER IS ALMOST EMPTY", .{});
+            break;
+        };
+        for (self.sim.agents.items) |ag| if (ag.kind == .animal) if (ag.brain) |b| {
+            if (b.needs[5] >= 92 and self.alertReady(1, 60)) self.pushAlert(2, "{s} IS VERY HUNGRY", .{ag.binder[0..@min(ag.binder.len, 30)]});
+            if (b.needs[6] >= 92 and self.alertReady(2, 60)) self.pushAlert(2, "{s} IS VERY THIRSTY", .{ag.binder[0..@min(ag.binder.len, 30)]});
+        };
+        // Guests with an urgent need that nothing in the zoo can satisfy.
+        const wants = [3][]const u8{ "SOMETHING TO EAT", "SOMETHING TO DRINK", "A BATHROOM" };
+        for (0..3) |ni| {
+            var n: u32 = 0;
+            for (self.sim.agents.items) |ag| if (ag.is_guest and ag.needs[ni] >= 90) {
+                n += 1;
+            };
+            if (n < 2) continue;
+            var have = false;
+            for (self.sim.venues.items) |v| if (@intFromEnum(v.need) == ni) {
+                have = true;
+            };
+            if (!have and self.alertReady(3 + ni, 90)) self.pushAlert(2, "GUESTS NEED {s}", .{wants[ni]});
+        }
+        if (z.income < 1000 and self.alertReady(6, 180)) self.pushAlert(2, "MONEY IS RUNNING LOW", .{});
+        const st = self.stars();
+        if (st > self.last_stars) self.pushAlert(1, "YOUR ZOO IS NOW A {d:.0} STAR ZOO!", .{st});
+        self.last_stars = st;
+        if (z.months != self.last_months) {
+            self.last_months = z.months;
+            const net = z.last_month.totalEarned() - z.last_month.totalSpent();
+            self.pushAlert(if (net >= 0) 1 else 0, "MONTH {d} DONE: {s}${d:.0}", .{ z.months, if (net < 0) "-" else "", @abs(net) });
+        }
+    }
+
+    /// The game's message bar: recent alerts, newest on top.
+    fn drawAlerts(self: *App, ui: *viewer.Ui) void {
+        var n: usize = 0;
+        for (self.alerts) |a| if (a.len > 0 and self.app_time - a.t < 14) {
+            n += 1;
+        };
+        if (n == 0) return;
+        const c = self.canvas(ui);
+        const s = c.scale;
+        const ts: f32 = @max(1, @round(s * 1.8));
+        const h = (16 + 14 * @as(f32, @floatFromInt(n))) * s;
+        ui.template("topbars", 300 * s, 8 * s, 440 * s, h, s, 1.5);
+        var y = 8 * s + 10 * s;
+        for (self.alerts) |a| {
+            if (a.len == 0 or self.app_time - a.t >= 14) continue;
+            const col: [4]f32 = switch (a.kind) {
+                1 => .{ 0.6, 1, 0.6, 1 },
+                2 => .{ 1, 0.65, 0.55, 1 },
+                else => .{ 1, 0.97, 0.7, 1 },
+            };
+            var tsz = ts;
+            var w = viewer.Ui.textWidth(a.text[0..a.len], tsz);
+            if (w > 400 * s) {
+                tsz = @max(1, ts - 1);
+                w = viewer.Ui.textWidth(a.text[0..a.len], tsz);
+            }
+            _ = ui.text(300 * s + (440 * s - w) / 2, y, tsz, a.text[0..a.len], col) catch {};
+            y += 14 * s;
+        }
+    }
+
     fn canvas(self: *const App, ui: *const viewer.Ui) uilayout.Canvas {
         var c = uilayout.Canvas.fit(ui.width, ui.height);
         c.scale *= self.ui_zoom;
@@ -2663,7 +2792,12 @@ pub const App = struct {
             defer self.gpa.free(ib);
             info = uilayout.parse(self.gpa, ib) catch null;
         } else |_| {}
-        self.hud = .{ .shell = shell, .bucks = bucks, .info = info };
+        var status: ?uilayout.Layout = null;
+        if (self.vfs.read(self.gpa, "ui/layout/zoostatus.xml")) |zb| {
+            defer self.gpa.free(zb);
+            status = uilayout.parse(self.gpa, zb) catch null;
+        } else |_| {}
+        self.hud = .{ .shell = shell, .bucks = bucks, .info = info, .status = status };
         _ = &shell;
         self.show_help = false;
     }
@@ -2688,6 +2822,9 @@ pub const App = struct {
         if (eq(name, "valley")) return .{ .tool = .lower };
         if (eq(name, "flatten")) return .{ .tool = .flatten };
         if (eq(name, "Zoofinance")) return .{ .menu = .open_finances };
+        if (eq(name, "zoo info tab")) return .{ .status_tab = 0 };
+        if (eq(name, "balance sheet tab")) return .{ .status_tab = 1 };
+        if (eq(name, "graphs tab")) return .{ .status_tab = 2 };
         if (eq(name, "undo")) return .{ .menu = .undo };
         if (eq(name, "delete")) return .{ .menu = .toggle_delete };
         if (eq(name, "options")) return .{ .menu = .open_pause };
@@ -2730,6 +2867,9 @@ pub const App = struct {
             if (eq(n.name, "flatten")) info.on = self.tool == .flatten;
             if (eq(n.name, "pause")) info.on = self.paused;
             if (eq(n.name, "delete")) info.on = self.delete_mode;
+            if (eq(n.name, "zoo info tab")) info.on = self.status_tab == 0;
+            if (eq(n.name, "balance sheet tab")) info.on = self.status_tab == 1;
+            if (eq(n.name, "graphs tab")) info.on = self.status_tab == 2;
         }
         return info;
     }
@@ -2757,16 +2897,8 @@ pub const App = struct {
         if (h.info) |*il| self.drawEntityInfo(ui, &d, il) else self.info_drawn = false;
     }
 
-    fn money(buf: []u8, v: f64) []const u8 {
-        const r: i64 = @intFromFloat(@round(v));
-        return if (r < 0)
-            std.fmt.bufPrint(buf, "-${d}", .{-r}) catch ""
-        else
-            std.fmt.bufPrint(buf, "${d}", .{r}) catch "";
-    }
-
-    /// The finance screen: income and spending by category for this month,
-    /// last month and overall, on the game's own panel art.
+    /// The zoo status screen on the game's own frame (`ui/layout/zoostatus.xml`):
+    /// tabs for zoo info (admission prices), the balance sheet and a profit graph.
     fn drawFinances(self: *App, ui: *viewer.Ui, scale: f32) !void {
         const z = &self.sim.zoo;
         const white = [4]f32{ 1, 1, 1, 1 };
@@ -2774,72 +2906,181 @@ pub const App = struct {
         const green = [4]f32{ 0.55, 0.95, 0.55, 1 };
         const red = [4]f32{ 1, 0.55, 0.5, 1 };
         const grey = [4]f32{ 0.8, 0.85, 0.9, 1 };
-        const s = scale * 0.68;
-        const cw = 13 * 6 * s; // column width
-        const name_w = 15 * 6 * s;
-        const panel_w = name_w + cw * 3 + 16 * s;
-        const rows: f32 = 2 + 7 + 1 + 7 + 1 + 2;
-        const row_h = 11 * s;
-        const panel_h = 22 * s + rows * row_h + 34 * s;
-        const x0 = (ui.width - panel_w) / 2;
-        var y = @max(8, (ui.height - panel_h) / 2);
-        ui.template("blank", x0, y, panel_w, panel_h, s / 2, 1.5);
-        ui.template("header", x0 + 4 * s, y + 4 * s, panel_w - 8 * s, 16 * s, s / 2, 1.5);
-        var tb: [48]u8 = undefined;
-        const title = std.fmt.bufPrint(&tb, "FINANCES   MONTH {d}", .{z.months + 1}) catch "FINANCES";
-        _ = try ui.text(x0 + 12 * s, y + 8 * s, s, title, gold);
-        y += 24 * s;
-        const x = x0 + 8 * s;
-        // Column headings.
-        const heads = [_][]const u8{ "THIS MONTH", "LAST MONTH", "ALL TIME" };
-        for (heads, 0..) |h, i| {
-            const hx = x + name_w + cw * @as(f32, @floatFromInt(i)) + cw - viewer.Ui.textWidth(h, s);
-            _ = try ui.text(hx, y, s, h, grey);
-        }
-        y += row_h;
-        const ledgers = [3]sim_mod.Ledger{ z.month, z.last_month, z.total };
-        var buf: [32]u8 = undefined;
-        // Income, then expenses.
-        for ([2]bool{ true, false }) |income| {
-            _ = try ui.text(x, y, s, if (income) "INCOME" else "EXPENSES", gold);
-            y += row_h;
-            var sums: [3]f64 = @splat(0);
-            for (sim_mod.cat_names, 0..) |name, ci| {
-                _ = try ui.text(x + 4 * s, y, s, name, white);
-                for (ledgers, 0..) |l, i| {
-                    const v = if (income) l.earned[ci] else l.spent[ci];
-                    sums[i] += v;
-                    const txt = money(&buf, v);
-                    const vx = x + name_w + cw * @as(f32, @floatFromInt(i)) + cw - viewer.Ui.textWidth(txt, s);
-                    _ = try ui.text(vx, y, s, txt, if (v == 0) grey else white);
+        const hud = &(self.hud orelse return);
+        const lay = &(hud.status orelse return);
+        const ctx = self.cur_ctx orelse return;
+        _ = scale;
+        const c = self.canvas(ui);
+        const s = c.scale;
+        const ts: f32 = @max(1, @round(s * 1.2));
+        // The status window is centred on the canvas.
+        const ox = (ui.width - 640 * s) / 2;
+        const oy = (ui.height - 590 * s) / 2 + 20 * s;
+        var d: uilayout.Draw = .{
+            .ui = ui,
+            .canvas = c,
+            .hooks = .{ .ctx = self, .info = hudInfo, .button = hudButton },
+            .mouse = toPixels(ctx, ctx.mouse[0], ctx.mouse[1]),
+            .pressed = self.lmb,
+        };
+        if (lay.find("background layout")) |n| uilayout.drawAt(&d, n, .{ ox, oy, 640 * s, 590 * s });
+        if (lay.find("zoostatus_filler")) |n| uilayout.drawAt(&d, n, .{ ox + 22 * s, oy + 98 * s, 597 * s, 459 * s });
+        // Tabs: the game spaces them 48 apart.
+        const tab_names = [_][]const u8{ "zoo info tab", "balance sheet tab", "graphs tab", "awards tab", "building list tab", "donations tab", "zoofame tab" };
+        for (tab_names, 0..) |tn, i| if (lay.find(tn)) |n| {
+            uilayout.drawAt(&d, n, .{ ox + (175 + 48 * @as(f32, @floatFromInt(i))) * s, oy + 22 * s, 48 * s, 64 * s });
+        };
+        const title: []const u8 = switch (self.status_tab) {
+            0 => "ZOO INFO",
+            1 => "BALANCE SHEET",
+            else => "PROFIT GRAPH",
+        };
+        _ = try ui.text(ox + 24 * s, oy + 12 * s, ts, title, gold);
+        var mb: [32]u8 = undefined;
+        const month_txt = std.fmt.bufPrint(&mb, "MONTH {d}", .{z.months + 1}) catch "";
+        _ = try ui.text(ox + 24 * s, oy + 30 * s, ts, month_txt, grey);
+
+        const cx = ox + 36 * s;
+        var y = oy + 112 * s;
+        const rh = 15 * s * (ts / @max(1, s * 1.2));
+        var buf: [48]u8 = undefined;
+        switch (self.status_tab) {
+            0 => {
+                const rows = [_]struct { l: []const u8, v: []const u8 }{
+                    .{ .l = "ZOO", .v = if (self.custom_len > 0) self.custom_name[0..self.custom_len] else (if (std.mem.indexOfScalar(u8, self.world.name, ':')) |ci| self.world.name[ci + 1 ..] else self.world.name) },
+                    .{ .l = "GUESTS IN THE ZOO", .v = std.fmt.bufPrint(&buf, "{d}", .{self.sim.liveGuests()}) catch "" },
+                    .{ .l = "GUESTS SO FAR", .v = std.fmt.bufPrint(buf[16..], "{d}", .{z.guests_total}) catch "" },
+                    .{ .l = "ANIMALS", .v = std.fmt.bufPrint(buf[32..], "{d}", .{self.countAnimals()}) catch "" },
+                };
+                for (rows) |r| {
+                    _ = try ui.text(cx, y, ts, r.l, grey);
+                    _ = try ui.text(cx + 210 * s, y, ts, r.v, white);
+                    y += rh;
                 }
-                y += row_h;
-            }
-            _ = try ui.text(x, y, s, if (income) "TOTAL INCOME" else "TOTAL EXPENSES", white);
-            for (sums, 0..) |v, i| {
-                const txt = money(&buf, v);
-                const vx = x + name_w + cw * @as(f32, @floatFromInt(i)) + cw - viewer.Ui.textWidth(txt, s);
-                _ = try ui.text(vx, y, s, txt, if (income) green else red);
-            }
-            y += row_h * 1.4;
+                y += rh;
+                _ = try ui.text(cx, y, ts, "ZOO RATING", grey);
+                var st_buf: [16]u8 = undefined;
+                _ = try ui.text(cx + 210 * s, y, ts, std.fmt.bufPrint(&st_buf, "{d:.0} STARS", .{self.stars()}) catch "", gold);
+                y += rh;
+                _ = try ui.text(cx, y, ts, "GUEST HAPPINESS", grey);
+                var hb: [16]u8 = undefined;
+                _ = try ui.text(cx + 210 * s, y, ts, std.fmt.bufPrint(&hb, "{d:.0}", .{self.sim.happiness()}) catch "", white);
+                y += rh * 2;
+                // Admission prices with plus and minus buttons.
+                _ = try ui.text(cx, y, ts, "ADMISSION PRICE", gold);
+                y += rh * 1.3;
+                var pb: [48]u8 = undefined;
+                _ = try ui.text(cx, y + 3 * s, ts, std.fmt.bufPrint(&pb, "ADULT ${d:.0}   CHILD ${d:.0}", .{ self.sim.adult_price, self.sim.child_price }) catch "", white);
+                const bw = 22 * s;
+                const bx = cx + 250 * s;
+                for ([2]bool{ false, true }) |up| {
+                    const x = bx + (if (up) bw + 6 * s else 0);
+                    ui.template("buttonbar", x, y, bw, bw, s / 2, 1);
+                    const lab: []const u8 = if (up) "+" else "-";
+                    _ = try ui.text(x + (bw - viewer.Ui.textWidth(lab, ts)) / 2, y + (bw - 7 * ts) / 2, ts, lab, white);
+                    try self.hits.append(self.gpa, .{ .x = x, .y = y, .w = bw, .h = bw, .action = .{ .menu = if (up) .price_up else .price_down } });
+                }
+                y += rh * 2.2;
+                _ = try ui.text(cx, y, ts, "HIGHER PRICES MEAN FEWER VISITORS.", grey);
+            },
+            1 => {
+                // Income and expenses by category: this month, last month, all time.
+                const cw = 12 * 6 * ts;
+                const name_w = 15 * 6 * ts;
+                const ledgers = [3]sim_mod.Ledger{ z.month, z.last_month, z.total };
+                const heads = [_][]const u8{ "THIS MONTH", "LAST MONTH", "ALL TIME" };
+                y = oy + 104 * s;
+                const sm = ts;
+                const rh2 = 11.5 * s;
+                for (heads, 0..) |h, i| {
+                    const hx = cx + name_w + cw * @as(f32, @floatFromInt(i + 1)) - viewer.Ui.textWidth(h, sm);
+                    _ = try ui.text(hx, y, sm, h, grey);
+                }
+                y += rh2;
+                var mbuf: [32]u8 = undefined;
+                for ([2]bool{ true, false }) |income| {
+                    _ = try ui.text(cx, y, sm, if (income) "INCOME" else "EXPENSES", gold);
+                    y += rh2;
+                    var sums: [3]f64 = @splat(0);
+                    for (sim_mod.cat_names, 0..) |nm, ci| {
+                        _ = try ui.text(cx + 6 * s, y, sm, nm, white);
+                        for (ledgers, 0..) |l, i| {
+                            const v = if (income) l.earned[ci] else l.spent[ci];
+                            sums[i] += v;
+                            const txt = money(&mbuf, v);
+                            _ = try ui.text(cx + name_w + cw * @as(f32, @floatFromInt(i + 1)) - viewer.Ui.textWidth(txt, sm), y, sm, txt, if (v == 0) grey else white);
+                        }
+                        y += rh2;
+                    }
+                    _ = try ui.text(cx, y, sm, if (income) "TOTAL INCOME" else "TOTAL EXPENSES", white);
+                    for (sums, 0..) |v, i| {
+                        const txt = money(&mbuf, v);
+                        _ = try ui.text(cx + name_w + cw * @as(f32, @floatFromInt(i + 1)) - viewer.Ui.textWidth(txt, sm), y, sm, txt, if (income) green else red);
+                    }
+                    y += rh2 * 1.3;
+                }
+                _ = try ui.text(cx, y, sm, "NET", white);
+                for (ledgers, 0..) |l, i| {
+                    const net = l.totalEarned() - l.totalSpent();
+                    const txt = money(&mbuf, net);
+                    _ = try ui.text(cx + name_w + cw * @as(f32, @floatFromInt(i + 1)) - viewer.Ui.textWidth(txt, sm), y, sm, txt, if (net >= 0) green else red);
+                }
+                y += rh2;
+                _ = try ui.text(cx, y, sm, "BALANCE", gold);
+                const bt = money(&mbuf, z.income);
+                _ = try ui.text(cx + name_w + cw * 3 - viewer.Ui.textWidth(bt, sm), y, sm, bt, gold);
+            },
+            else => {
+                // Net result of each finished month, as bars around a zero line.
+                const gx = cx;
+                const gy = oy + 120 * s;
+                const gw = 540 * s;
+                const gh = 300 * s;
+                try ui.rect(gx, gy, gw, gh, .{ 0, 0, 0, 0.35 });
+                const n: usize = z.history_n;
+                if (n == 0) {
+                    _ = try ui.text(gx + 20 * s, gy + gh / 2, ts, "NO FINISHED MONTHS YET", grey);
+                } else {
+                    var maxv: f64 = 1;
+                    for (z.history[0..n]) |v| maxv = @max(maxv, @abs(v));
+                    const bw2 = @min(gw / @as(f32, @floatFromInt(@max(n, 8))), 40 * s);
+                    const mid = gy + gh / 2;
+                    try ui.rect(gx, mid, gw, s, .{ 1, 1, 1, 0.4 });
+                    for (z.history[0..n], 0..) |v, i| {
+                        const hgt: f32 = @floatCast(v / maxv * @as(f64, gh / 2 - 12 * s));
+                        const x = gx + 10 * s + @as(f32, @floatFromInt(i)) * bw2;
+                        const col: [4]f32 = if (v >= 0) .{ 0.4, 0.85, 0.4, 1 } else .{ 0.9, 0.4, 0.35, 1 };
+                        try ui.rect(x, if (hgt >= 0) mid - hgt else mid, bw2 * 0.7, @abs(hgt), col);
+                    }
+                    var ab: [40]u8 = undefined;
+                    _ = try ui.text(gx + 6 * s, gy + 6 * s, ts * 0.8, std.fmt.bufPrint(&ab, "LARGEST MONTH ${d:.0}", .{maxv}) catch "", grey);
+                }
+                _ = try ui.text(gx, gy + gh + 10 * s, ts * 0.8, "EACH BAR IS A FINISHED MONTH (OLDEST LEFT).", grey);
+            },
         }
-        _ = try ui.text(x, y, s, "NET", white);
-        for (ledgers, 0..) |l, i| {
-            const net = l.totalEarned() - l.totalSpent();
-            const txt = money(&buf, net);
-            const vx = x + name_w + cw * @as(f32, @floatFromInt(i)) + cw - viewer.Ui.textWidth(txt, s);
-            _ = try ui.text(vx, y, s, txt, if (net >= 0) green else red);
-        }
-        y += row_h;
-        _ = try ui.text(x, y, s, "BALANCE", gold);
-        const bt = money(&buf, z.income);
-        _ = try ui.text(x + name_w + cw * 3 - viewer.Ui.textWidth(bt, s), y, s, bt, gold);
-        y += row_h * 1.6;
-        const bw = 12 * 6 * s;
-        const bx = (ui.width - bw) / 2;
-        ui.template("buttonbar", bx, y, bw, 14 * s, s / 2, 1);
-        _ = try ui.text(bx + (bw - viewer.Ui.textWidth("CLOSE", s)) / 2, y + 4 * s, s, "CLOSE", white);
-        try self.hits.append(self.gpa, .{ .x = bx, .y = y, .w = bw, .h = 14 * s, .action = .{ .menu = .close_menu } });
+        // Close button.
+        const bw = 14 * 6 * ts;
+        const bx = ox + (640 * s - bw) / 2;
+        const by = oy + 590 * s - 28 * s;
+        ui.template("buttonbar", bx, by, bw, 22 * s, s / 2, 1);
+        _ = try ui.text(bx + (bw - viewer.Ui.textWidth("CLOSE", ts)) / 2, by + (22 * s - 7 * ts) / 2, ts, "CLOSE", white);
+        try self.hits.append(self.gpa, .{ .x = bx, .y = by, .w = bw, .h = 22 * s, .action = .{ .menu = .close_menu } });
+    }
+
+    fn countAnimals(self: *const App) usize {
+        var n: usize = 0;
+        for (self.sim.agents.items) |ag| if (ag.kind == .animal) {
+            n += 1;
+        };
+        return n;
+    }
+
+    fn money(buf: []u8, v: f64) []const u8 {
+        const r: i64 = @intFromFloat(@round(v));
+        return if (r < 0)
+            std.fmt.bufPrint(buf, "-${d}", .{-r}) catch ""
+        else
+            std.fmt.bufPrint(buf, "${d}", .{r}) catch "";
     }
 
     /// Pixel position of a window-coordinate mouse position.
@@ -2875,6 +3116,7 @@ pub const App = struct {
             },
             .buy_item => |pos| self.selectBuyItem(pos),
             .info_tab => |t| self.info_tab = t,
+            .status_tab => |t| self.status_tab = t,
             .menu => |a| self.menuAction(a, ctx),
             .entry, .none, .del_save => {},
         }
@@ -3100,9 +3342,10 @@ pub const App = struct {
         const yellow = [4]f32{ 1, 0.92, 0.5, 1 };
         const grey = [4]f32{ 0.8, 0.85, 0.9, 1 };
         var buf: [256]u8 = undefined;
-        var y = pad;
+        var y = pad + (if (self.hudActive()) 56 * self.canvas(ui).scale else 0);
         // A menu replaces the normal display.
         self.hits.clearRetainingCapacity();
+        self.cur_ctx = ctx;
         if (self.menu != .none) {
             try self.drawMenu(ui, scale);
             return;
@@ -3134,11 +3377,12 @@ pub const App = struct {
             "VIEW";
         // The game's date bar and stars take the top-left corner.
         const lx = if (self.hudActive()) pad + 300 * self.canvas(ui).scale else pad;
+        if (self.hudActive()) self.drawAlerts(ui);
         try ui.label(lx, y, scale, head, white);
         y += line + 2 * scale;
         // The right-hand statistics take the same row, so clip the hint to fit.
         const stats_w = viewer.Ui.textWidth(self.statsText(&buf), scale);
-        const room = @max(0, ui.width - stats_w - pad * 4 - 4);
+        const room = @max(0, ui.width - stats_w - pad * 4 - 4 - lx);
         if (self.opts.tools and self.show_help) {
             const hint = self.toolHint();
             const fit: usize = @intFromFloat(@floor(room / (6 * scale)));
@@ -3146,7 +3390,8 @@ pub const App = struct {
             y += line + 2 * scale;
         }
         if (self.message_len > 0) {
-            try ui.label(lx, y, scale, self.message[0..self.message_len], yellow);
+            const mfit: usize = @intFromFloat(@max(4, @floor(room / (6 * scale))));
+            try ui.label(lx, y, scale, self.message[0..@min(self.message_len, mfit)], yellow);
         }
 
         // Top right: simulation status.
@@ -3455,6 +3700,11 @@ pub const App = struct {
 
     pub fn frame(self: *App, ctx: *viewer.FrameCtx) !void {
         self.blink +%= 1;
+        self.app_time += ctx.dt;
+        if (self.app_time - self.alert_check > 4 and self.menu == .none and self.opts.sim) {
+            self.alert_check = self.app_time;
+            self.checkAlerts();
+        }
         self.playInput(ctx);
         if (self.reset_camera) {
             // A different map was loaded: look at its middle.

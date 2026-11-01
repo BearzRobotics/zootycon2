@@ -172,6 +172,9 @@ pub const Zoo = struct {
     last_month: Ledger = .{},
     total: Ledger = .{},
     months: u32 = 0,
+    /// Net result of each finished month (oldest first, most recent last).
+    history: [24]f64 = @splat(0),
+    history_n: u32 = 0,
 
     guests_total: u32 = 0,
     guests_left: u32 = 0,
@@ -737,7 +740,9 @@ pub const Sim = struct {
         self.spawn_timer -= dt;
         if (self.spawn_timer <= 0) {
             const rnd = self.rng.random();
-            self.spawn_timer = self.spawn_delay[0] + rnd.float(f32) * (self.spawn_delay[1] - self.spawn_delay[0]);
+            // Dearer tickets keep people away, cheaper ones bring more.
+            const price_factor = std.math.clamp(self.adult_price / 24.0, 0.4, 5.0);
+            self.spawn_timer = (self.spawn_delay[0] + rnd.float(f32) * (self.spawn_delay[1] - self.spawn_delay[0])) * price_factor;
             if (self.entrance_node != null and self.guest_binders.len > 0 and self.liveGuests() < self.max_guests) self.want_spawn = true;
         }
         // Pay day.
@@ -751,6 +756,14 @@ pub const Sim = struct {
             for (self.venues.items) |v| {
                 self.zoo.spend(.upkeep, v.upkeep);
                 self.zoo.upkeep_paid += v.upkeep;
+            }
+            const net = self.zoo.month.totalEarned() - self.zoo.month.totalSpent();
+            if (self.zoo.history_n < self.zoo.history.len) {
+                self.zoo.history[self.zoo.history_n] = net;
+                self.zoo.history_n += 1;
+            } else {
+                std.mem.copyForwards(f64, self.zoo.history[0 .. self.zoo.history.len - 1], self.zoo.history[1..]);
+                self.zoo.history[self.zoo.history.len - 1] = net;
             }
             self.zoo.last_month = self.zoo.month;
             self.zoo.month = .{};
