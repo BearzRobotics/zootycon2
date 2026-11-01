@@ -858,7 +858,8 @@ test "parses a minimal file with one empty node" {
     try w.int(&buf, gpa, u32, 6);
     try buf.appendSlice(gpa, "NiNode");
     try w.int(&buf, gpa, u16, 0); // block 0 -> type 0
-    try w.int(&buf, gpa, u32, 0); // unknown
+    try w.int(&buf, gpa, u32, 0); // header unknown
+    try w.int(&buf, gpa, u32, 0); // block prefix
     // NiNode body
     try w.int(&buf, gpa, u32, 4);
     try buf.appendSlice(gpa, "root");
