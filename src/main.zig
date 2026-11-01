@@ -22,6 +22,7 @@ const usage =
     \\  ddscheck [prefix]           parse every .dds texture and report formats
     \\  nifinfo <path>               print a NIF's scene graph
     \\  view <model> [--anim A] [--time S] [--shot]  view a .nif/.bfm model
+    \\  mapcheck [prefix]           parse every map and its terrain
     \\  bfcheck [prefix]            parse every .bf animation and report coverage
     \\  nifcheck [prefix]           parse every .nif/.kf and report coverage
     \\  xmlcheck [prefix]            parse every .xml and report failures
@@ -303,6 +304,52 @@ pub fn main(init: std.process.Init) !void {
         }
         if (shot) vopts.screenshot = out;
         try zootycon2.viewer.run(gpa, &vfs, rest[0], vopts);
+    } else if (std.mem.eql(u8, cmd, "mapcheck")) {
+        const prefix = if (rest.len > 0) rest[0] else "maps/";
+        var names: std.ArrayList([]const u8) = .empty;
+        defer names.deinit(gpa);
+        const Pick = struct {
+            list: *std.ArrayList([]const u8),
+            gpa: std.mem.Allocator,
+            prefix: []const u8,
+            fn add(c: @This(), name: []const u8) anyerror!void {
+                if (std.mem.startsWith(u8, name, c.prefix) and std.mem.endsWith(u8, name, ".zt2")) try c.list.append(c.gpa, name);
+            }
+        };
+        try vfs.forEach(Pick{ .list = &names, .gpa = gpa, .prefix = prefix }, Pick.add);
+        std.mem.sort([]const u8, names.items, {}, struct {
+            fn less(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.less);
+        var bad: usize = 0;
+        for (names.items) |n| {
+            const data = try vfs.read(gpa, n);
+            defer gpa.free(data);
+            var m = zootycon2.map.parse(gpa, data) catch |e| {
+                bad += 1;
+                try out.print("{s}: map {s}\n", .{ n, @errorName(e) });
+                continue;
+            };
+            defer m.deinit();
+            const dir = std.fs.path.dirname(n) orelse "";
+            const tpath = try std.fs.path.join(gpa, &.{ dir, m.terrain_file });
+            defer gpa.free(tpath);
+            const tdata = vfs.read(gpa, tpath) catch {
+                bad += 1;
+                try out.print("{s}: terrain {s} missing\n", .{ n, tpath });
+                continue;
+            };
+            defer gpa.free(tdata);
+            var t = zootycon2.terrain.parse(gpa, tdata) catch |e| {
+                bad += 1;
+                try out.print("{s}: terrain {s}\n", .{ n, @errorName(e) });
+                continue;
+            };
+            defer t.deinit();
+            try out.print("{s}: {d}x{d} verts, {d:.0}x{d:.0} units, {d} objects\n", .{ n, t.width, t.height, t.world_width, t.world_height, m.objects.len });
+        }
+        try out.print("{d} maps, {d} problems\n", .{ names.items.len, bad });
     } else if (std.mem.eql(u8, cmd, "bfcheck")) {
         const prefix = if (rest.len > 0) rest[0] else "";
         var names: std.ArrayList([]const u8) = .empty;
