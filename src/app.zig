@@ -24,6 +24,8 @@ const audio_mod = @import("audio.zig");
 const uilayout = @import("uilayout.zig");
 const ai = @import("ai.zig");
 const vfs_mod = @import("vfs.zig");
+const scenario_mod = @import("scenario.zig");
+const loc_mod = @import("loc.zig");
 
 const Mat4 = viewer.Mat4;
 
@@ -46,6 +48,7 @@ const sc = struct {
     const period: u32 = 55;
     const t: u32 = 23;
     const m: u32 = 16;
+    const o: u32 = 18;
     const b: u32 = 5;
     const i: u32 = 12;
     const esc: u32 = 41;
@@ -110,7 +113,7 @@ const Alert = struct {
 pub const BuyTab = enum { fence, path, building, scenery, animal, food, staff, deform, enrich, shelter, tree, plant, rock };
 
 /// Which full-screen menu is open (if any).
-const Menu = enum { none, pause, maps, saves, settings, finances, new_zoo, save_as, main };
+const Menu = enum { none, pause, maps, saves, settings, finances, new_zoo, save_as, main, goals };
 
 const MenuAction = enum {
     close_menu,
@@ -119,6 +122,7 @@ const MenuAction = enum {
     open_maps,
     open_settings,
     open_finances,
+    open_goals,
     open_pause,
     toggle_pause,
     undo,
@@ -195,6 +199,8 @@ pub const Options = struct {
     ///   lower X Y SECS | flatten X Y SECS | delete X Y | undo | save | load
     ///   wait SECS | propname TEXT | actorname NAME | fencekind NAME | yaw RAD
     script: []const u8 = "",
+    /// Goals file of a scenario to play on the loaded map.
+    scenario: []const u8 = "",
     /// Virtual mouse and keyboard, played through the real event queue one
     /// action per frame, separated by `;`:
     ///   move X Y        pointer to window position
@@ -282,6 +288,9 @@ pub const App = struct {
     // Clickable interface, rebuilt each frame by `overlay`.
     hits: std.ArrayList(Hit) = .empty,
     feeder_state: u64 = 0,
+    /// Scenario goals: localized strings and the running goal tree.
+    strings: ?loc_mod.Loc = null,
+    scen: ?*scenario_mod.Manager = null,
     over_ui: bool = false,
 
     // Virtual input.
@@ -389,6 +398,8 @@ pub const App = struct {
         self.actor_names.deinit(self.gpa);
         self.guest_names.deinit(self.gpa);
         self.food_names.deinit(self.gpa);
+        if (self.scen) |m| m.destroy();
+        if (self.strings) |*st| st.deinit();
         var fl = self.food_loaded.keyIterator();
         while (fl.next()) |k| self.gpa.free(k.*);
         self.food_loaded.deinit(self.gpa);
@@ -1656,6 +1667,108 @@ pub const App = struct {
         }
     }
 
+    // ------------------------------------------------------------ scenarios
+
+    /// Starts the goals of a scenario (`scenario/goals/*.xml`) on the
+    /// current zoo.
+    fn startScenario(self: *App, goals: []const u8) void {
+        if (self.scen) |m| {
+            m.destroy();
+            self.scen = null;
+        }
+        if (self.strings == null) {
+            var st = loc_mod.Loc.init(self.gpa);
+            st.load(self.vfs, "lang/1033/") catch {};
+            self.strings = st;
+        }
+        const m = scenario_mod.Manager.create(self.gpa, self.vfs, &self.strings.?) catch |e| {
+            self.say("scenario failed: {s}", .{@errorName(e)});
+            return;
+        };
+        m.host = .{
+            .ctx = self,
+            .entities = scenEntities,
+            .attr = scenAttr,
+            .set_attr = scenSetAttr,
+            .binder = scenBinder,
+            .stat = scenStat,
+            .give_cash = scenGiveCash,
+        };
+        m.add(goals) catch |e| {
+            self.say("cannot load goals {s}: {s}", .{ goals, @errorName(e) });
+            m.destroy();
+            return;
+        };
+        self.scen = m;
+        m.tick();
+    }
+
+    /// Whether an entity is of a kind, by type path.
+    fn binderIs(self: *App, binder: []const u8, kind: []const u8, direct: bool) bool {
+        const b = self.reg.get(binder) orelse return false;
+        if (direct) return std.ascii.eqlIgnoreCase(b.name, kind) or (b.type_path.len > 0 and std.ascii.eqlIgnoreCase(b.type_path[b.type_path.len - 1], kind));
+        for (b.type_path) |t| if (std.ascii.eqlIgnoreCase(t, kind)) return true;
+        return false;
+    }
+
+    const prop_handle: u32 = 0x8000_0000;
+
+    fn scenEntities(ctx: *anyopaque, gpa: std.mem.Allocator, kind: []const u8, direct: bool, out: *std.ArrayList(u32)) void {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        for (self.sim.agents.items) |ag| {
+            if (ag.binder.len == 0 or !self.binderIs(ag.binder, kind, direct)) continue;
+            out.append(gpa, ag.id) catch {};
+        }
+        for (self.world.props.items) |p| {
+            if (p.binder.len == 0 or !self.binderIs(p.binder, kind, direct)) continue;
+            out.append(gpa, p.id | prop_handle) catch {};
+        }
+    }
+
+    fn scenAttr(ctx: *anyopaque, id: u32, name: []const u8) ?f64 {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        if (id & prop_handle != 0) return null;
+        const ag = self.sim.agentFor(id) orelse return null;
+        const b = ag.brain orelse return null;
+        for (ai.need_names, 0..) |n, i| if (std.ascii.eqlIgnoreCase(n, name)) return b.needs[i];
+        return null;
+    }
+
+    fn scenSetAttr(ctx: *anyopaque, id: u32, name: []const u8, value: f64) void {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        if (id & prop_handle != 0) return;
+        const ag = self.sim.agentFor(id) orelse return;
+        if (ag.brain) |*b| for (ai.need_names, 0..) |n, i| if (std.ascii.eqlIgnoreCase(n, name)) {
+            b.needs[i] = @floatCast(value);
+        };
+    }
+
+    fn scenBinder(ctx: *anyopaque, id: u32) []const u8 {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        if (id & prop_handle != 0) {
+            for (self.world.props.items) |p| if (p.id | prop_handle == id) return p.binder;
+            return "";
+        }
+        return if (self.sim.agentFor(id)) |ag| ag.binder else "";
+    }
+
+    fn scenStat(ctx: *anyopaque, name: []const u8) f64 {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        const eq = std.mem.eql;
+        if (eq(u8, name, "cash")) return self.sim.zoo.income;
+        if (eq(u8, name, "month")) return @floatFromInt(self.sim.zoo.months);
+        if (eq(u8, name, "day")) return @floor((1 - self.sim.month_timer / self.sim.month_secs) * 30) + 1;
+        if (eq(u8, name, "time")) return self.tod;
+        if (eq(u8, name, "fame")) return self.stars() * 2;
+        if (eq(u8, name, "guests")) return @floatFromInt(self.sim.liveGuests());
+        return 0;
+    }
+
+    fn scenGiveCash(ctx: *anyopaque, amount: f64) void {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        if (amount >= 0) self.sim.zoo.earn(.admission, amount) else self.sim.zoo.spend(.supplies, -amount);
+    }
+
     fn installHooks(self: *App) void {
         self.sim.hooks = .{ .ctx = self, .brain = hookBrain, .anim_len = hookAnimLen, .flag = hookFlag, .feeder = hookFeeder, .usable = hookUsable, .wage = hookWage, .venue = hookVenue, .habitat = hookHabitat };
         self.sim.guest_binders = self.guest_names.items;
@@ -2108,6 +2221,7 @@ pub const App = struct {
             .open_saves => self.openMenu(.saves),
             .open_maps => self.openMenu(.maps),
             .open_settings => self.openMenu(.settings),
+            .open_goals => self.openMenu(.goals),
             .open_finances => {
                 self.status_tab = 1;
                 self.openMenu(.finances);
@@ -2270,12 +2384,14 @@ pub const App = struct {
             .saves => "LOAD A SAVED ZOO",
             .settings => "SETTINGS",
             .finances => "FINANCES",
+            .goals => "GOALS",
             .new_zoo => "NEW BLANK ZOO",
             .save_as => "SAVE YOUR ZOO",
             .main => "ZOOTYCON2",
             .none => "",
         };
         if (self.menu == .finances) return self.drawFinances(ui, scale);
+        if (self.menu == .goals) return self.drawGoals(ui, scale);
         if (self.menu == .main and self.hud != null) return self.drawMainMenu(ui);
         const tscale = scale * 1.6;
         const tw = viewer.Ui.textWidth(title, tscale);
@@ -2395,7 +2511,7 @@ pub const App = struct {
                 y += try self.menuButton(ui, y, scale, "OPTIONS", .{ .menu = .open_settings }, false);
                 y += try self.menuButton(ui, y, scale, "QUIT", .{ .menu = .quit }, false);
             },
-            .finances, .none => {},
+            .finances, .goals, .none => {},
         }
     }
 
@@ -3051,6 +3167,7 @@ pub const App = struct {
         if (eq(name, "valley")) return .{ .tool = .lower };
         if (eq(name, "flatten")) return .{ .tool = .flatten };
         if (eq(name, "Zoofinance")) return .{ .menu = .open_finances };
+        if (eq(name, "scenariogoals")) return .{ .menu = .open_goals };
         if (eq(name, "zoo info tab")) return .{ .status_tab = 0 };
         if (eq(name, "balance sheet tab")) return .{ .status_tab = 1 };
         if (eq(name, "graphs tab")) return .{ .status_tab = 2 };
@@ -3195,6 +3312,106 @@ pub const App = struct {
 
     /// The zoo status screen on the game's own frame (`ui/layout/zoostatus.xml`):
     /// tabs for zoo info (admission prices), the balance sheet and a profit graph.
+    /// Word-wraps `text` (upper-cased, as the font has capitals only) into
+    /// lines at most `cols` characters wide and draws them. Returns the height used.
+    fn wrapText(self: *App, ui: *viewer.Ui, x: f32, y: f32, ts: f32, cols: usize, text: []const u8, color: [4]f32) !f32 {
+        _ = self;
+        var line: [160]u8 = undefined;
+        var n: usize = 0;
+        var yy = y;
+        var words = std.mem.tokenizeAny(u8, text, " \t\r\n");
+        while (words.next()) |w| {
+            if (n > 0 and n + 1 + w.len > cols) {
+                _ = try ui.text(x, yy, ts, line[0..n], color);
+                yy += 10 * ts;
+                n = 0;
+            }
+            if (n > 0 and n < line.len) {
+                line[n] = ' ';
+                n += 1;
+            }
+            const take = @min(w.len, line.len - n);
+            _ = std.ascii.upperString(line[n..][0..take], w[0..take]);
+            n += take;
+        }
+        if (n > 0) {
+            _ = try ui.text(x, yy, ts, line[0..n], color);
+            yy += 10 * ts;
+        }
+        return yy - y;
+    }
+
+    /// The goals window: every visible rule of the running scenario, with
+    /// its state, as the scenario scripts last described it.
+    fn drawGoals(self: *App, ui: *viewer.Ui, scale: f32) !void {
+        const ts: f32 = @max(1, @round(scale * 0.8));
+        const pw = @min(ui.width * 0.9, 130 * 6 * ts);
+        const ph = ui.height * 0.82;
+        const px = (ui.width - pw) / 2;
+        const py = ui.height * 0.08;
+        ui.template("blank", px, py, pw, ph, scale / 2, 1);
+        _ = try ui.text(px + 16 * ts, py + 10 * ts, ts * 1.4, "GOALS", .{ 1, 0.92, 0.5, 1 });
+        var y = py + 34 * ts;
+        const cols: usize = @intFromFloat(@max(20, (pw - 70 * ts) / (6 * ts)));
+        const m = self.scen orelse {
+            _ = try ui.text(px + 16 * ts, y, ts, "THIS ZOO HAS NO SCENARIO GOALS.", .{ 0.8, 0.85, 0.9, 1 });
+            return self.goalsClose(ui, px, py, pw, ph, ts);
+        };
+        var stack: [32]*const scenario_mod.Node = undefined;
+        var depth: [32]usize = undefined;
+        var sp: usize = 0;
+        var ri = m.roots.items.len;
+        while (ri > 0) {
+            ri -= 1;
+            if (sp < stack.len) {
+                stack[sp] = m.roots.items[ri];
+                depth[sp] = 0;
+                sp += 1;
+            }
+        }
+        while (sp > 0 and y < py + ph - 40 * ts) {
+            sp -= 1;
+            const n = stack[sp];
+            const d = depth[sp];
+            if (!n.is_group and !n.hidden) {
+                const text = m.textFor(n);
+                const mark: []const u8 = switch (n.state) {
+                    .pending => "[ ]",
+                    .success => "[X]",
+                    .failed => "[!]",
+                };
+                const col: [4]f32 = switch (n.state) {
+                    .pending => .{ 1, 1, 1, 1 },
+                    .success => .{ 0.55, 0.95, 0.55, 1 },
+                    .failed => .{ 1, 0.55, 0.5, 1 },
+                };
+                _ = try ui.text(px + 16 * ts, y, ts, mark, col);
+                y += try self.wrapText(ui, px + 40 * ts, y, ts, cols, text, col) + 4 * ts;
+            }
+            var ci = n.children.len;
+            while (ci > 0) {
+                ci -= 1;
+                if (sp < stack.len) {
+                    stack[sp] = n.children[ci];
+                    depth[sp] = d + 1;
+                    sp += 1;
+                }
+            }
+        }
+        return self.goalsClose(ui, px, py, pw, ph, ts);
+    }
+
+    fn goalsClose(self: *App, ui: *viewer.Ui, px: f32, py: f32, pw: f32, ph: f32, ts: f32) !void {
+        const bw = 30 * 6 * ts;
+        const bx = px + (pw - bw) / 2;
+        const by = py + ph - 26 * ts;
+        const bh = 7 * ts + 8 * ts;
+        ui.template("buttonbar", bx, by, bw, bh, ts / 2, 1);
+        const label = "CLOSE";
+        _ = try ui.text(bx + (bw - viewer.Ui.textWidth(label, ts)) / 2, by + 4 * ts, ts, label, .{ 1, 1, 1, 1 });
+        try self.hits.append(self.gpa, .{ .x = bx, .y = by, .w = bw, .h = bh, .action = .{ .menu = .close_menu } });
+    }
+
     fn drawFinances(self: *App, ui: *viewer.Ui, scale: f32) !void {
         const z = &self.sim.zoo;
         const white = [4]f32{ 1, 1, 1, 1 };
@@ -3504,6 +3721,7 @@ pub const App = struct {
             },
             sc.delete, sc.x => self.deleteSelected(),
             sc.f => self.refill(),
+            sc.o => self.openMenu(.goals),
             sc.z => self.doUndo(),
             sc.c => {
                 self.fence_start = null;
@@ -4073,7 +4291,10 @@ pub const App = struct {
         // Simulation.
         if (self.opts.sim) {
             self.updateGuestCap();
-            if (!self.paused and self.menu == .none) self.sim.advance(&self.world, ctx.dt * self.speed);
+            if (!self.paused and self.menu == .none) {
+                self.sim.advance(&self.world, ctx.dt * self.speed);
+                if (self.scen) |m| m.update(ctx.dt * self.speed);
+            }
             for (self.actor_ids.items, 0..) |id, i| {
                 const ag = self.sim.agentFor(id) orelse continue;
                 const root = self.modelMatrixAt(ag.pos, ag.yaw, self.actor_scales.items[i]);
@@ -4228,6 +4449,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, vfs: *vfs_mod.Vfs, path: []const u8, 
     try app.buildMapList();
     if (opts.pick_map) app.openMenu(.main);
     try app.buildCatalogs();
+    if (opts.scenario.len > 0) app.startScenario(opts.scenario);
     app.runScript(opts.script);
     try app.splitInput(opts.input);
     std.debug.print("{d} objects, {d} fence types, {d} path textures, {d} animals/people in the catalogs\n", .{

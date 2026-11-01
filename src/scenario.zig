@@ -57,6 +57,38 @@ pub const Node = struct {
     alt_failure: ?[]const u8 = null,
 };
 
+/// The game as scenario scripts see it. The application fills this in;
+/// the defaults describe an empty world so the manager runs on its own.
+pub const Host = struct {
+    ctx: *anyopaque = undefined,
+    /// Handles of the entities of a kind: a category (`animal`, `entrance`),
+    /// a species (`TigerBengal`) or a binder (`frontgate_df`). `direct`
+    /// means exactly that type rather than anything derived from it.
+    entities: *const fn (ctx: *anyopaque, gpa: std.mem.Allocator, kind: []const u8, direct: bool, out: *std.ArrayList(u32)) void = noEntities,
+    /// A number about an entity (`hunger`, `hygiene`...), if it has one.
+    attr: *const fn (ctx: *anyopaque, id: u32, name: []const u8) ?f64 = noAttr,
+    set_attr: *const fn (ctx: *anyopaque, id: u32, name: []const u8, value: f64) void = noSetAttr,
+    /// The entity's binder name.
+    binder: *const fn (ctx: *anyopaque, id: u32) []const u8 = noBinder,
+    /// Zoo-wide numbers by name: `cash`, `month`, `day`, `time`, `fame`
+    /// (in half stars), `guests`.
+    stat: *const fn (ctx: *anyopaque, name: []const u8) f64 = noStat,
+    give_cash: *const fn (ctx: *anyopaque, amount: f64) void = noCash,
+};
+
+fn noEntities(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: bool, _: *std.ArrayList(u32)) void {}
+fn noAttr(_: *anyopaque, _: u32, _: []const u8) ?f64 {
+    return null;
+}
+fn noSetAttr(_: *anyopaque, _: u32, _: []const u8, _: f64) void {}
+fn noBinder(_: *anyopaque, _: u32) []const u8 {
+    return "";
+}
+fn noStat(_: *anyopaque, _: []const u8) f64 {
+    return 0;
+}
+fn noCash(_: *anyopaque, _: f64) void {}
+
 /// What a finished scenario came to.
 pub const Outcome = enum { running, won, lost };
 
@@ -75,6 +107,7 @@ pub const Manager = struct {
     /// Lines scripts asked to show (win/fail panels, hints), oldest first.
     messages: std.ArrayList([]const u8) = .empty,
     log: bool = false,
+    host: Host = .{},
 
     pub fn create(gpa: std.mem.Allocator, vfs: *vfs_mod.Vfs, loc: *const loc_mod.Loc) !*Manager {
         const eng = try script.Engine.create(gpa, vfs);
@@ -291,6 +324,39 @@ pub const Manager = struct {
         return self.vars.get(key);
     }
 
+    /// Calls on game components (`ZTStatus:...`). Returns the number of
+    /// results pushed, or null when the call is not handled.
+    fn handleCall(self: *Manager, L: ?*c.lua_State, comp: []const u8, method: []const u8) ?c_int {
+        const h = self.host;
+        const eq = std.mem.eql;
+        if (eq(u8, comp, "BFGManager")) {
+            const direct = eq(u8, method, "BFG_GET_ENTITIES_DIRECT");
+            if (direct or eq(u8, method, "BFG_GET_ENTITIES")) {
+                const kind = l.str(L, 2) orelse "";
+                var ids: std.ArrayList(u32) = .empty;
+                defer ids.deinit(self.gpa);
+                h.entities(h.ctx, self.gpa, kind, direct, &ids);
+                c.lua_newtable(L);
+                for (ids.items, 1..) |id, i| {
+                    c.lua_pushnumber(L, @floatFromInt(i));
+                    c.lua_newtable(L);
+                    c.lua_pushstring(L, "value");
+                    c.lua_pushnumber(L, @floatFromInt(id));
+                    c.lua_settable(L, -3);
+                    c.lua_settable(L, -3);
+                }
+                return 1;
+            }
+        } else if (eq(u8, comp, "ZTStatus")) {
+            const stat: ?[]const u8 = if (eq(u8, method, "ZT_GET_FAME_HALFSTARS")) "fame" else if (eq(u8, method, "ZT_GET_CURRENT_MONTH")) "month" else if (eq(u8, method, "ZT_GET_CURRENT_DAYOFMONTH")) "day" else if (eq(u8, method, "ZT_GET_CURRENT_TIMEOFDAY")) "time" else if (eq(u8, method, "ZT_GET_NUM_GUESTS")) "guests" else null;
+            if (stat) |name| {
+                c.lua_pushnumber(L, h.stat(h.ctx, name));
+                return 1;
+            }
+        }
+        return null;
+    }
+
     pub fn say(self: *Manager, text: []const u8) void {
         const t = self.arena.allocator().dupe(u8, text) catch return;
         self.messages.append(self.gpa, t) catch {};
@@ -324,6 +390,117 @@ fn registerApi(eng: *script.Engine) void {
     eng.register("getuservar", apiGetVar);
     eng.register("getLocID", apiLocId);
     eng.register("queryObject", apiQueryObject);
+    eng.register("resolveTable", apiResolve);
+    eng.register("areCompsEqual", apiCompsEqual);
+    eng.register("giveCash", apiGiveCash);
+    eng.register("howMuchCash", apiHowMuchCash);
+    eng.register("getCurrentMonth", apiCurrentMonth);
+    eng.register("getCurrentTimeOfDay", apiTimeOfDay);
+}
+
+fn statOf(name: []const u8) f64 {
+    const m = active orelse return 0;
+    return m.host.stat(m.host.ctx, name);
+}
+
+fn apiGiveCash(L: ?*c.lua_State) callconv(.c) c_int {
+    const m = active orelse return 0;
+    if (c.lua_isnumber(L, 1) != 0) m.host.give_cash(m.host.ctx, c.lua_tonumber(L, 1));
+    return 0;
+}
+
+fn apiHowMuchCash(L: ?*c.lua_State) callconv(.c) c_int {
+    c.lua_pushnumber(L, statOf("cash"));
+    return 1;
+}
+
+fn apiCurrentMonth(L: ?*c.lua_State) callconv(.c) c_int {
+    c.lua_pushnumber(L, statOf("month"));
+    return 1;
+}
+
+fn apiTimeOfDay(L: ?*c.lua_State) callconv(.c) c_int {
+    c.lua_pushnumber(L, statOf("time"));
+    return 1;
+}
+
+/// `resolveTable(entry.value)` turns an entity handle into an object.
+fn apiResolve(L: ?*c.lua_State) callconv(.c) c_int {
+    if (c.lua_isnumber(L, 1) == 0) {
+        c.lua_pushnil(L);
+        return 1;
+    }
+    c.lua_newtable(L);
+    c.lua_pushstring(L, "__ent");
+    c.lua_pushvalue(L, 1);
+    c.lua_settable(L, -3);
+    c.lua_newtable(L);
+    c.lua_pushstring(L, "__index");
+    c.lua_pushcclosure(L, entityIndex, 0);
+    c.lua_settable(L, -3);
+    _ = c.lua_setmetatable(L, -2);
+    return 1;
+}
+
+fn handleOf(L: ?*c.lua_State, i: c_int) ?f64 {
+    switch (c.lua_type(L, i)) {
+        c.LUA_TNUMBER => return c.lua_tonumber(L, i),
+        c.LUA_TTABLE => {
+            c.lua_pushstring(L, "__ent");
+            c.lua_rawget(L, i);
+            defer c.lua_pop(L, 1);
+            if (c.lua_isnumber(L, -1) != 0) return c.lua_tonumber(L, -1);
+            c.lua_pushstring(L, "value");
+            c.lua_rawget(L, i);
+            defer c.lua_pop(L, 1);
+            if (c.lua_isnumber(L, -1) != 0) return c.lua_tonumber(L, -1);
+            return null;
+        },
+        else => return null,
+    }
+}
+
+fn apiCompsEqual(L: ?*c.lua_State) callconv(.c) c_int {
+    const a = handleOf(L, 1);
+    const b = handleOf(L, 2);
+    c.lua_pushboolean(L, @intFromBool(a != null and b != null and a.? == b.?));
+    return 1;
+}
+
+fn entityIndex(L: ?*c.lua_State) callconv(.c) c_int {
+    if (c.lua_type(L, 2) != c.LUA_TSTRING) {
+        c.lua_pushnil(L);
+        return 1;
+    }
+    c.lua_pushstring(L, "__ent");
+    c.lua_rawget(L, 1);
+    c.lua_pushvalue(L, 2);
+    c.lua_pushcclosure(L, entityCall, 2);
+    return 1;
+}
+
+fn entityCall(L: ?*c.lua_State) callconv(.c) c_int {
+    const id: u32 = @intFromFloat(c.lua_tonumber(L, upvalue_base - 1));
+    const method = std.mem.span(c.lua_tostring(L, upvalue_base - 2));
+    const m = active orelse return 0;
+    const h = m.host;
+    const eq = std.mem.eql;
+    if (eq(u8, method, "BFG_GET_ATTR_FLOAT")) {
+        c.lua_pushnumber(L, h.attr(h.ctx, id, l.str(L, 2) orelse "") orelse 0);
+        return 1;
+    } else if (eq(u8, method, "BFG_SET_ATTR_FLOAT")) {
+        if (c.lua_isnumber(L, 3) != 0) h.set_attr(h.ctx, id, l.str(L, 2) orelse "", c.lua_tonumber(L, 3));
+        return 0;
+    } else if (eq(u8, method, "BFG_GET_BINDER_TYPE")) {
+        l.pushStr(L, h.binder(h.ctx, id));
+        return 1;
+    } else if (eq(u8, method, "BFG_GET_ENTITY_ID")) {
+        c.lua_pushnumber(L, @floatFromInt(id));
+        return 1;
+    }
+    var nb: [160]u8 = undefined;
+    if (script.currentEngine()) |e| e.noteMissing(std.fmt.bufPrint(&nb, "entity:{s}", .{method}) catch method);
+    return 0;
 }
 
 fn apiLog(L: ?*c.lua_State) callconv(.c) c_int {
@@ -375,12 +552,77 @@ fn apiQueryObject(L: ?*c.lua_State) callconv(.c) c_int {
         }
         return 1;
     }
+    const known = [_][]const u8{ "BFGManager", "UIRoot", "ZTStatus", "ZTEconomyMgr", "ZTPhotoChallengesComponent", "ZTAIMgr", "ZTMode", "ZTPuzzleMgr", "ZTWorldMgr", "ZTResearchMgr" };
+    for (known) |k| if (std.mem.eql(u8, k, name)) {
+        pushComponent(L, name);
+        return 1;
+    };
     if (script.currentEngine()) |e| {
         var nb: [120]u8 = undefined;
         e.noteMissing(std.fmt.bufPrint(&nb, "queryObject:{s}", .{name}) catch name);
     }
     c.lua_pushnil(L);
     return 1;
+}
+
+/// A game component as scripts see it: a table whose methods are looked up
+/// on demand and routed to `componentCall`.
+fn pushComponent(L: ?*c.lua_State, name: []const u8) void {
+    c.lua_newtable(L);
+    c.lua_pushstring(L, "__comp");
+    l.pushStr(L, name);
+    c.lua_settable(L, -3);
+    c.lua_newtable(L);
+    c.lua_pushstring(L, "__index");
+    c.lua_pushcclosure(L, componentIndex, 0);
+    c.lua_settable(L, -3);
+    _ = c.lua_setmetatable(L, -2);
+}
+
+/// `comp.METHOD` -> a closure remembering the component and method names.
+fn componentIndex(L: ?*c.lua_State) callconv(.c) c_int {
+    if (c.lua_type(L, 2) != c.LUA_TSTRING) {
+        c.lua_pushnil(L);
+        return 1;
+    }
+    c.lua_pushstring(L, "__comp");
+    c.lua_rawget(L, 1);
+    c.lua_pushvalue(L, 2);
+    c.lua_pushcclosure(L, componentCall, 2);
+    return 1;
+}
+
+const upvalue_base: c_int = -10001;
+
+fn componentCall(L: ?*c.lua_State) callconv(.c) c_int {
+    const comp = std.mem.span(c.lua_tostring(L, upvalue_base - 1));
+    const method = std.mem.span(c.lua_tostring(L, upvalue_base - 2));
+    const m = active orelse return 0;
+    if (m.handleCall(L, comp, method)) |n| return n;
+    var nb: [400]u8 = undefined;
+    if (script.currentEngine()) |e| {
+        var w: std.Io.Writer = .fixed(&nb);
+        w.print("{s}:{s}(", .{ comp, method }) catch {};
+        const top = c.lua_gettop(L);
+        var i: c_int = 2;
+        while (i <= top) : (i += 1) {
+            switch (c.lua_type(L, i)) {
+                c.LUA_TSTRING => w.print("\"{s}\",", .{std.mem.span(c.lua_tostring(L, i))}) catch {},
+                c.LUA_TNUMBER => w.print("{d},", .{c.lua_tonumber(L, i)}) catch {},
+                c.LUA_TTABLE => w.writeAll("table,") catch {},
+                c.LUA_TNIL => w.writeAll("nil,") catch {},
+                else => w.writeAll("?,") catch {},
+            }
+        }
+        w.writeAll(")") catch {};
+        if (e.log) e.noteMissing(w.buffered()) else e.noteMissing(w.buffered());
+    }
+    // UI objects answer every call with themselves so chains keep working.
+    if (std.mem.eql(u8, comp, "UIRoot")) {
+        pushComponent(L, comp);
+        return 1;
+    }
+    return 0;
 }
 
 // Methods are called with the object first (`mgr:BFS_X(a)`), so arguments start at 2.
