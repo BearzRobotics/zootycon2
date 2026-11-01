@@ -37,6 +37,8 @@ pub const Hooks = struct {
     feeder: *const fn (ctx: *anyopaque, binder: []const u8) ?[]const u8,
     /// Monthly salary of a staff entity (0 for everyone else).
     wage: ?*const fn (ctx: *anyopaque, binder: []const u8) f32 = null,
+    /// If an entity is a shop or facility guests can use.
+    venue: ?*const fn (ctx: *anyopaque, binder: []const u8) ?VenueInfo = null,
 };
 
 /// A food or water container placed in the world.
@@ -95,7 +97,28 @@ const OracleCtx = struct {
 };
 
 /// What a guest is currently heading for.
-pub const Goal = enum { none, view, wander, leave };
+pub const Goal = enum { none, view, wander, leave, shop };
+
+/// Guest needs, in the order of `Agent.needs`.
+pub const Need = enum { hunger, thirst, bathroom, dessert, gift };
+pub const need_count = 5;
+/// How fast each need grows per second, and the level at which a guest
+/// starts looking for somewhere to satisfy it.
+const need_rate = [need_count]f32{ 0.35, 0.5, 0.3, 0.22, 0.12 };
+const need_seek = [need_count]f32{ 55, 55, 60, 75, 85 };
+
+/// What a shop or facility sells.
+pub const VenueInfo = struct { need: Need, price: f32, upkeep: f32 };
+
+/// A shop or facility placed in the world.
+pub const Venue = struct {
+    prop_id: u32,
+    pos: [2]f32,
+    need: Need,
+    price: f32,
+    upkeep: f32,
+    uses: u32 = 0,
+};
 
 /// Zoo-wide numbers shown to the player.
 pub const Zoo = struct {
@@ -108,6 +131,9 @@ pub const Zoo = struct {
     /// Feeders refilled by keepers, and salaries paid so far.
     refills: u32 = 0,
     wages_paid: f64 = 0,
+    /// Purchases made at shops, and upkeep paid on buildings.
+    sales: u32 = 0,
+    upkeep_paid: f64 = 0,
 };
 
 /// What a keeper is doing about feeders.
@@ -139,6 +165,9 @@ pub const Agent = struct {
     wage: f32 = 0,
     job: Job = .none,
     job_feeder: u32 = 0,
+    /// Hunger, thirst, bathroom, dessert and gift urges, 0..100.
+    needs: [need_count]f32 = @splat(0),
+    shop_prop: u32 = 0,
     /// Animation the agent is playing, by manifest name.
     anim_name: []const u8 = "Stand_Idle",
     /// Id of the world actor this agent drives.
@@ -339,6 +368,8 @@ pub const Sim = struct {
     zoo: Zoo = .{},
     feeders: std.ArrayList(Feeder) = .empty,
     feeders_key: usize = std.math.maxInt(usize),
+    venues: std.ArrayList(Venue) = .empty,
+    venues_key: usize = std.math.maxInt(usize),
     /// Entity names guests are made from.
     guest_binders: []const []const u8 = &.{},
     max_guests: u32 = 50,
@@ -438,6 +469,28 @@ pub const Sim = struct {
         }
         self.findEntrance(w);
         self.syncFeeders(w);
+        self.syncVenues(w);
+    }
+
+    fn syncVenues(self: *Sim, w: *const world_mod.World) void {
+        const h = self.hooks orelse return;
+        const vf = h.venue orelse return;
+        var key: usize = w.props.items.len;
+        for (w.props.items) |p| key = key *% 31 +% p.id;
+        if (key == self.venues_key) return;
+        self.venues_key = key;
+        var next: std.ArrayList(Venue) = .empty;
+        for (w.props.items) |p| {
+            if (p.binder.len == 0) continue;
+            const info = vf(h.ctx, p.binder) orelse continue;
+            var uses: u32 = 0;
+            for (self.venues.items) |old| if (old.prop_id == p.id) {
+                uses = old.uses;
+            };
+            next.append(self.gpa, .{ .prop_id = p.id, .pos = .{ p.position[0], p.position[1] }, .need = info.need, .price = info.price, .upkeep = info.upkeep, .uses = uses }) catch {};
+        }
+        self.venues.deinit(self.gpa);
+        self.venues = next;
     }
 
     /// Rebuilds the feeder list from the world's props, keeping food levels
@@ -605,6 +658,10 @@ pub const Sim = struct {
                 self.zoo.income -= ag.wage;
                 self.zoo.wages_paid += ag.wage;
             };
+            for (self.venues.items) |v| {
+                self.zoo.income -= v.upkeep;
+                self.zoo.upkeep_paid += v.upkeep;
+            }
         }
         for (self.agents.items) |*ag| {
             ag.anim_time += dt;
@@ -802,6 +859,13 @@ pub const Sim = struct {
         if (ag.leave_done) return;
         ag.tour_left -= dt;
         ag.happiness = @max(0, ag.happiness - 0.01 * dt);
+        var critical = false;
+        for (&ag.needs, need_rate, 0..) |*n, r, i| {
+            n.* = @min(100, n.* + r * dt);
+            if (i < 3 and n.* >= 90) critical = true;
+        }
+        // Unmet basic needs make for an unhappy visit.
+        if (critical) ag.happiness = @max(0, ag.happiness - 0.25 * dt);
         switch (ag.state) {
             .idle => {
                 ag.timer -= dt;
@@ -848,8 +912,63 @@ pub const Sim = struct {
                 ag.happiness = @min(100, ag.happiness + (6 + self.rng.random().float(f32) * 4) * worth);
                 self.guestRest(ag, 8, 18);
             },
+            .shop => {
+                for (self.venues.items) |*v| if (v.prop_id == ag.shop_prop) {
+                    const i = @intFromEnum(v.need);
+                    ag.needs[i] = 0;
+                    v.uses += 1;
+                    self.zoo.sales += 1;
+                    self.zoo.income += v.price;
+                    ag.happiness = @min(100, ag.happiness + 4 + (if (v.need == .gift) @as(f32, 4) else 0));
+                    ag.anim_name = "Stand_Idle";
+                    break;
+                };
+                self.guestRest(ag, 3, 5);
+            },
             else => self.guestRest(ag, 2, 6),
         }
+    }
+
+    /// If a guest has an urge it can satisfy somewhere reachable, heads there.
+    fn guestShop(self: *Sim, ag: *Agent) bool {
+        var order: [need_count]usize = .{ 0, 1, 2, 3, 4 };
+        // Most pressing (relative to its threshold) first.
+        std.mem.sort(usize, &order, ag, struct {
+            fn more(a: *const Agent, x: usize, y: usize) bool {
+                return a.needs[x] - need_seek[x] > a.needs[y] - need_seek[y];
+            }
+        }.more);
+        for (order) |i| {
+            if (ag.needs[i] < need_seek[i]) continue;
+            var best: ?*const Venue = null;
+            var best_d: f32 = std.math.inf(f32);
+            for (self.venues.items) |*v| {
+                if (@intFromEnum(v.need) != i) continue;
+                const dx = v.pos[0] - ag.pos[0];
+                const dy = v.pos[1] - ag.pos[1];
+                const d = dx * dx + dy * dy;
+                if (d < best_d) {
+                    best_d = d;
+                    best = v;
+                }
+            }
+            const v = best orelse continue;
+            const spot = self.graph.nearest(v.pos[0], v.pos[1], 20) orelse continue;
+            ag.shop_prop = v.prop_id;
+            if (self.routeTo(ag, spot)) {
+                ag.goal = .shop;
+                ag.state = .walk;
+                ag.anim = .walk;
+                ag.anim_name = "Walk_Ahead";
+                return true;
+            }
+            if ((ag.node orelse 0) == spot) {
+                ag.goal = .shop;
+                self.guestArrive(ag);
+                return true;
+            }
+        }
+        return false;
     }
 
     /// Picks what the guest does next.
@@ -873,6 +992,7 @@ pub const Sim = struct {
                 }
             }
         };
+        if (self.guestShop(ag)) return;
         // Otherwise: go and watch an animal, or just stroll.
         var animals: usize = 0;
         for (self.agents.items) |a| if (a.kind == .animal) {

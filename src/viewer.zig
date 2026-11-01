@@ -305,7 +305,7 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
-fn poseWorld(world: []Mat4, nf: *const nif.Nif, root: Mat4, anim: ?*const bf.Animation, t: f32) void {
+pub fn poseWorld(world: []Mat4, nf: *const nif.Nif, root: Mat4, anim: ?*const bf.Animation, t: f32) void {
     for (nf.roots) |r| poseNode(world, nf, r, root, anim, t, false);
 }
 
@@ -688,6 +688,12 @@ const Skin = struct {
     /// Geometry space -> bone space, per bone.
     offsets: []const Mat4,
 };
+
+/// Near clip distance. It follows the zoom so that when the camera is close
+/// to something (a guest's head, say) it is not cut off by the near plane.
+fn nearFor(cam: Camera) f32 {
+    return std.math.clamp(cam.dist * 0.04, 0.05, @max(0.05, cam.radius * 0.01));
+}
 
 fn dist_far_for(cam: Camera) f32 {
     return cam.dist + cam.radius * 10;
@@ -2869,7 +2875,7 @@ pub fn loopWith(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Came
             cam.center[2] + cam.dist * @sin(cam.pitch),
         };
         const aspect = @as(f32, @floatFromInt(size.width)) / @as(f32, @floatFromInt(size.height));
-        const vp = mul(perspective(0.8, aspect, cam.radius * 0.01, cam.dist + cam.radius * 10), lookAt(eye, cam.center, .{ 0, 0, 1 }));
+        const vp = mul(perspective(0.8, aspect, nearFor(cam), cam.dist + cam.radius * 10), lookAt(eye, cam.center, .{ 0, 0, 1 }));
 
         if (play) |pb| {
             const t: f32 = opts.time orelse blk: {
@@ -2973,7 +2979,7 @@ pub fn loopWith(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Came
         for (scene.actor_draws.items) |d| drawItem(gfx, scene, d, &frustum, &dstate);
         for (scene.overlay.items) |d| drawItem(gfx, scene, d, &frustum, &dstate);
         if (use_post) {
-            const near = cam.radius * 0.01;
+            const near = nearFor(cam);
             const far = cam.dist + cam.radius * 10;
             runPost(gfx, scene.fx, cam, aspect, near, far, .{ .width = size.width, .height = size.height });
         }

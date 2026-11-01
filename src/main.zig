@@ -250,6 +250,59 @@ pub fn main(init: std.process.Init) !void {
                 }
             }
         }
+    } else if (std.mem.eql(u8, cmd, "headcheck")) {
+        // Debug: where the Link_Head node goes in every animation of a model.
+        if (rest.len < 1) return fail("headcheck <file.bfm>\n");
+        const v = zootycon2.viewer;
+        const data = try vfs.read(gpa, rest[0]);
+        defer gpa.free(data);
+        var mf = try zootycon2.model.parseManifest(gpa, data);
+        defer mf.deinit();
+        const nb = try vfs.read(gpa, mf.model_name);
+        defer gpa.free(nb);
+        var nf = try zootycon2.nif.parse(gpa, nb);
+        defer nf.deinit();
+        var head: ?usize = null;
+        var spine: ?usize = null;
+        for (nf.blocks, 0..) |blk, bi| switch (blk) {
+            .node => |n| {
+                if (std.ascii.eqlIgnoreCase(n.av.net.name, "Link_Head")) head = bi;
+                if (std.ascii.eqlIgnoreCase(n.av.net.name, "Bip01 Spine")) spine = bi;
+            },
+            else => {},
+        };
+        const hi = head orelse return fail("no Link_Head\n");
+        const world = try gpa.alloc(v.Mat4, nf.blocks.len);
+        defer gpa.free(world);
+        for (mf.animations) |an| {
+            const ab = vfs.read(gpa, an.path) catch continue;
+            defer gpa.free(ab);
+            var anim = zootycon2.bf.parse(gpa, ab) catch continue;
+            defer anim.deinit();
+            var zmin: f32 = 1e9;
+            var zmax: f32 = -1e9;
+            var bad = false;
+            var dmax: f32 = 0;
+            var t: f32 = 0;
+            while (t <= anim.duration) : (t += 0.05) {
+                @memset(world, v.identity);
+                v.poseWorld(world, &nf, v.identity, &anim, t);
+                const m = world[hi];
+                for (m) |x| if (!std.math.isFinite(x)) {
+                    bad = true;
+                };
+                zmin = @min(zmin, m[14]);
+                zmax = @max(zmax, m[14]);
+                if (spine) |si| {
+                    const s = world[si];
+                    const dx = m[12] - s[12];
+                    const dy = m[13] - s[13];
+                    const dz = m[14] - s[14];
+                    dmax = @max(dmax, @sqrt(dx * dx + dy * dy + dz * dz));
+                }
+            }
+            try out.print("{s}: z {d:.1}..{d:.1} head-spine {d:.1}{s}\n", .{ an.name, zmin, zmax, dmax, if (bad) " NAN" else "" });
+        }
     } else if (std.mem.eql(u8, cmd, "modelcheck")) {
         const prefix = if (rest.len > 0) rest[0] else "";
         var names: std.ArrayList([]const u8) = .empty;

@@ -387,7 +387,7 @@ pub const App = struct {
         var bit = self.reg.binders.valueIterator();
         while (bit.next()) |b| {
             const bd = b.*;
-            if (bd.abstract or self.feederKind(bd.name) == null) continue;
+            if (bd.abstract or (self.feederKind(bd.name) == null and venueNeed(bd) == null)) continue;
             if (viewer.binderModel(self.gpa, &self.reg, bd.name, "mainObj") == null) continue;
             try self.food_names.append(self.gpa, try ca.dupe(u8, bd.name));
         }
@@ -1153,6 +1153,63 @@ pub const App = struct {
         return null;
     }
 
+    /// Shops and facilities, classified by their entity type names.
+    fn venueNeed(b: *const entity.Binder) ?sim_mod.Need {
+        for (b.type_path) |t| {
+            var buf: [64]u8 = undefined;
+            if (t.len > buf.len) continue;
+            const l = std.ascii.lowerString(&buf, t);
+            if (std.mem.startsWith(u8, l, "bathroom")) return .bathroom;
+            if (std.mem.startsWith(u8, l, "foodstand_")) {
+                if (std.mem.indexOf(u8, l, "soda") != null or std.mem.indexOf(u8, l, "coffee") != null or std.mem.indexOf(u8, l, "water") != null) return .thirst;
+                return .hunger;
+            }
+            if (std.mem.startsWith(u8, l, "restaurant")) return .hunger;
+            if (std.mem.startsWith(u8, l, "snackcart")) return .dessert;
+            if (std.mem.startsWith(u8, l, "giftcart") or std.mem.startsWith(u8, l, "giftshop")) return .gift;
+        }
+        return null;
+    }
+
+    fn findTransaction(e: *const xml.Element, name: []const u8) ?*const xml.Element {
+        if (std.ascii.eqlIgnoreCase(e.name, "ZTTransaction")) {
+            if (e.attr("name")) |n| if (std.ascii.eqlIgnoreCase(n, name)) return e;
+        }
+        for (e.children) |c| if (findTransaction(c, name)) |v| return v;
+        return null;
+    }
+
+    fn hookVenue(ctx: *anyopaque, binder: []const u8) ?sim_mod.VenueInfo {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        const b = self.reg.get(binder) orelse return null;
+        const need = venueNeed(b) orelse return null;
+        const ch = self.reg.chain(self.gpa, b) catch return null;
+        defer self.gpa.free(ch);
+        var price: f32 = 0;
+        var upkeep: f32 = 0;
+        var i = ch.len;
+        while (i > 0) {
+            i -= 1;
+            if (price == 0) if (findTransaction(ch[i].root, "Buy_Item")) |t| {
+                // "costChoice" lists the prices the player may set; take the middle.
+                if (t.attr("costChoice")) |cc| {
+                    var vals: [8]f32 = undefined;
+                    var n: usize = 0;
+                    var tk = std.mem.tokenizeAny(u8, cc, " ,");
+                    while (tk.next()) |v| if (n < vals.len) {
+                        vals[n] = std.fmt.parseFloat(f32, v) catch continue;
+                        n += 1;
+                    };
+                    if (n > 0) price = vals[n / 2];
+                } else if (t.attr("cost")) |c| price = std.fmt.parseFloat(f32, c) catch 0;
+            };
+            if (upkeep == 0) if (findTransaction(ch[i].root, "upkeep")) |t| {
+                if (t.attr("cost")) |c| upkeep = std.fmt.parseFloat(f32, c) catch 0;
+            };
+        }
+        return .{ .need = need, .price = price, .upkeep = upkeep };
+    }
+
     fn hookWage(ctx: *anyopaque, binder: []const u8) f32 {
         const self: *App = @ptrCast(@alignCast(ctx));
         const b = self.reg.get(binder) orelse return 0;
@@ -1208,7 +1265,7 @@ pub const App = struct {
     }
 
     fn installHooks(self: *App) void {
-        self.sim.hooks = .{ .ctx = self, .brain = hookBrain, .anim_len = hookAnimLen, .flag = hookFlag, .feeder = hookFeeder, .wage = hookWage };
+        self.sim.hooks = .{ .ctx = self, .brain = hookBrain, .anim_len = hookAnimLen, .flag = hookFlag, .feeder = hookFeeder, .wage = hookWage, .venue = hookVenue };
         self.sim.guest_binders = self.guest_names.items;
         self.updateGuestCap();
     }
@@ -2090,9 +2147,14 @@ pub const App = struct {
                             .view => "WATCHING ANIMALS",
                             .leave => "HEADING HOME",
                             .wander => "STROLLING",
+                            .shop => "GOING SHOPPING",
                             .none => "LOOKING AROUND",
                         };
                         try rows.append(self.gpa, .{ .text = goal, .frac = 0, .color = grey, .is_bar = false });
+                        for (ag.needs[0..3], 0..) |nv, ni| {
+                            const names = [_][]const u8{ "HUNGER", "THIRST", "BATHROOM" };
+                            try rows.append(self.gpa, .{ .text = names[ni], .frac = nv / 100.0, .color = needColor(nv), .is_bar = true });
+                        }
                         if (std.math.isFinite(ag.tour_left)) try rows.append(self.gpa, .{ .text = try std.fmt.allocPrint(a, "LEAVES IN {d:.0}S", .{@max(ag.tour_left, 0)}), .frac = 0, .color = grey, .is_bar = false });
                     } else if (ag.brain) |b| {
                         const shown = [_]usize{ 5, 6, 0, 1, 2, 3, 4 };
