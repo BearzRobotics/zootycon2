@@ -20,6 +20,7 @@ const map_mod = @import("map.zig");
 const terrain_mod = @import("terrain.zig");
 const environment = @import("environment.zig");
 const xml = @import("xml.zig");
+const ai = @import("ai.zig");
 const vfs_mod = @import("vfs.zig");
 
 const Mat4 = viewer.Mat4;
@@ -144,7 +145,9 @@ pub const App = struct {
     // Instance bookkeeping: instance i shows actor `actor_ids[i]`.
     actor_ids: std.ArrayList(u32) = .empty,
     actor_scales: std.ArrayList(f32) = .empty,
-    inst_anim: std.ArrayList(?sim_mod.Anim) = .empty,
+    inst_anim: std.ArrayList([]const u8) = .empty,
+    /// Behaviour data per species (null when none loads), keyed by species.
+    ai_libs: std.StringHashMapUnmanaged(*ai.Library) = .empty,
     actor_defs: std.StringHashMapUnmanaged(?viewer.ActorModel) = .empty,
 
     // Tool state.
@@ -198,6 +201,13 @@ pub const App = struct {
         self.actor_ids.deinit(self.gpa);
         self.actor_scales.deinit(self.gpa);
         self.inst_anim.deinit(self.gpa);
+        var lit = self.ai_libs.iterator();
+        while (lit.next()) |e| {
+            self.gpa.free(e.key_ptr.*);
+            e.value_ptr.*.deinit();
+            self.gpa.destroy(e.value_ptr.*);
+        }
+        self.ai_libs.deinit(self.gpa);
         self.sim.deinit();
         if (self.env) |*e| e.deinit();
         self.look.deinit(self.gpa);
@@ -356,7 +366,7 @@ pub const App = struct {
             if (!try scene.addActor(def.file, m, phase, a.swaps, head)) continue;
             try self.actor_ids.append(self.gpa, a.id);
             try self.actor_scales.append(self.gpa, def.scale);
-            try self.inst_anim.append(self.gpa, null);
+            try self.inst_anim.append(self.gpa, "");
         }
     }
 
@@ -682,6 +692,7 @@ pub const App = struct {
         self.synced_terrain_rev = std.math.maxInt(u32);
         self.sim.deinit();
         self.sim = sim_mod.Sim.init(self.gpa, self.opts.seed);
+        self.installHooks();
         self.say("loaded {s}", .{zt2_path});
     }
 
@@ -774,6 +785,82 @@ pub const App = struct {
         } else if (std.mem.eql(u8, verb, "tod")) {
             self.tod = try num(it.next());
         } else return error.UnknownCommand;
+    }
+
+    // ------------------------------------------------------------ behaviour
+
+    fn fileExists(self: *App, comptime fmt: []const u8, args: anytype) ?[]u8 {
+        var buf: [160]u8 = undefined;
+        const path = std.fmt.bufPrint(&buf, fmt, args) catch return null;
+        if (!self.vfs.exists(path)) return null;
+        return self.vfs.read(self.gpa, path) catch null;
+    }
+
+    /// Loads the species' behaviour data (plus the generic actor tasks), once.
+    fn brainFor(self: *App, binder: []const u8) ?sim_mod.BrainSetup {
+        const b = self.reg.get(binder) orelse return null;
+        // The species is the most specific name on the type path that has a task file.
+        var species: []const u8 = "";
+        var i = b.type_path.len;
+        while (i > 0) {
+            i -= 1;
+            var lower: [64]u8 = undefined;
+            if (b.type_path[i].len > lower.len) continue;
+            const l = std.ascii.lowerString(&lower, b.type_path[i]);
+            var pbuf: [128]u8 = undefined;
+            const p = std.fmt.bufPrint(&pbuf, "ai/tasks/animals/{s}.tsk", .{l}) catch continue;
+            if (self.vfs.exists(p)) {
+                species = b.type_path[i];
+                break;
+            }
+        }
+        var key_buf: [64]u8 = undefined;
+        if (species.len > key_buf.len) return null;
+        const key = std.ascii.lowerString(&key_buf, species);
+        if (self.ai_libs.get(key)) |lib| return .{ .lib = lib, .groups = b.type_path };
+
+        const lib = self.gpa.create(ai.Library) catch return null;
+        lib.* = ai.Library.init(self.gpa);
+        if (species.len > 0) {
+            if (self.fileExists("ai/tasks/animals/{s}.beh", .{key})) |d| {
+                defer self.gpa.free(d);
+                lib.addSets(d) catch {};
+            }
+            if (self.fileExists("ai/tasks/animals/{s}.tsk", .{key})) |d| {
+                defer self.gpa.free(d);
+                lib.addTasks(d) catch {};
+            }
+        }
+        // Generic tasks every actor has (a default idle).
+        if (self.fileExists("ai/tasks/actor.beh", .{})) |d| {
+            defer self.gpa.free(d);
+            lib.addSets(d) catch {};
+        }
+        if (self.fileExists("ai/tasks/actor.tsk", .{})) |d| {
+            defer self.gpa.free(d);
+            lib.addTasks(d) catch {};
+        }
+        const owned = self.gpa.dupe(u8, key) catch return null;
+        self.ai_libs.put(self.gpa, owned, lib) catch {
+            self.gpa.free(owned);
+            return null;
+        };
+        return .{ .lib = lib, .groups = b.type_path };
+    }
+
+    fn hookBrain(ctx: *anyopaque, binder: []const u8) ?sim_mod.BrainSetup {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        return self.brainFor(binder);
+    }
+
+    fn hookAnimLen(ctx: *anyopaque, actor_id: u32, name: []const u8) ?f32 {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        for (self.actor_ids.items, 0..) |id, i| if (id == actor_id) return self.scene.animDuration(i, name);
+        return null;
+    }
+
+    fn installHooks(self: *App) void {
+        self.sim.hooks = .{ .ctx = self, .brain = hookBrain, .anim_len = hookAnimLen };
     }
 
     // ------------------------------------------------------- virtual input
@@ -879,7 +966,7 @@ pub const App = struct {
                 if (self.hover != null) "yes" else "no",                self.paused,
             });
             for (self.sim.agents.items[0..@min(self.sim.agents.items.len, 6)]) |ag| {
-                std.debug.print("agent #{d}: {s} speed={d:.2} state={s}\n", .{ ag.id, @tagName(ag.kind), ag.speed, @tagName(ag.state) });
+                std.debug.print("agent #{d}: {s} speed={d:.2} state={s} anim={s} brain={}\n", .{ ag.id, @tagName(ag.kind), ag.speed, @tagName(ag.state), ag.anim_name, ag.brain != null });
             }
             std.debug.print("perf: {d:.1} fps ({d} static draws, {d} actor draws)\n", .{ if (ctx.dt > 0) 1.0 / ctx.dt else 0.0, self.scene.draws.items.len, self.scene.actor_draws.items.len });
             std.debug.print("cam: yaw={d:.3} pitch={d:.3} dist={d:.2} center=({d:.1},{d:.1})\n", .{ ctx.cam.yaw, ctx.cam.pitch, ctx.cam.dist, ctx.cam.center[0], ctx.cam.center[1] });
@@ -1274,13 +1361,10 @@ pub const App = struct {
             for (self.actor_ids.items, 0..) |id, i| {
                 const ag = self.sim.agentFor(id) orelse continue;
                 const root = self.modelMatrixAt(ag.pos, ag.yaw, self.actor_scales.items[i]);
-                if (self.inst_anim.items[i] != ag.anim) {
-                    const names: []const []const u8 = switch (ag.anim) {
-                        .idle => &.{ "Stand_Idle", "Idle" },
-                        .walk => &.{ "Walk_Ahead", "Walk" },
-                    };
-                    self.scene.driveInstance(i, root, names, ag.anim_time);
-                    self.inst_anim.items[i] = ag.anim;
+                if (!std.mem.eql(u8, self.inst_anim.items[i], ag.anim_name)) {
+                    const names = [_][]const u8{ ag.anim_name, "Stand_Idle", "Idle" };
+                    self.scene.driveInstance(i, root, &names, ag.anim_time);
+                    self.inst_anim.items[i] = ag.anim_name;
                 } else {
                     const inst = &self.scene.instances.items[i];
                     inst.root = root;
@@ -1375,6 +1459,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, vfs: *vfs_mod.Vfs, path: []const u8, 
         .catalog_arena = .init(gpa),
     };
     defer app.deinit();
+    app.installHooks();
     try app.buildCatalogs();
     app.runScript(opts.script);
     try app.splitInput(opts.input);

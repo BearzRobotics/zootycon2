@@ -1450,6 +1450,15 @@ pub const Scene = struct {
         return true;
     }
 
+    /// Length in seconds of an animation of an instance's model, if it has one.
+    pub fn animDuration(self: *Scene, idx: usize, name: []const u8) ?f32 {
+        if (idx >= self.instances.items.len) return null;
+        const mf = self.instances.items[idx].manifest orelse return null;
+        const entry = mf.animation(name) orelse return null;
+        const an = self.loadAnim(entry.path) orelse return null;
+        return if (an.duration > 0) an.duration else null;
+    }
+
     /// Ground speed (model units per second) of an instance's walk
     /// animation, from how far its root bone travels over one cycle.
     pub fn walkSpeed(self: *Scene, idx: usize) ?f32 {

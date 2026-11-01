@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const world_mod = @import("world.zig");
+const ai = @import("ai.zig");
 
 pub const Kind = enum { person, animal };
 
@@ -16,7 +17,37 @@ pub const Anim = enum { idle, walk };
 
 pub const State = enum { idle, walk };
 
+/// What an animal's brain needs from the outside world.
+pub const BrainSetup = struct {
+    lib: *const ai.Library,
+    /// The species and groups the animal belongs to (`Lion`, `Lion_Adult_F`...).
+    groups: []const []const u8,
+};
+
+/// Lets the simulation ask the renderer-side about things only it knows.
+pub const Hooks = struct {
+    ctx: *anyopaque,
+    /// Behaviour data for an entity, if its species has any.
+    brain: *const fn (ctx: *anyopaque, binder: []const u8) ?BrainSetup,
+    /// Length of an animation for this actor's model, null if it has none by that name.
+    anim_len: *const fn (ctx: *anyopaque, actor_id: u32, name: []const u8) ?f32,
+};
+
+const OracleCtx = struct {
+    hooks: Hooks,
+    id: u32,
+    fn duration(ctx: *anyopaque, name: []const u8) ?f32 {
+        const c: *OracleCtx = @ptrCast(@alignCast(ctx));
+        return c.hooks.anim_len(c.hooks.ctx, c.id, name);
+    }
+};
+
 pub const Agent = struct {
+    /// Behaviour driven by game data (animals); null uses the built-in
+    /// idle/walk loop.
+    brain: ?ai.Brain = null,
+    /// Animation the agent is playing, by manifest name.
+    anim_name: []const u8 = "Stand_Idle",
     /// Id of the world actor this agent drives.
     id: u32,
     kind: Kind,
@@ -137,6 +168,7 @@ pub const Sim = struct {
     time: f64 = 0,
     /// World revision the walkway graph was built from.
     graph_paths: usize = std.math.maxInt(usize),
+    hooks: ?Hooks = null,
     /// Fixed step and leftover time for `advance`.
     step_len: f32 = 1.0 / 30.0,
     accum: f32 = 0,
@@ -146,6 +178,7 @@ pub const Sim = struct {
     }
 
     pub fn deinit(self: *Sim) void {
+        for (self.agents.items) |*a| if (a.brain) |*b| b.deinit();
         self.agents.deinit(self.gpa);
         self.walls.deinit(self.gpa);
         self.graph.deinit();
@@ -173,7 +206,12 @@ pub const Sim = struct {
             for (w.actors.items) |a| if (a.id == id) {
                 found = true;
             };
-            if (found) i += 1 else _ = self.agents.orderedRemove(i);
+            if (found) {
+                i += 1;
+            } else {
+                var gone = self.agents.orderedRemove(i);
+                if (gone.brain) |*b| b.deinit();
+            }
         }
         // Add agents for new actors.
         for (w.actors.items) |a| {
@@ -183,7 +221,12 @@ pub const Sim = struct {
             // The rotation matrix's first column is the model's +x axis in
             // the world; models face -y, so heading follows from yaw.
             const yaw = std.math.atan2(a.rotation[3], a.rotation[0]);
+            var brain: ?ai.Brain = null;
+            if (kind == .animal) if (self.hooks) |h| if (h.brain(h.ctx, a.binder)) |setup| {
+                brain = try ai.Brain.init(self.gpa, setup.lib, setup.groups, self.rng.random().int(u64));
+            };
             try self.agents.append(self.gpa, .{
+                .brain = brain,
                 .id = a.id,
                 .kind = kind,
                 .pos = a.position,
@@ -239,6 +282,10 @@ pub const Sim = struct {
         self.time += dt;
         for (self.agents.items) |*ag| {
             ag.anim_time += dt;
+            if (ag.brain != null and self.hooks != null) {
+                self.thinkAnimal(ag, w, dt);
+                continue;
+            }
             switch (ag.state) {
                 .idle => {
                     ag.timer -= dt;
@@ -293,25 +340,26 @@ pub const Sim = struct {
     fn rest(self: *Sim, ag: *Agent) void {
         ag.state = .idle;
         ag.anim = .idle;
+        ag.anim_name = "Stand_Idle";
         ag.timer = 2.0 + self.rng.random().float(f32) * 4.0;
     }
 
     fn startWalk(_: *Sim, ag: *Agent) void {
         ag.state = .walk;
         ag.anim = .walk;
+        ag.anim_name = "Walk_Ahead";
         ag.anim_time = 0;
     }
 
-    fn walk(self: *Sim, ag: *Agent, w: *const world_mod.World, dt: f32) void {
+    const Move = enum { moving, arrived, blocked };
+
+    /// Turns towards the agent's target and moves along the heading at
+    /// `speed`. Animals stop at fences.
+    fn moveToward(self: *Sim, ag: *Agent, w: *const world_mod.World, dt: f32, speed: f32) Move {
         const dx = ag.target[0] - ag.pos[0];
         const dy = ag.target[1] - ag.pos[1];
         const dist = @sqrt(dx * dx + dy * dy);
-        if (dist < 0.15) {
-            if (ag.kind == .person and self.rng.random().float(f32) < 0.85) {
-                self.decide(ag, w);
-            } else self.rest(ag);
-            return;
-        }
+        if (dist < 0.15) return .arrived;
         // Turn towards the target, then move along the heading.
         const want = std.math.atan2(dy, dx) + std.math.pi / 2.0;
         var diff = want - ag.yaw;
@@ -321,18 +369,71 @@ pub const Sim = struct {
         ag.yaw += std.math.clamp(diff, -max_turn, max_turn);
         // Only advance once roughly facing the target.
         if (@abs(diff) < 1.0) {
-            const step = @min(ag.speed * dt, dist);
+            const step = @min(speed * dt, dist);
             const nx = ag.pos[0] + dx / dist * step;
             const ny = ag.pos[1] + dy / dist * step;
-            // Animals cannot walk through fences: stop and rest instead.
-            if (ag.kind == .animal and self.blocked(.{ ag.pos[0], ag.pos[1] }, .{ nx, ny })) {
-                self.rest(ag);
-                return;
-            }
+            // Animals cannot walk through fences.
+            if (ag.kind == .animal and self.blocked(.{ ag.pos[0], ag.pos[1] }, .{ nx, ny })) return .blocked;
             ag.pos[0] = nx;
             ag.pos[1] = ny;
             ag.pos[2] = w.terrain.zAt(ag.pos[0], ag.pos[1]) + ag.ground_offset;
         }
+        return .moving;
+    }
+
+    fn walk(self: *Sim, ag: *Agent, w: *const world_mod.World, dt: f32) void {
+        switch (self.moveToward(ag, w, dt, ag.speed)) {
+            .moving => {},
+            .arrived => if (ag.kind == .person and self.rng.random().float(f32) < 0.85) {
+                self.decide(ag, w);
+            } else self.rest(ag),
+            .blocked => self.rest(ag),
+        }
+    }
+
+    /// Runs an animal's data-driven brain and carries out what it asks for.
+    fn thinkAnimal(self: *Sim, ag: *Agent, w: *const world_mod.World, dt: f32) void {
+        const h = self.hooks.?;
+        var oc: OracleCtx = .{ .hooks = h, .id = ag.id };
+        const brain = &ag.brain.?;
+        brain.update(dt, .{ .ctx = &oc, .duration = OracleCtx.duration });
+        const before = ag.anim_name;
+        switch (brain.current()) {
+            .anim => |name| {
+                ag.state = .idle;
+                ag.anim = .idle;
+                ag.anim_name = name;
+            },
+            .wander => |speed| {
+                const fast = speed == .fast and h.anim_len(h.ctx, ag.id, "Run_Ahead") != null;
+                ag.anim_name = if (fast) "Run_Ahead" else "Walk_Ahead";
+                ag.anim = .walk;
+                const factor: f32 = switch (speed) {
+                    .slow => 0.6,
+                    .medium => 1.0,
+                    .fast => 2.2,
+                };
+                if (ag.state != .walk) {
+                    ag.state = .walk;
+                    self.pickWanderTarget(ag, w);
+                }
+                switch (self.moveToward(ag, w, dt, ag.speed * factor)) {
+                    .moving => {},
+                    .arrived, .blocked => self.pickWanderTarget(ag, w),
+                }
+            },
+        }
+        if (!std.mem.eql(u8, before, ag.anim_name)) ag.anim_time = 0;
+    }
+
+    fn pickWanderTarget(self: *Sim, ag: *Agent, w: *const world_mod.World) void {
+        const rnd = self.rng.random();
+        const ang = rnd.float(f32) * std.math.tau;
+        const r = 2.0 + rnd.float(f32) * 6.0;
+        ag.target = .{
+            std.math.clamp(ag.home[0] + @cos(ang) * r, 1, w.terrain.world_width - 1),
+            std.math.clamp(ag.home[1] + @sin(ang) * r, 1, w.terrain.world_height - 1),
+        };
     }
 };
 
@@ -458,6 +559,73 @@ test "animals stay inside a fenced pen" {
         try testing.expect(p[0] > 24 and p[0] < 36 and p[1] > 24 and p[1] < 36);
     }
     try testing.expect(moved);
+}
+
+const BrainTest = struct {
+    lib: *ai.Library,
+    fn brain(ctx: *anyopaque, _: []const u8) ?BrainSetup {
+        const self: *BrainTest = @ptrCast(@alignCast(ctx));
+        return .{ .lib = self.lib, .groups = &.{ "Lion", "Lion_Adult_F" } };
+    }
+    fn animLen(_: *anyopaque, _: u32, name: []const u8) ?f32 {
+        const known = [_][]const u8{ "Stand_Idle", "Lie_Idle", "Walk_Ahead", "Stand_2Lie", "Lie_2Stand", "Sleep_Idle" };
+        for (known) |k| if (std.mem.eql(u8, k, name)) return 1.5;
+        return null;
+    }
+};
+
+test "animals run data-driven tasks: they wander inside the pen and rest" {
+    const gpa = testing.allocator;
+    var lib = ai.Library.init(gpa);
+    defer lib.deinit();
+    try lib.addSets(
+        \\<BehaviorSets>
+        \\ <Walk><behaviors><BFBehWander minPlayTime="6" maxPlayTime="8" locoSpeed="medium"/></behaviors></Walk>
+        \\ <Sleep><behaviors><BFBehAnimate targetAnim="Sleep_Idle"/></behaviors></Sleep>
+        \\</BehaviorSets>
+    );
+    try lib.addTasks(
+        \\<BFAITaskTemplateList>
+        \\ <BFAITaskTemplate Name="Wander"><BFAICreateData><Subjects><Lion/></Subjects><Targets><self/></Targets></BFAICreateData>
+        \\  <BFAIEvalData><BFAIAttributeFloatMap exercise="-30"/></BFAIEvalData>
+        \\  <BFBehExecTask><BFBehPlaySet behSet="Walk"/></BFBehExecTask>
+        \\  <BFAICompletionData><BFAIAttributeFloatMap exercise="-100" rest="30"/></BFAICompletionData></BFAITaskTemplate>
+        \\ <BFAITaskTemplate Name="Sleep"><BFAICreateData><Subjects><Lion/></Subjects><Targets><self/></Targets></BFAICreateData>
+        \\  <BFAIEvalData><BFAIAttributeFloatMap rest="-35"/></BFAIEvalData>
+        \\  <BFBehExecTask><BFBehPlaySet behSet="Sleep"/></BFBehExecTask>
+        \\  <BFAICompletionData><BFAIAttributeFloatMap rest="-100"/></BFAICompletionData></BFAITaskTemplate>
+        \\</BFAITaskTemplateList>
+    );
+    var w = world_mod.World.init(gpa, try testTerrain(gpa));
+    defer w.deinit();
+    const corners = [_][3]f32{ .{ 24, 24, 0 }, .{ 36, 24, std.math.pi / 2.0 }, .{ 36, 36, std.math.pi }, .{ 24, 36, 3.0 * std.math.pi / 2.0 } };
+    for (corners) |c| for (0..4) |i| {
+        const k = @as(f32, @floatFromInt(i)) * 3.0;
+        _ = try w.addFence("zoowall", .{ c[0] + @cos(c[2]) * k, c[1] + @sin(c[2]) * k, 0 }, c[2]);
+    };
+    _ = try w.addActor("Lion_Adult_F", .{ 30, 30, 6 }, world_mod.identity_rotation, &.{});
+    var bt: BrainTest = .{ .lib = &lib };
+    var sim = Sim.init(gpa, 21);
+    defer sim.deinit();
+    sim.hooks = .{ .ctx = &bt, .brain = BrainTest.brain, .anim_len = BrainTest.animLen };
+    try sim.sync(&w);
+    try testing.expect(sim.agents.items[0].brain != null);
+    var walked = false;
+    var slept = false;
+    var travelled: f32 = 0;
+    var last = sim.agents.items[0].pos;
+    for (0..9000) |_| { // five simulated minutes
+        sim.advance(&w, 1.0 / 30.0);
+        const ag = sim.agents.items[0];
+        if (std.mem.eql(u8, ag.anim_name, "Walk_Ahead")) walked = true;
+        if (std.mem.startsWith(u8, ag.anim_name, "Sleep")) slept = true;
+        travelled += @abs(ag.pos[0] - last[0]) + @abs(ag.pos[1] - last[1]);
+        last = ag.pos;
+        try testing.expect(ag.pos[0] > 24 and ag.pos[0] < 36 and ag.pos[1] > 24 and ag.pos[1] < 36);
+    }
+    try testing.expect(walked);
+    try testing.expect(slept);
+    try testing.expect(travelled > 5.0);
 }
 
 test "curbs and gates do not block" {
