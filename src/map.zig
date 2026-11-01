@@ -11,6 +11,13 @@
 const std = @import("std");
 const xml = @import("xml.zig");
 
+/// One texture replacement saved with an entity (`BFTextureSwapInfo`).
+pub const Swap = struct {
+    image: []const u8,
+    /// `base`, `decal0`, ...
+    layer: []const u8,
+};
+
 pub const Object = struct {
     /// Model path as written (often without an extension).
     model: []const u8,
@@ -18,6 +25,7 @@ pub const Object = struct {
     position: [3]f32,
     /// Row-major 3x3 rotation.
     rotation: [9]f32,
+    swaps: []const Swap = &.{},
 };
 
 /// One straight 3-unit fence (or curb) segment on a tile edge. `kind` names
@@ -44,6 +52,7 @@ pub const Actor = struct {
     position: [3]f32,
     /// Row-major 3x3 rotation.
     rotation: [9]f32,
+    swaps: []const Swap = &.{},
 };
 
 pub const Map = struct {
@@ -99,6 +108,24 @@ const Collector = struct {
         for (e.children) |c| try self.visit(c);
     }
 
+    /// Texture replacements saved somewhere under a physics object.
+    fn swaps(self: *Collector, phys: *const xml.Element) Error![]const Swap {
+        const info = findInfo(phys) orelse return &.{};
+        var list: std.ArrayList(Swap) = .empty;
+        for (info.children) |t| {
+            if (!std.ascii.eqlIgnoreCase(t.name, "texture")) continue;
+            const image = t.attr("imageName") orelse continue;
+            try list.append(self.a, .{ .image = image, .layer = t.attr("layer") orelse "base" });
+        }
+        return list.toOwnedSlice(self.a);
+    }
+
+    fn findInfo(e: *const xml.Element) ?*const xml.Element {
+        if (std.ascii.eqlIgnoreCase(e.name, "BFTextureSwapInfo")) return e;
+        for (e.children) |c| if (findInfo(c)) |f| return f;
+        return null;
+    }
+
     fn hasModel(phys: *const xml.Element) bool {
         for (phys.children) |c| for (model_components) |name| {
             if (std.ascii.eqlIgnoreCase(c.name, name)) {
@@ -131,7 +158,7 @@ const Collector = struct {
                     rot[i * 3 + 2] = v[2];
                 };
             }
-            try self.actors.append(self.a, .{ .binder = binder, .position = vec3(pos), .rotation = rot });
+            try self.actors.append(self.a, .{ .binder = binder, .position = vec3(pos), .rotation = rot, .swaps = try self.swaps(c) });
             return;
         }
     }
@@ -201,6 +228,7 @@ const Collector = struct {
             .scale = attrFloat(sg, "scale", 1.0),
             .position = vec3(pos),
             .rotation = rot,
+            .swaps = try self.swaps(e),
         });
     }
 };

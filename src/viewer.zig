@@ -118,6 +118,8 @@ const vs_src: [:0]const u8 =
     \\layout(location=2) in vec2 aUv;
     \\layout(location=3) in vec4 aIdx;
     \\layout(location=4) in vec4 aWeight;
+    \\layout(location=5) in vec2 aUv2;
+    \\out vec2 vUv2;
     \\uniform mat4 uBones[96];
     \\uniform int uSkinned;
     \\uniform mat4 uModel;
@@ -135,6 +137,7 @@ const vs_src: [:0]const u8 =
     \\  vP = w.xyz;
     \\  vN = mat3(m) * aNormal;
     \\  vUv = aUv;
+    \\  vUv2 = aUv2;
     \\  gl_Position = uViewProj * w;
     \\}
 ;
@@ -144,6 +147,9 @@ const fs_src: [:0]const u8 =
     \\in vec3 vN;
     \\in vec3 vP;
     \\in vec2 vUv;
+    \\in vec2 vUv2;
+    \\uniform sampler2D uDecal;
+    \\uniform int uDecalMode; // 0 none, 1 decal on uv set 0, 2 decal on uv set 1
     \\uniform sampler2D uTex;
     \\uniform sampler2D uTex2;
     \\uniform int uTerrain;
@@ -153,6 +159,10 @@ const fs_src: [:0]const u8 =
     \\void main() {
     \\  vec3 n = dot(vN, vN) > 1e-6 ? normalize(vN) : normalize(cross(dFdx(vP), dFdy(vP)));
     \\  vec4 c = texture(uTex, vUv) * uTint;
+    \\  if (uDecalMode != 0) {
+    \\    vec4 d = texture(uDecal, uDecalMode == 2 ? vUv2 : vUv);
+    \\    c.rgb = mix(c.rgb, d.rgb, d.a);
+    \\  }
     \\  if (uTerrain == 1) {
     \\    // Flat ground shows the cover texture, steep slopes the cliff texture.
     \\    float steep = smoothstep(0.2, 0.5, 1.0 - n.z);
@@ -248,6 +258,8 @@ fn poseNode(world: []Mat4, nf: *const nif.Nif, ref: nif.Ref, parent: Mat4, anim:
 // ------------------------------------------------------------------ scene
 
 const max_bones = 96;
+/// Floats per vertex: position 3, normal 3, uv 2, bone indices 4, bone weights 4, second uv 2.
+const vf = 18;
 
 const FencePieces = struct {
     post: ?[]const Draw = null,
@@ -262,6 +274,13 @@ const Skin = struct {
 };
 
 const Draw = struct {
+    /// Decal layer texture (0 = none) and which UV set it uses (1 or 2).
+    decal: gl.Uint = 0,
+    decal_mode: i32 = 0,
+    /// Names used to match per-entity texture swaps (owned by the scene arena).
+    mat_name: []const u8 = "",
+    base_name: []const u8 = "",
+    decal_name: []const u8 = "",
     /// Index into `Scene.instances` whose world matrices this draw uses.
     inst: ?u32 = null,
     /// Decals blend over what is behind them without writing depth.
@@ -514,17 +533,35 @@ pub const Scene = struct {
         var tint = [4]f32{ 1, 1, 1, 1 };
         var blend = false;
         var alpha_cut: f32 = 0;
+        var decal: gl.Uint = 0;
+        var decal_mode: i32 = 0;
+        var mat_name: []const u8 = "";
+        var base_name: []const u8 = "";
+        var decal_name: []const u8 = "";
+        const sa = self.arena.allocator();
         for (geo.av.properties) |pr| {
             if (pr < 0) continue;
             switch (nf.blocks[@intCast(pr)]) {
-                .texturing => |t| if (t.base) |bt| if (bt.source >= 0) switch (nf.blocks[@intCast(bt.source)]) {
-                    .source_texture => |st| if (st.file_name) |fnm| {
-                        tex = self.loadTexture(fnm);
-                    },
-                    else => {},
+                .texturing => |t| {
+                    if (t.base) |bt| if (bt.source >= 0) switch (nf.blocks[@intCast(bt.source)]) {
+                        .source_texture => |st| if (st.file_name) |fnm| {
+                            tex = self.loadTexture(fnm);
+                            base_name = try sa.dupe(u8, fnm);
+                        },
+                        else => {},
+                    };
+                    if (t.decals[0]) |dt| if (dt.source >= 0) switch (nf.blocks[@intCast(dt.source)]) {
+                        .source_texture => |st| if (st.file_name) |fnm| {
+                            decal = self.loadTexture(fnm);
+                            decal_mode = if (dt.uv_set == 0) 1 else 2;
+                            decal_name = try sa.dupe(u8, fnm);
+                        },
+                        else => {},
+                    };
                 },
                 .material => |m| {
                     tint = .{ m.diffuse[0], m.diffuse[1], m.diffuse[2], m.alpha };
+                    mat_name = try sa.dupe(u8, m.net.name);
                 },
                 .alpha => |a| {
                     if (a.flags & 1 != 0) blend = true;
@@ -536,23 +573,27 @@ pub const Scene = struct {
 
         // Interleave position, normal, uv.
         const n = md.vertices.len;
-        const buf = try self.gpa.alloc(f32, n * 16);
+        const buf = try self.gpa.alloc(f32, n * vf);
         @memset(buf, 0);
         defer self.gpa.free(buf);
         const have_n = md.normals.len == n;
         const have_uv = md.uv_sets.len > 0 and md.uv_sets[0].len == n;
+        const have_uv2 = md.uv_sets.len > 1 and md.uv_sets[1].len == n;
         for (0..n) |i| {
             const v = md.vertices[i];
-            buf[i * 16 + 0] = v[0];
-            buf[i * 16 + 1] = v[1];
-            buf[i * 16 + 2] = v[2];
+            buf[i * vf + 0] = v[0];
+            buf[i * vf + 1] = v[1];
+            buf[i * vf + 2] = v[2];
             const nr: nif.Vec3 = if (have_n) md.normals[i] else .{ 0, 0, 0 };
-            buf[i * 16 + 3] = nr[0];
-            buf[i * 16 + 4] = nr[1];
-            buf[i * 16 + 5] = nr[2];
+            buf[i * vf + 3] = nr[0];
+            buf[i * vf + 4] = nr[1];
+            buf[i * vf + 5] = nr[2];
             const uv: [2]f32 = if (have_uv) md.uv_sets[0][i] else .{ 0, 0 };
-            buf[i * 16 + 6] = uv[0];
-            buf[i * 16 + 7] = uv[1];
+            buf[i * vf + 6] = uv[0];
+            buf[i * vf + 7] = uv[1];
+            const uv2: [2]f32 = if (have_uv2) md.uv_sets[1][i] else uv;
+            buf[i * vf + 16] = uv2[0];
+            buf[i * vf + 17] = uv2[1];
             if (self.interactive) {
                 const wp = transformPoint(world, v);
                 for (0..3) |k| {
@@ -575,10 +616,39 @@ pub const Scene = struct {
             .index_count = @intCast(md.indices.len),
             .world = world,
             .texture = tex,
+            .decal = decal,
+            .decal_mode = decal_mode,
+            .mat_name = mat_name,
+            .base_name = base_name,
+            .decal_name = decal_name,
             .tint = tint,
             .blend = blend,
             .alpha_cut = alpha_cut,
         });
+    }
+
+    /// The texture name without directory, extension or its last `_` part:
+    /// `guest_adult_m_pants_02.dds` -> `guest_adult_m_pants`.
+    fn textureFamily(name: []const u8) []const u8 {
+        var base = name;
+        if (std.mem.lastIndexOfAny(u8, base, "/\\")) |i| base = base[i + 1 ..];
+        if (std.mem.lastIndexOfScalar(u8, base, '.')) |i| base = base[0..i];
+        if (std.mem.lastIndexOfScalar(u8, base, '_')) |i| base = base[0..i];
+        return base;
+    }
+
+    /// Applies saved per-entity texture swaps: a swap replaces the layer's
+    /// texture on meshes whose current texture is in the same family.
+    fn applySwaps(self: *Scene, d: *Draw, swaps: []const map_mod.Swap) void {
+        for (swaps) |sw| {
+            const is_decal = std.mem.startsWith(u8, sw.layer, "decal");
+            const current = if (is_decal) d.decal_name else d.base_name;
+            if (current.len == 0) continue;
+            if (!std.ascii.eqlIgnoreCase(textureFamily(current), textureFamily(sw.image))) continue;
+            const tex = self.loadTexture(sw.image);
+            if (is_decal) d.decal = tex else d.texture = tex;
+            return;
+        }
     }
 
     /// Uploads interleaved vertices (16 floats each: position, normal, uv,
@@ -592,7 +662,7 @@ pub const Scene = struct {
         g.genBuffers(2, &bufs);
         g.bindBuffer(gl.ARRAY_BUFFER, bufs[0]);
         g.bufferData(gl.ARRAY_BUFFER, @intCast(buf.len * 4), buf.ptr, gl.STATIC_DRAW);
-        const stride: gl.Sizei = 64;
+        const stride: gl.Sizei = vf * 4;
         g.enableVertexAttribArray(0);
         g.vertexAttribPointer(0, 3, gl.FLOAT, 0, stride, @ptrFromInt(0));
         g.enableVertexAttribArray(1);
@@ -603,6 +673,8 @@ pub const Scene = struct {
         g.vertexAttribPointer(3, 4, gl.FLOAT, 0, stride, @ptrFromInt(32));
         g.enableVertexAttribArray(4);
         g.vertexAttribPointer(4, 4, gl.FLOAT, 0, stride, @ptrFromInt(48));
+        g.enableVertexAttribArray(5);
+        g.vertexAttribPointer(5, 2, gl.FLOAT, 0, stride, @ptrFromInt(64));
         g.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, bufs[1]);
         g.bufferData(gl.ELEMENT_ARRAY_BUFFER, @intCast(index_bytes), indices, gl.STATIC_DRAW);
         g.bindVertexArray(0);
@@ -615,11 +687,11 @@ pub const Scene = struct {
         const h = t.height;
         const sx = t.spacingX();
         const sy = t.spacingY();
-        const buf = try self.gpa.alloc(f32, @as(usize, w) * h * 16);
+        const buf = try self.gpa.alloc(f32, @as(usize, w) * h * vf);
         defer self.gpa.free(buf);
         @memset(buf, 0);
         for (0..h) |j| for (0..w) |i| {
-            const o = (j * w + i) * 16;
+            const o = (j * w + i) * vf;
             const z = t.z[j * w + i];
             const zl = t.z[j * w + (if (i > 0) i - 1 else i)];
             const zr = t.z[j * w + (if (i + 1 < w) i + 1 else i)];
@@ -636,6 +708,8 @@ pub const Scene = struct {
             buf[o + 5] = n[2];
             buf[o + 6] = @as(f32, @floatFromInt(i)) / 4.0;
             buf[o + 7] = @as(f32, @floatFromInt(j)) / 4.0;
+            buf[o + 16] = buf[o + 6];
+            buf[o + 17] = buf[o + 7];
         };
         const idx = try self.gpa.alloc(u32, @as(usize, w - 1) * (h - 1) * 6);
         defer self.gpa.free(idx);
@@ -680,19 +754,21 @@ pub const Scene = struct {
             for (paths[fi..], fi..) |p, pi| {
                 if (done[pi] or !std.ascii.eqlIgnoreCase(p.texture, first.texture)) continue;
                 done[pi] = true;
-                const base: u32 = @intCast(verts.items.len / 16);
+                const base: u32 = @intCast(verts.items.len / vf);
                 for (0..subdiv + 1) |j| for (0..subdiv + 1) |i| {
                     const u = @as(f32, @floatFromInt(i)) / subdiv;
                     const v = @as(f32, @floatFromInt(j)) / subdiv;
                     const x = p.position[0] + (u - 0.5) * p.width;
                     const y = p.position[1] + (v - 0.5) * p.height;
-                    var vert: [16]f32 = @splat(0);
+                    var vert: [vf]f32 = @splat(0);
                     vert[0] = x;
                     vert[1] = y;
                     vert[2] = t.zAt(x, y) + 0.04;
                     vert[5] = 1; // normal up
                     vert[6] = u;
                     vert[7] = 1 - v;
+                    vert[16] = vert[6];
+                    vert[17] = vert[7];
                     try verts.appendSlice(self.gpa, &vert);
                 };
                 for (0..subdiv) |j| for (0..subdiv) |i| {
@@ -871,7 +947,7 @@ pub const Scene = struct {
 
     /// Adds an animated figure from a `.bfm` actor file, looping an idle
     /// animation. Returns false if the model cannot be built.
-    pub fn addActor(self: *Scene, file: []const u8, root: Mat4, phase: f32) !bool {
+    pub fn addActor(self: *Scene, file: []const u8, root: Mat4, phase: f32, swaps: []const map_mod.Swap) !bool {
         const tmpl = (try self.actorTemplate(file)) orelse return false;
         const world = try self.gpa.alloc(Mat4, tmpl.nf.blocks.len);
         @memset(world, identity);
@@ -893,6 +969,7 @@ pub const Scene = struct {
         for (tmpl.draws) |d| {
             var c = d;
             c.inst = idx;
+            self.applySwaps(&c, swaps);
             try self.draws.append(self.gpa, c);
         }
         return true;
@@ -939,11 +1016,12 @@ pub const Scene = struct {
     }
 
     /// Adds fixed copies of a model's draws, moved by `m`.
-    pub fn place(self: *Scene, draws: []const Draw, m: Mat4) !void {
+    pub fn place(self: *Scene, draws: []const Draw, m: Mat4, swaps: []const map_mod.Swap) !void {
         for (draws) |d| {
             var c = d;
             c.world = mul(m, d.world);
             c.dynamic = false;
+            self.applySwaps(&c, swaps);
             try self.draws.append(self.gpa, c);
         }
     }
@@ -981,8 +1059,8 @@ pub const Scene = struct {
             var sum: f32 = 0;
             for (infl[v]) |e| sum += e.w;
             for (0..4) |k| {
-                buf[v * 16 + 8 + k] = @floatFromInt(infl[v][k].bone);
-                buf[v * 16 + 12 + k] = if (sum > 0) infl[v][k].w / sum else if (k == 0) 1 else 0;
+                buf[v * vf + 8 + k] = @floatFromInt(infl[v][k].bone);
+                buf[v * vf + 12 + k] = if (sum > 0) infl[v][k].w / sum else if (k == 0) 1 else 0;
             }
         }
 
@@ -1042,6 +1120,8 @@ const Gfx = struct {
     u_bones: gl.Int,
     u_tex2: gl.Int,
     u_terrain: gl.Int,
+    u_decal: gl.Int,
+    u_decal_mode: gl.Int,
 
     fn open(self: *Gfx, opts: Options) !void {
         self.plat = platform.Platform.init() catch {
@@ -1078,6 +1158,8 @@ const Gfx = struct {
         self.u_bones = g.getUniformLocation(self.prog, "uBones");
         self.u_tex2 = g.getUniformLocation(self.prog, "uTex2");
         self.u_terrain = g.getUniformLocation(self.prog, "uTerrain");
+        self.u_decal = g.getUniformLocation(self.prog, "uDecal");
+        self.u_decal_mode = g.getUniformLocation(self.prog, "uDecalMode");
     }
 
     fn close(self: *Gfx) void {
@@ -1171,6 +1253,7 @@ fn loop(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Camera, play
 
         g.viewport(0, 0, @intCast(size.width), @intCast(size.height));
         g.clearColor(0.18, 0.2, 0.24, 1);
+        g.depthMask(1); // decals turn depth writes off; clearing needs them on
         g.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
         const eye = [3]f32{
@@ -1195,10 +1278,14 @@ fn loop(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Camera, play
         g.uniformMatrix4fv(gfx.u_vp, 1, 0, &vp);
         g.uniform1i(gfx.u_tex, 0);
         g.uniform1i(gfx.u_tex2, 1);
+        g.uniform1i(gfx.u_decal, 2);
         for (scene.draws.items) |d| {
             g.activeTexture(gl.TEXTURE0 + 1);
             g.bindTexture(gl.TEXTURE_2D, d.texture2);
             g.uniform1i(gfx.u_terrain, if (d.texture2 != 0) 1 else 0);
+            g.activeTexture(gl.TEXTURE0 + 2);
+            g.bindTexture(gl.TEXTURE_2D, d.decal);
+            g.uniform1i(gfx.u_decal_mode, if (d.decal != 0) d.decal_mode else 0);
             g.activeTexture(gl.TEXTURE0);
             const wl: []const Mat4 = if (d.inst) |i| scene.instances.items[i].world else scene.world;
             if (d.skin) |sk| {
@@ -1376,7 +1463,7 @@ pub fn runMap(gpa: std.mem.Allocator, vfs: *vfs_mod.Vfs, path: []const u8, opts:
             continue;
         };
         const m = fromTransform(.{ .translation = o.position, .rotation = o.rotation, .scale = o.scale });
-        try scene.place(draws, m);
+        try scene.place(draws, m, o.swaps);
         placed += 1;
     }
     var fences_placed: usize = 0;
@@ -1390,8 +1477,8 @@ pub fn runMap(gpa: std.mem.Allocator, vfs: *vfs_mod.Vfs, path: []const u8, opts:
         const sn = @sin(f.rotation);
         const rot = [9]f32{ c, -sn, 0, sn, c, 0, 0, 0, 1 };
         const m = fromTransform(.{ .translation = .{ x, y, z }, .rotation = rot, .scale = 1 });
-        if (pieces.segment) |d| try scene.place(d, m);
-        if (pieces.post) |d| try scene.place(d, m);
+        if (pieces.segment) |d| try scene.place(d, m, &.{});
+        if (pieces.post) |d| try scene.place(d, m, &.{});
         fences_placed += 1;
     }
     if (mp.actors.len > 0) {
@@ -1403,7 +1490,7 @@ pub fn runMap(gpa: std.mem.Allocator, vfs: *vfs_mod.Vfs, path: []const u8, opts:
             const def = actorModel(gpa, &reg, a.binder) orelse continue;
             const m = fromTransform(.{ .translation = a.position, .rotation = a.rotation, .scale = def.scale });
             const phase = @mod(a.position[0] * 0.37 + a.position[1] * 0.61, 3.0);
-            if (!try scene.addActor(def.file, m, phase)) continue;
+            if (!try scene.addActor(def.file, m, phase, a.swaps)) continue;
             actors_placed += 1;
         }
         std.debug.print("{d} of {d} animals/guests/staff placed\n", .{ actors_placed, mp.actors.len });
