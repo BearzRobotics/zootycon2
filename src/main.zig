@@ -303,6 +303,9 @@ pub fn main(init: std.process.Init) !void {
             } else if (std.mem.eql(u8, arg, "--seed") and k + 1 < rest.len) {
                 k += 1;
                 aopts.seed = try std.fmt.parseInt(u64, rest[k], 10);
+            } else if (std.mem.eql(u8, arg, "--input") and k + 1 < rest.len) {
+                k += 1;
+                aopts.input = rest[k];
             } else if (std.mem.eql(u8, arg, "--script") and k + 1 < rest.len) {
                 k += 1;
                 aopts.script = rest[k];

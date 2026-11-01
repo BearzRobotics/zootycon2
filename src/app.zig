@@ -94,6 +94,20 @@ pub const Options = struct {
     ///   lower X Y SECS | flatten X Y SECS | delete X Y | undo | save | load
     ///   wait SECS | propname TEXT | actorname NAME | fencekind NAME | yaw RAD
     script: []const u8 = "",
+    /// Virtual mouse and keyboard, played through the real event queue one
+    /// action per frame, separated by `;`:
+    ///   move X Y        pointer to window position
+    ///   at X Y [Z]      pointer over a world position (Z defaults to the ground)
+    ///   down|up|click [BUTTON]   mouse button (1 left, 3 right; default 1)
+    ///   key NAME | keydown NAME | keyup NAME     (a-z, 0-9, tab, delete, f5, f9, [ ] , . shift)
+    ///   wheel N         scroll
+    ///   wait FRAMES     pause the script
+    ///   cam YAW PITCH DIST [CX CY]   set the camera
+    ///   info            print tool, counts and selection
+    ///   shot            capture the screenshot now
+    ///   quit
+    /// If the script finishes and a screenshot was requested, it is taken.
+    input: []const u8 = "",
 };
 
 pub const App = struct {
@@ -136,6 +150,12 @@ pub const App = struct {
     title_dirty: bool = true,
     undo: std.ArrayList(UndoOp) = .empty,
 
+    // Virtual input.
+    input_cmds: std.ArrayList([]const u8) = .empty,
+    input_i: usize = 0,
+    wait_frames: u32 = 0,
+    vmouse: [2]f32 = .{ 0, 0 },
+
     // Catalogs.
     props: std.ArrayList([]const u8) = .empty,
     prop_i: usize = 0,
@@ -150,6 +170,7 @@ pub const App = struct {
     pub fn deinit(self: *App) void {
         for (self.undo.items) |op| if (op == .added) self.gpa.free(op.added);
         self.undo.deinit(self.gpa);
+        self.input_cmds.deinit(self.gpa);
         self.props.deinit(self.gpa);
         self.fence_kinds.deinit(self.gpa);
         self.path_textures.deinit(self.gpa);
@@ -725,6 +746,113 @@ pub const App = struct {
         } else return error.UnknownCommand;
     }
 
+    // ------------------------------------------------------- virtual input
+
+    fn scancodeFor(name: []const u8) ?u32 {
+        if (name.len == 1) {
+            const ch = std.ascii.toLower(name[0]);
+            if (ch >= 'a' and ch <= 'z') return 4 + @as(u32, ch - 'a');
+            if (ch >= '1' and ch <= '9') return 30 + @as(u32, ch - '1');
+            if (ch == '0') return 39;
+            switch (ch) {
+                '[' => return sc.lbracket,
+                ']' => return sc.rbracket,
+                ',' => return sc.comma,
+                '.' => return sc.period,
+                else => return null,
+            }
+        }
+        const names = [_]struct { n: []const u8, c: u32 }{
+            .{ .n = "tab", .c = sc.tab },
+            .{ .n = "delete", .c = sc.delete },
+            .{ .n = "esc", .c = 41 },
+            .{ .n = "f5", .c = sc.f5 },
+            .{ .n = "f9", .c = sc.f9 },
+            .{ .n = "shift", .c = sc.lshift },
+        };
+        for (names) |e| if (std.ascii.eqlIgnoreCase(e.n, name)) return e.c;
+        return null;
+    }
+
+    fn splitInput(self: *App, text: []const u8) !void {
+        var it = std.mem.tokenizeScalar(u8, text, ';');
+        while (it.next()) |c| {
+            const t = std.mem.trim(u8, c, " \t\r\n");
+            if (t.len > 0) try self.input_cmds.append(self.gpa, t);
+        }
+    }
+
+    /// Runs the next virtual-input action (one per frame).
+    fn playInput(self: *App, ctx: *viewer.FrameCtx) void {
+        if (self.wait_frames > 0) {
+            self.wait_frames -= 1;
+            return;
+        }
+        if (self.input_i >= self.input_cmds.items.len) {
+            if (self.input_cmds.items.len > 0) {
+                self.input_cmds.clearRetainingCapacity();
+                self.input_i = 0;
+                // Script done: take the requested screenshot, if any.
+                if (self.opts.viewer.screenshot != null) ctx.shot_request = true;
+            }
+            return;
+        }
+        const cmd = self.input_cmds.items[self.input_i];
+        self.input_i += 1;
+        self.runInput(cmd, ctx) catch |e| self.say("input '{s}' failed: {s}", .{ cmd, @errorName(e) });
+    }
+
+    fn runInput(self: *App, cmd: []const u8, ctx: *viewer.FrameCtx) !void {
+        var it = std.mem.tokenizeScalar(u8, cmd, ' ');
+        const verb = it.next() orelse return;
+        const plat = ctx.plat;
+        if (std.mem.eql(u8, verb, "move")) {
+            self.vmouse = .{ try num(it.next()), try num(it.next()) };
+            plat.injectEvent(.{ .mouse_move = .{ .x = self.vmouse[0], .y = self.vmouse[1] } });
+        } else if (std.mem.eql(u8, verb, "at")) {
+            const x = try num(it.next());
+            const y = try num(it.next());
+            const z = if (it.next()) |zt| try std.fmt.parseFloat(f32, zt) else self.world.terrain.zAt(x, y);
+            const p = ctx.cam.project(.{ x, y, z }, @floatFromInt(ctx.win_width), @floatFromInt(ctx.win_height)) orelse return error.BehindCamera;
+            self.vmouse = p;
+            plat.injectEvent(.{ .mouse_move = .{ .x = p[0], .y = p[1] } });
+        } else if (std.mem.eql(u8, verb, "down") or std.mem.eql(u8, verb, "up") or std.mem.eql(u8, verb, "click")) {
+            const b: u8 = if (it.next()) |t| @intCast(try std.fmt.parseInt(u8, t, 10)) else 1;
+            if (!std.mem.eql(u8, verb, "up")) plat.injectEvent(.{ .mouse_button = .{ .button = b, .down = true, .x = self.vmouse[0], .y = self.vmouse[1] } });
+            if (!std.mem.eql(u8, verb, "down")) plat.injectEvent(.{ .mouse_button = .{ .button = b, .down = false, .x = self.vmouse[0], .y = self.vmouse[1] } });
+        } else if (std.mem.eql(u8, verb, "key") or std.mem.eql(u8, verb, "keydown") or std.mem.eql(u8, verb, "keyup")) {
+            const name = it.next() orelse return error.BadScript;
+            const code = scancodeFor(name) orelse return error.UnknownKey;
+            if (!std.mem.eql(u8, verb, "keyup")) plat.injectEvent(.{ .key_down = .{ .scancode = code, .repeat = false } });
+            if (!std.mem.eql(u8, verb, "keydown")) plat.injectEvent(.{ .key_up = .{ .scancode = code } });
+        } else if (std.mem.eql(u8, verb, "wheel")) {
+            plat.injectEvent(.{ .mouse_wheel = .{ .dx = 0, .dy = try num(it.next()) } });
+        } else if (std.mem.eql(u8, verb, "wait")) {
+            self.wait_frames = @intFromFloat(try num(it.next()));
+        } else if (std.mem.eql(u8, verb, "cam")) {
+            ctx.cam.yaw = try num(it.next());
+            ctx.cam.pitch = try num(it.next());
+            ctx.cam.dist = try num(it.next());
+            if (it.next()) |cx| {
+                ctx.cam.center[0] = try std.fmt.parseFloat(f32, cx);
+                ctx.cam.center[1] = try num(it.next());
+                ctx.cam.center[2] = self.world.terrain.zAt(ctx.cam.center[0], ctx.cam.center[1]);
+            }
+        } else if (std.mem.eql(u8, verb, "info")) {
+            const w = &self.world;
+            var sel_buf: [48]u8 = undefined;
+            const sel = if (self.selected) |sl| std.fmt.bufPrint(&sel_buf, "{s}#{d}", .{ @tagName(sl.kind), sl.id }) catch "?" else "none";
+            std.debug.print("info: tool={s} props={d} fences={d} paths={d} actors={d} selected={s} hover={s} paused={}\n", .{
+                @tagName(self.tool), w.props.items.len, w.fences.items.len, w.paths.items.len, w.actors.items.len, sel,
+                if (self.hover != null) "yes" else "no",                self.paused,
+            });
+        } else if (std.mem.eql(u8, verb, "shot")) {
+            ctx.shot_request = true;
+        } else if (std.mem.eql(u8, verb, "quit")) {
+            ctx.quit = true;
+        } else return error.UnknownCommand;
+    }
+
     // ------------------------------------------------------------- events
 
     fn cycle(i: *usize, len: usize, delta: i32) void {
@@ -827,7 +955,7 @@ pub const App = struct {
     }
 
     fn click(self: *App, ctx: *viewer.FrameCtx) void {
-        const r = ctx.cam.ray(ctx.mouse[0], ctx.mouse[1], @floatFromInt(ctx.width), @floatFromInt(ctx.height));
+        const r = ctx.cam.ray(ctx.mouse[0], ctx.mouse[1], @floatFromInt(ctx.win_width), @floatFromInt(ctx.win_height));
         const hit = terrainHit(&self.world.terrain, r.origin, r.dir);
         self.hover = hit;
         switch (self.tool) {
@@ -956,11 +1084,12 @@ pub const App = struct {
     }
 
     pub fn frame(self: *App, ctx: *viewer.FrameCtx) !void {
+        self.playInput(ctx);
         try self.syncScene(ctx.secs);
 
         // Hover point under the mouse.
         if (self.opts.tools) {
-            const r = ctx.cam.ray(ctx.mouse[0], ctx.mouse[1], @floatFromInt(ctx.width), @floatFromInt(ctx.height));
+            const r = ctx.cam.ray(ctx.mouse[0], ctx.mouse[1], @floatFromInt(ctx.win_width), @floatFromInt(ctx.win_height));
             self.hover = terrainHit(&self.world.terrain, r.origin, r.dir);
             if (self.lmb and self.hover != null) switch (self.tool) {
                 .raise, .lower, .flatten => self.brush(self.hover.?[0], self.hover.?[1], ctx.dt),
@@ -1054,6 +1183,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, vfs: *vfs_mod.Vfs, path: []const u8, 
     defer app.deinit();
     try app.buildCatalogs();
     app.runScript(opts.script);
+    try app.splitInput(opts.input);
     std.debug.print("{d} objects, {d} fence types, {d} path textures, {d} animals/people in the catalogs\n", .{
         app.props.items.len, app.fence_kinds.items.len, app.path_textures.items.len, app.actor_names.items.len,
     });
@@ -1072,5 +1202,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, vfs: *vfs_mod.Vfs, path: []const u8, 
     };
     var vopts = opts.viewer;
     if (opts.tools) vopts.orbit_button = 3;
+    // With virtual input the script decides when the screenshot is taken.
+    if (opts.input.len > 0) vopts.shot_frames = std.math.maxInt(u32);
     try viewer.loopWith(gpa, &gfx, &scene, cam, null, vopts, &app);
 }

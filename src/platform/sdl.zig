@@ -66,6 +66,52 @@ pub const Platform = struct {
         return null;
     }
 
+    /// Queues a synthetic input event as if the user had produced it. It goes
+    /// through the same queue as real input, so everything downstream of
+    /// `pollEvent` runs exactly as it would for a person at the keyboard.
+    pub fn injectEvent(_: Platform, ev: Event) void {
+        var e: c.SDL_Event = std.mem.zeroes(c.SDL_Event);
+        switch (ev) {
+            .quit => e.type = c.SDL_EVENT_QUIT,
+            .key_down => |k| {
+                e.type = c.SDL_EVENT_KEY_DOWN;
+                e.key.type = c.SDL_EVENT_KEY_DOWN;
+                e.key.scancode = @intCast(k.scancode);
+                e.key.down = true;
+                e.key.repeat = k.repeat;
+            },
+            .key_up => |k| {
+                e.type = c.SDL_EVENT_KEY_UP;
+                e.key.type = c.SDL_EVENT_KEY_UP;
+                e.key.scancode = @intCast(k.scancode);
+                e.key.down = false;
+            },
+            .mouse_move => |m| {
+                e.type = c.SDL_EVENT_MOUSE_MOTION;
+                e.motion.type = c.SDL_EVENT_MOUSE_MOTION;
+                e.motion.x = m.x;
+                e.motion.y = m.y;
+            },
+            .mouse_button => |b| {
+                const t: u32 = if (b.down) c.SDL_EVENT_MOUSE_BUTTON_DOWN else c.SDL_EVENT_MOUSE_BUTTON_UP;
+                e.type = t;
+                e.button.type = t;
+                e.button.button = b.button;
+                e.button.down = b.down;
+                e.button.x = b.x;
+                e.button.y = b.y;
+            },
+            .mouse_wheel => |w| {
+                e.type = c.SDL_EVENT_MOUSE_WHEEL;
+                e.wheel.type = c.SDL_EVENT_MOUSE_WHEEL;
+                e.wheel.x = w.dx;
+                e.wheel.y = w.dy;
+            },
+            .resized => return,
+        }
+        _ = c.SDL_PushEvent(&e);
+    }
+
     pub fn delayMs(_: Platform, ms: u32) void {
         c.SDL_Delay(ms);
     }
@@ -116,6 +162,15 @@ pub const Window = struct {
 
     pub fn setTitle(self: Window, title: [:0]const u8) void {
         _ = c.SDL_SetWindowTitle(self.handle, title.ptr);
+    }
+
+    /// Size in window coordinates (what mouse positions are measured in);
+    /// differs from `pixelSize` on HiDPI displays.
+    pub fn logicalSize(self: Window) struct { width: u32, height: u32 } {
+        var w: c_int = 0;
+        var h: c_int = 0;
+        _ = c.SDL_GetWindowSize(self.handle, &w, &h);
+        return .{ .width = @intCast(@max(w, 1)), .height = @intCast(@max(h, 1)) };
     }
 
     /// Size of the drawable area in pixels (differs from window size on HiDPI).

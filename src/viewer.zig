@@ -1207,6 +1207,9 @@ pub const Options = struct {
     /// Initial camera yaw and pitch in radians, if given.
     yaw: ?f32 = null,
     pitch: ?f32 = null,
+    /// Frames rendered before the screenshot is taken (a hook can also
+    /// request it earlier or later through `FrameCtx.shot_request`).
+    shot_frames: u32 = 3,
     /// Mouse button that orbits the camera (1 left, 3 right).
     orbit_button: u8 = 1,
     /// Map position to look at (x, y), instead of the map centre.
@@ -1317,6 +1320,21 @@ pub const Camera = struct {
         };
     }
 
+    /// Window position of a world point, or null if it is behind the camera.
+    pub fn project(self: Camera, p: [3]f32, width: f32, height: f32) ?[2]f32 {
+        const e = self.eye();
+        const f = normalize3(.{ self.center[0] - e[0], self.center[1] - e[1], self.center[2] - e[2] });
+        const right = normalize3(cross(f, .{ 0, 0, 1 }));
+        const up = cross(right, f);
+        const v = [3]f32{ p[0] - e[0], p[1] - e[1], p[2] - e[2] };
+        const depth = v[0] * f[0] + v[1] * f[1] + v[2] * f[2];
+        if (depth <= 0.001) return null;
+        const t = @tan(fov_y / 2);
+        const x = (v[0] * right[0] + v[1] * right[1] + v[2] * right[2]) / (depth * t * (width / height));
+        const y = (v[0] * up[0] + v[1] * up[1] + v[2] * up[2]) / (depth * t);
+        return .{ (x + 1) / 2 * width, (1 - y) / 2 * height };
+    }
+
     /// World-space ray through window position (mx, my) in a viewport of
     /// the given size.
     pub fn ray(self: Camera, mx: f32, my: f32, width: f32, height: f32) struct { origin: [3]f32, dir: [3]f32 } {
@@ -1351,6 +1369,14 @@ pub const FrameCtx = struct {
     mouse: [2]f32 = .{ 0, 0 },
     /// Set by a hook to end the loop.
     quit: bool = false,
+    /// Window size in mouse coordinates (differs from `width`/`height`,
+    /// which are pixels, on HiDPI displays).
+    win_width: u32 = 1,
+    win_height: u32 = 1,
+    /// Set by a hook to capture the screenshot on this frame.
+    shot_request: bool = false,
+    /// For synthetic input.
+    plat: platform.Platform,
 };
 
 const NoHooks = struct {
@@ -1407,7 +1433,7 @@ pub fn loopWith(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Came
     var last_y: f32 = 0;
     var size = gfx.win.pixelSize();
     var held = [4]bool{ false, false, false, false }; // w a s d
-    var ctx: FrameCtx = .{ .cam = &cam, .win = gfx.win, .width = size.width, .height = size.height };
+    var ctx: FrameCtx = .{ .cam = &cam, .win = gfx.win, .width = size.width, .height = size.height, .plat = plat };
 
     g.enable(gl.DEPTH_TEST);
     g.depthFunc(gl.LEQUAL);
@@ -1465,6 +1491,9 @@ pub fn loopWith(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Came
         ctx.secs = @as(f32, @floatFromInt(now_ms - start_ms)) / 1000.0;
         ctx.width = size.width;
         ctx.height = size.height;
+        const logical = gfx.win.logicalSize();
+        ctx.win_width = logical.width;
+        ctx.win_height = logical.height;
         try hooks.frame(&ctx);
         if (ctx.quit) break :main;
         // WASD pans the look-at point across the ground plane.
@@ -1514,7 +1543,7 @@ pub fn loopWith(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Came
 
         frame += 1;
         if (opts.screenshot) |w| {
-            if (frame < 3) {
+            if (frame < opts.shot_frames and !ctx.shot_request) {
                 gfx.ctx.swap();
                 continue;
             }
