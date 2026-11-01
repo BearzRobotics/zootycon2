@@ -13,10 +13,20 @@ pub const Error = error{ OutOfMemory, ScriptNotFound, ScriptFailed };
 
 /// Lua 5.0's pseudo-index for the table of globals.
 const globals_index: c_int = -10001;
+const registry_index: c_int = -10000;
 
 /// Only one engine exists at a time (the game has one scenario running), so
 /// the C callbacks reach it through this.
 var current: ?*Engine = null;
+
+/// Makes `eng` the engine C callbacks talk to.
+pub fn setCurrent(eng: *Engine) void {
+    current = eng;
+}
+
+pub fn currentEngine() ?*Engine {
+    return current;
+}
 
 pub const Engine = struct {
     gpa: std.mem.Allocator,
@@ -132,7 +142,7 @@ pub const Engine = struct {
     pub fn callNumber(self: *Engine, name: [:0]const u8) Error!f64 {
         c.lua_pushstring(self.L, name.ptr);
         c.lua_gettable(self.L, globals_index);
-        if (c.lua_isfunction(self.L, -1) == 0) {
+        if (!c.lua_isfunction(self.L, -1)) {
             c.lua_pop(self.L, 1);
             return error.ScriptNotFound;
         }
@@ -144,6 +154,39 @@ pub const Engine = struct {
         if (c.lua_isnumber(self.L, -1) != 0) return c.lua_tonumber(self.L, -1);
         if (c.lua_type(self.L, -1) == c.LUA_TBOOLEAN) return if (c.lua_toboolean(self.L, -1) != 0) 1 else 0;
         return 0;
+    }
+
+    /// A new empty table kept alive in the registry; the reference lives
+    /// until the engine closes.
+    pub fn newTableRef(self: *Engine) c_int {
+        c.lua_newtable(self.L);
+        return c.luaL_ref(self.L, registry_index);
+    }
+
+    /// Calls a global function with one table argument (a rule's persistent
+    /// state) and returns its first result as a number.
+    pub fn callWithTable(self: *Engine, name: [:0]const u8, table_ref: c_int) Error!f64 {
+        c.lua_pushstring(self.L, name.ptr);
+        c.lua_gettable(self.L, globals_index);
+        if (!c.lua_isfunction(self.L, -1)) {
+            c.lua_pop(self.L, 1);
+            return error.ScriptNotFound;
+        }
+        c.lua_rawgeti(self.L, registry_index, table_ref);
+        if (c.lua_pcall(self.L, 1, 1, 0) != 0) {
+            self.takeError();
+            return error.ScriptFailed;
+        }
+        defer c.lua_pop(self.L, 1);
+        if (c.lua_isnumber(self.L, -1) != 0) return c.lua_tonumber(self.L, -1);
+        if (c.lua_type(self.L, -1) == c.LUA_TBOOLEAN) return if (c.lua_toboolean(self.L, -1) != 0) 1 else 0;
+        return 0;
+    }
+
+    pub fn setGlobalNumber(self: *Engine, name: [:0]const u8, v: f64) void {
+        c.lua_pushstring(self.L, name.ptr);
+        c.lua_pushnumber(self.L, v);
+        c.lua_settable(self.L, globals_index);
     }
 
     /// Runs a chunk of source text (tests and debugging).
@@ -167,7 +210,7 @@ pub const Engine = struct {
         return c.lua_tonumber(self.L, -1);
     }
 
-    fn noteMissing(self: *Engine, name: []const u8) void {
+    pub fn noteMissing(self: *Engine, name: []const u8) void {
         if (self.missing.getPtr(name)) |n| {
             n.* += 1;
             return;

@@ -814,6 +814,33 @@ pub fn main(init: std.process.Init) !void {
             };
         }
         try out.print("{d} scripts, {d} failed\n", .{ names.items.len, failed });
+    } else if (std.mem.eql(u8, cmd, "scenariotest")) {
+        // scenariotest <goals.xml> [ticks]: runs a scenario headless and
+        // prints the rule states and the game functions scripts still need.
+        if (rest.len < 1) return fail("usage: scenariotest <goals.xml> [ticks]\n");
+        const ticks: usize = if (rest.len > 1) std.fmt.parseInt(usize, rest[1], 10) catch 3 else 3;
+        var strings = zootycon2.loc.Loc.init(gpa);
+        defer strings.deinit();
+        try strings.load(&vfs, "lang/1033/");
+        const mgr = try zootycon2.scenario.Manager.create(gpa, &vfs, &strings);
+        defer mgr.destroy();
+        mgr.log = true;
+        mgr.eng.log = true;
+        try mgr.add(rest[0]);
+        for (0..ticks) |_| mgr.tick();
+        const Dump = struct {
+            fn node(m: *zootycon2.scenario.Manager, o: anytype, n: *const zootycon2.scenario.Node, depth: usize) !void {
+                for (0..depth) |_| try o.writeAll("  ");
+                try o.print("{s} {s} [{s}]{s}", .{ if (n.is_group) "group" else "rule", n.name, @tagName(n.state), if (n.hidden) " hidden" else "" });
+                if (!n.is_group) try o.print(" \"{s}\"", .{m.textFor(n)[0..@min(m.textFor(n).len, 100)]});
+                try o.writeAll("\n");
+                for (n.children) |k| try node(m, o, k, depth + 1);
+            }
+        };
+        for (mgr.roots.items) |r| try Dump.node(mgr, out, r, 0);
+        try out.print("missing game functions ({d}):", .{mgr.eng.missing.count()});
+        for (mgr.eng.missing.keys(), mgr.eng.missing.values()) |k, v| try out.print(" {s}({d})", .{ k, v });
+        try out.writeAll("\n");
     } else if (std.mem.eql(u8, cmd, "xmlcheck")) {
         const prefix = if (rest.len > 0) rest[0] else "";
         var names: std.ArrayList([]const u8) = .empty;
