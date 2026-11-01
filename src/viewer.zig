@@ -70,6 +70,16 @@ fn setRotation(m: *Mat4, q: [4]f32, scale: f32) void {
     };
 }
 
+fn ortho(half: f32, near: f32, far: f32) Mat4 {
+    var m = std.mem.zeroes(Mat4);
+    m[0] = 1.0 / half;
+    m[5] = 1.0 / half;
+    m[10] = -2.0 / (far - near);
+    m[14] = -(far + near) / (far - near);
+    m[15] = 1;
+    return m;
+}
+
 fn perspective(fovy: f32, aspect: f32, near: f32, far: f32) Mat4 {
     const f = 1.0 / @tan(fovy / 2.0);
     var m = std.mem.zeroes(Mat4);
@@ -166,6 +176,31 @@ const fs_src: [:0]const u8 =
     \\uniform vec3 uLdir[6];
     \\uniform vec3 uLcol[6];
     \\uniform vec3 uFogColor;
+    \\uniform int uModern;
+    \\uniform float uExposure;
+    \\uniform int uShadowOn;
+    \\uniform sampler2DShadow uShadow;
+    \\uniform mat4 uLightVP;
+    \\uniform float uShadowTexel;
+    \\// Fraction of the sun that reaches this point (1 = fully lit).
+    \\float sunVisibility(vec3 pos, float ndl) {
+    \\  if (uShadowOn == 0) return 1.0;
+    \\  vec4 sc = uLightVP * vec4(pos, 1.0);
+    \\  vec3 p = sc.xyz * 0.5 + 0.5;
+    \\  if (p.x < 0.0 || p.x > 1.0 || p.y < 0.0 || p.y > 1.0 || p.z > 1.0) return 1.0;
+    \\  float bias = max(0.0015 * (1.0 - ndl), 0.0004);
+    \\  float v = 0.0;
+    \\  for (int x = -1; x <= 1; x++) for (int y = -1; y <= 1; y++) {
+    \\    v += texture(uShadow, vec3(p.xy + vec2(x, y) * uShadowTexel, p.z - bias));
+    \\  }
+    \\  return v / 9.0;
+    \\}
+    \\vec3 toLinear(vec3 c) { return pow(max(c, vec3(0.0)), vec3(2.2)); }
+    \\vec3 filmic(vec3 x) {
+    \\  // ACES approximation, then back to display gamma.
+    \\  vec3 m = clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+    \\  return pow(m, vec3(1.0 / 2.2));
+    \\}
     \\uniform vec2 uFogRange;
     \\uniform vec3 uEye;
     \\uniform vec4 uTint;
@@ -192,12 +227,28 @@ const fs_src: [:0]const u8 =
     \\  // Two-sided lighting: flip the normal towards the viewer.
     \\  vec3 toEye = uEye - vP;
     \\  if (dot(n, toEye) < 0.0) n = -n;
+    \\  // Only the first light (the sun) casts shadows.
+    \\  float sunNdl = max(dot(n, -uLdir[uLightSet * 3]), 0.0);
+    \\  float vis = sunVisibility(vP, sunNdl);
     \\  vec3 lit = uAmb[uLightSet];
     \\  for (int i = 0; i < 3; i++) {
-    \\    lit += uLcol[uLightSet * 3 + i] * max(dot(n, -uLdir[uLightSet * 3 + i]), 0.0);
+    \\    float f = i == 0 ? vis : 1.0;
+    \\    lit += uLcol[uLightSet * 3 + i] * max(dot(n, -uLdir[uLightSet * 3 + i]), 0.0) * f;
     \\  }
     \\  float fogF = clamp((length(toEye) - uFogRange.x) / max(uFogRange.y - uFogRange.x, 1.0), 0.0, 1.0);
-    \\  outColor = vec4(mix(c.rgb * lit, uFogColor, fogF), c.a);
+    \\  if (uModern == 1) {
+    \\    // Light in linear space: textures and light colours are stored in
+    \\    // display gamma, so convert, light, then tone map back.
+    \\    vec3 litL = toLinear(uAmb[uLightSet]);
+    \\    for (int i = 0; i < 3; i++) {
+    \\      float f = i == 0 ? vis : 1.0;
+    \\      litL += toLinear(uLcol[uLightSet * 3 + i]) * max(dot(n, -uLdir[uLightSet * 3 + i]), 0.0) * f;
+    \\    }
+    \\    vec3 colL = mix(toLinear(c.rgb) * litL * uExposure, toLinear(uFogColor) * uExposure, fogF);
+    \\    outColor = vec4(filmic(colL), c.a);
+    \\  } else {
+    \\    outColor = vec4(mix(c.rgb * lit, uFogColor, fogF), c.a);
+    \\  }
     \\}
 ;
 
@@ -314,6 +365,13 @@ const sky_fs: [:0]const u8 =
     \\in vec3 vDir;
     \\uniform vec3 uSunDir;   // unit vector towards the sun (or moon)
     \\uniform vec3 uSunCol;
+    \\uniform int uModern;
+    \\uniform float uExposure;
+    \\vec3 toLinear(vec3 c) { return pow(max(c, vec3(0.0)), vec3(2.2)); }
+    \\vec3 filmic(vec3 x) {
+    \\  vec3 m = clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+    \\  return pow(m, vec3(1.0 / 2.2));
+    \\}
     \\out vec4 outColor;
     \\void main() {
     \\  vec3 d = normalize(vDir);
@@ -321,7 +379,41 @@ const sky_fs: [:0]const u8 =
     \\  float disc = smoothstep(0.9988, 0.9994, s);
     \\  float glow = pow(max(s, 0.0), 48.0) * 0.45;
     \\  vec3 col = vColor + uSunCol * (disc + glow);
+    \\  if (uModern == 1) col = filmic(toLinear(col) * uExposure * 0.7);
     \\  outColor = vec4(col, 1.0);
+    \\}
+;
+
+const shadow_vs: [:0]const u8 =
+    \\#version 330 core
+    \\layout(location=0) in vec3 aPos;
+    \\layout(location=2) in vec2 aUv;
+    \\layout(location=3) in vec4 aIdx;
+    \\layout(location=4) in vec4 aWeight;
+    \\uniform mat4 uBones[96];
+    \\uniform int uSkinned;
+    \\uniform mat4 uModel;
+    \\uniform mat4 uLightVP;
+    \\out vec2 vUv;
+    \\void main() {
+    \\  mat4 m = uModel;
+    \\  if (uSkinned == 1) {
+    \\    m = aWeight.x * uBones[int(aIdx.x)] + aWeight.y * uBones[int(aIdx.y)]
+    \\      + aWeight.z * uBones[int(aIdx.z)] + aWeight.w * uBones[int(aIdx.w)];
+    \\  }
+    \\  vUv = aUv;
+    \\  gl_Position = uLightVP * (m * vec4(aPos, 1.0));
+    \\}
+;
+
+const shadow_fs: [:0]const u8 =
+    \\#version 330 core
+    \\in vec2 vUv;
+    \\uniform sampler2D uTex;
+    \\uniform float uAlphaCut;
+    \\void main() {
+    \\  // Leaves and fences cast shadows only where they are solid.
+    \\  if (texture(uTex, vUv).a < max(uAlphaCut, 0.4)) discard;
     \\}
 ;
 
@@ -559,7 +651,17 @@ const ActorTemplate = struct {
     manifest: ?model.Manifest,
 };
 
+/// Optional rendering features beyond the original game's look.
+pub const Fx = struct {
+    /// Linear-light shading with filmic tone mapping.
+    modern: bool = false,
+    exposure: f32 = 1.7,
+    /// Sun shadows from a depth map fitted around the camera.
+    shadows: bool = false,
+};
+
 pub const Scene = struct {
+    fx: Fx = .{},
     gpa: std.mem.Allocator,
     g: *const Gl,
     vfs: *vfs_mod.Vfs,
@@ -1622,6 +1724,9 @@ pub const Options = struct {
     /// Initial camera yaw and pitch in radians, if given.
     yaw: ?f32 = null,
     pitch: ?f32 = null,
+    /// Multisample anti-aliasing samples (0 = off); falls back to none if
+    /// the display cannot do it.
+    msaa: u32 = 0,
     /// Frames rendered before the screenshot is taken (a hook can also
     /// request it earlier or later through `FrameCtx.shot_request`).
     shot_frames: u32 = 3,
@@ -1685,6 +1790,25 @@ pub const Gfx = struct {
     sky_scale: gl.Int,
     sky_sun: gl.Int,
     sky_suncol: gl.Int,
+    sky_modern: gl.Int,
+    sky_exposure: gl.Int,
+    // shadows (created the first time they are switched on)
+    shadow_prog: gl.Uint = 0,
+    shadow_fbo: gl.Uint = 0,
+    shadow_tex: gl.Uint = 0,
+    shadow_size: gl.Sizei = 2048,
+    sh_vp: gl.Int = -1,
+    sh_model: gl.Int = -1,
+    sh_bones: gl.Int = -1,
+    sh_skinned: gl.Int = -1,
+    sh_tex: gl.Int = -1,
+    sh_cut: gl.Int = -1,
+    u_shadow_on: gl.Int = -1,
+    u_shadow: gl.Int = -1,
+    u_light_vp: gl.Int = -1,
+    u_shadow_texel: gl.Int = -1,
+    u_modern: gl.Int,
+    u_exposure: gl.Int,
     // 2D overlay
     ui_prog: gl.Uint,
     ui_screen: gl.Int,
@@ -1699,16 +1823,31 @@ pub const Gfx = struct {
             return error.PlatformInit;
         };
         errdefer self.plat.deinit();
-        self.win = platform.Window.createGl("zootycon2 viewer", opts.width, opts.height) catch {
-            std.debug.print("window creation failed: {s}\n", .{platform.lastError()});
-            return error.PlatformWindow;
-        };
+        // Try with the requested anti-aliasing, then without it.
+        var samples = opts.msaa;
+        while (true) {
+            self.win = platform.Window.createGl("zootycon2 viewer", opts.width, opts.height, samples) catch {
+                if (samples > 0) {
+                    samples = 0;
+                    continue;
+                }
+                std.debug.print("window creation failed: {s}\n", .{platform.lastError()});
+                return error.PlatformWindow;
+            };
+            self.ctx = self.win.glCreateContext() catch {
+                self.win.destroy();
+                if (samples > 0) {
+                    samples = 0;
+                    continue;
+                }
+                std.debug.print("OpenGL 3.3 context failed: {s}\n", .{platform.lastError()});
+                return error.GlContext;
+            };
+            break;
+        }
         errdefer self.win.destroy();
-        self.ctx = self.win.glCreateContext() catch {
-            std.debug.print("OpenGL 3.3 context failed: {s}\n", .{platform.lastError()});
-            return error.GlContext;
-        };
         errdefer self.ctx.destroy();
+        if (opts.msaa > 0 and samples == 0) std.debug.print("anti-aliasing not available; continuing without it\n", .{});
         self.g = .{};
         if (self.g.load(platform.glGetProcAddress)) |missing| {
             std.debug.print("missing OpenGL function: {s}\n", .{missing});
@@ -1717,6 +1856,11 @@ pub const Gfx = struct {
         if (opts.screenshot == null) {
             if (self.g.getString(gl.RENDERER)) |r| std.debug.print("renderer: {s}\n", .{r});
         }
+        // `Gfx` is created undefined, so its defaults do not apply: set these here.
+        self.shadow_prog = 0;
+        self.shadow_fbo = 0;
+        self.shadow_tex = 0;
+        self.shadow_size = 2048;
         self.prog = try makeProgram(&self.g);
         const g = &self.g;
         self.u_model = g.getUniformLocation(self.prog, "uModel");
@@ -1748,7 +1892,53 @@ pub const Gfx = struct {
         self.sky_scale = g.getUniformLocation(self.sky_prog, "uScale");
         self.sky_sun = g.getUniformLocation(self.sky_prog, "uSunDir");
         self.sky_suncol = g.getUniformLocation(self.sky_prog, "uSunCol");
+        self.sky_modern = g.getUniformLocation(self.sky_prog, "uModern");
+        self.sky_exposure = g.getUniformLocation(self.sky_prog, "uExposure");
+        self.u_shadow_on = g.getUniformLocation(self.prog, "uShadowOn");
+        self.u_shadow = g.getUniformLocation(self.prog, "uShadow");
+        self.u_light_vp = g.getUniformLocation(self.prog, "uLightVP");
+        self.u_shadow_texel = g.getUniformLocation(self.prog, "uShadowTexel");
+        self.u_modern = g.getUniformLocation(self.prog, "uModern");
+        self.u_exposure = g.getUniformLocation(self.prog, "uExposure");
         try self.initUi();
+    }
+
+    /// Creates the shadow program, depth texture and framebuffer on first use.
+    fn ensureShadow(self: *Gfx) bool {
+        if (self.shadow_fbo != 0) return true;
+        const g = &self.g;
+        self.shadow_prog = makeProgramFrom(g, shadow_vs, shadow_fs) catch return false;
+        self.sh_vp = g.getUniformLocation(self.shadow_prog, "uLightVP");
+        self.sh_model = g.getUniformLocation(self.shadow_prog, "uModel");
+        self.sh_bones = g.getUniformLocation(self.shadow_prog, "uBones");
+        self.sh_skinned = g.getUniformLocation(self.shadow_prog, "uSkinned");
+        self.sh_tex = g.getUniformLocation(self.shadow_prog, "uTex");
+        self.sh_cut = g.getUniformLocation(self.shadow_prog, "uAlphaCut");
+        g.genTextures(1, @ptrCast(&self.shadow_tex));
+        g.bindTexture(gl.TEXTURE_2D, self.shadow_tex);
+        g.texImage2D(gl.TEXTURE_2D, 0, @intCast(gl.DEPTH_COMPONENT24), self.shadow_size, self.shadow_size, 0, gl.DEPTH_COMPONENT, gl.FLOAT, null);
+        g.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, @intCast(gl.LINEAR));
+        g.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, @intCast(gl.LINEAR));
+        g.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, @intCast(gl.CLAMP_TO_BORDER));
+        g.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, @intCast(gl.CLAMP_TO_BORDER));
+        const border = [4]f32{ 1, 1, 1, 1 };
+        g.texParameterfv(gl.TEXTURE_2D, gl.TEXTURE_BORDER_COLOR, &border);
+        g.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_COMPARE_MODE, @intCast(gl.COMPARE_REF_TO_TEXTURE));
+        g.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_COMPARE_FUNC, @intCast(gl.LEQUAL));
+        g.genFramebuffers(1, @ptrCast(&self.shadow_fbo));
+        g.bindFramebuffer(gl.FRAMEBUFFER, self.shadow_fbo);
+        g.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, self.shadow_tex, 0);
+        const none = [1]gl.Enum{gl.NONE};
+        g.drawBuffers(1, &none);
+        g.readBuffer(gl.NONE);
+        const ok = g.checkFramebufferStatus(gl.FRAMEBUFFER) == gl.FRAMEBUFFER_COMPLETE;
+        g.bindFramebuffer(gl.FRAMEBUFFER, 0);
+        if (!ok) {
+            std.debug.print("shadow framebuffer is not complete; shadows disabled\n", .{});
+            self.shadow_fbo = 0;
+            return false;
+        }
+        return true;
     }
 
     fn initUi(self: *Gfx) !void {
@@ -1934,6 +2124,100 @@ const Frustum = struct {
     }
 };
 
+/// Uploads the model matrix (or bone matrices) for a draw.
+fn setModelUniforms(g: *const Gl, scene: *Scene, d: Draw, loc_model: gl.Int, loc_bones: gl.Int) void {
+    const wl: []const Mat4 = if (d.inst) |i| scene.instances.items[i].world else scene.world;
+    if (d.skin) |sk| {
+        var mats: [max_bones]Mat4 = undefined;
+        for (sk.bones, sk.offsets, 0..) |bn, off, i| mats[i] = mul(wl[bn], off);
+        g.uniformMatrix4fv(loc_bones, @intCast(sk.bones.len), 0, @ptrCast(&mats));
+    } else if (d.attach_node) |n| {
+        const m = mul(wl[n], d.world);
+        g.uniformMatrix4fv(loc_model, 1, 0, &m);
+    } else {
+        g.uniformMatrix4fv(loc_model, 1, 0, if (d.dynamic) &wl[d.block] else &d.world);
+    }
+}
+
+/// Renders the sun's view of the scene into the shadow map and returns the
+/// matrix that maps world positions into it, or null if there is no usable sun.
+fn renderShadows(gfx: *Gfx, scene: *Scene, cam: Camera, sun_dir: [3]f32, size: struct { width: u32, height: u32 }) ?Mat4 {
+    if (!gfx.ensureShadow()) return null;
+    // A sun that is at or below the horizon casts no useful shadows.
+    if (sun_dir[2] > -0.12) return null;
+    const g = &gfx.g;
+    const res: f32 = @floatFromInt(gfx.shadow_size);
+    const half = std.math.clamp(cam.dist * 1.25, 30, 260);
+    const dir = normalize3(sun_dir);
+    const up: [3]f32 = if (@abs(dir[2]) > 0.95) .{ 0, 1, 0 } else .{ 0, 0, 1 };
+    const eye = [3]f32{ cam.center[0] - dir[0] * half * 2.5, cam.center[1] - dir[1] * half * 2.5, cam.center[2] - dir[2] * half * 2.5 };
+    var lvp = mul(ortho(half, 0.1, half * 5.5), lookAt(eye, cam.center, up));
+    // Snap to whole texels so shadows do not shimmer as the camera moves.
+    const cx = lvp[0] * cam.center[0] + lvp[4] * cam.center[1] + lvp[8] * cam.center[2] + lvp[12];
+    const cy = lvp[1] * cam.center[0] + lvp[5] * cam.center[1] + lvp[9] * cam.center[2] + lvp[13];
+    lvp[12] += (@round(cx * res / 2) - cx * res / 2) * 2 / res;
+    lvp[13] += (@round(cy * res / 2) - cy * res / 2) * 2 / res;
+
+    g.bindFramebuffer(gl.FRAMEBUFFER, gfx.shadow_fbo);
+    g.viewport(0, 0, gfx.shadow_size, gfx.shadow_size);
+    g.depthMask(1);
+    g.enable(gl.DEPTH_TEST);
+    g.disable(gl.BLEND);
+    g.clear(gl.DEPTH_BUFFER_BIT);
+    g.enable(gl.POLYGON_OFFSET_FILL);
+    g.polygonOffset(2.0, 4.0);
+    g.useProgram(gfx.shadow_prog);
+    g.uniformMatrix4fv(gfx.sh_vp, 1, 0, &lvp);
+    g.uniform1i(gfx.sh_tex, 0);
+    g.activeTexture(gl.TEXTURE0);
+    var last_tex: gl.Uint = std.math.maxInt(u32);
+    var last_cut: f32 = -1;
+    var last_skin: i32 = -1;
+    var last_vao: gl.Uint = std.math.maxInt(u32);
+    const lists = [_][]const Draw{ scene.draws.items, scene.actor_draws.items };
+    const reach = half * 1.5;
+    for (lists) |list| for (list) |d| {
+        if (d.blend and !d.depth_write) continue; // ground decals
+        if (d.bound[3] >= 0) {
+            const dx = d.bound[0] - cam.center[0];
+            const dy = d.bound[1] - cam.center[1];
+            if (dx * dx + dy * dy > (reach + d.bound[3]) * (reach + d.bound[3])) continue;
+            if (d.lod_range[0] > 0 or d.lod_range[1] < std.math.inf(f32)) {
+                // Same level-of-detail choice as the camera sees.
+                const eye_c = cam.eye();
+                const ex = d.bound[0] - eye_c[0];
+                const ey = d.bound[1] - eye_c[1];
+                const ez = d.bound[2] - eye_c[2];
+                const dist = @sqrt(ex * ex + ey * ey + ez * ez);
+                if (dist < d.lod_range[0] or dist >= d.lod_range[1]) continue;
+            }
+        }
+        const skinned: i32 = if (d.skin != null) 1 else 0;
+        if (skinned != last_skin) {
+            g.uniform1i(gfx.sh_skinned, skinned);
+            last_skin = skinned;
+        }
+        setModelUniforms(g, scene, d, gfx.sh_model, gfx.sh_bones);
+        if (d.alpha_cut != last_cut) {
+            g.uniform1f(gfx.sh_cut, d.alpha_cut);
+            last_cut = d.alpha_cut;
+        }
+        if (d.texture != last_tex) {
+            g.bindTexture(gl.TEXTURE_2D, d.texture);
+            last_tex = d.texture;
+        }
+        if (d.vao != last_vao) {
+            g.bindVertexArray(d.vao);
+            last_vao = d.vao;
+        }
+        g.drawElements(gl.TRIANGLES, d.index_count, d.index_type, null);
+    };
+    g.disable(gl.POLYGON_OFFSET_FILL);
+    g.bindFramebuffer(gl.FRAMEBUFFER, 0);
+    g.viewport(0, 0, @intCast(size.width), @intCast(size.height));
+    return lvp;
+}
+
 /// What the GL state already holds, so draws only send what changed.
 const DrawState = struct {
     tex0: gl.Uint = std.math.maxInt(u32),
@@ -1992,22 +2276,12 @@ fn drawItem(gfx: *Gfx, scene: *Scene, d: Draw, fr: *const Frustum, st: *DrawStat
         g.uniform1i(gfx.u_lightset, d.light_set);
         st.light_set = d.light_set;
     }
-    const wl: []const Mat4 = if (d.inst) |i| scene.instances.items[i].world else scene.world;
     const skinned: i32 = if (d.skin != null) 1 else 0;
     if (skinned != st.skinned) {
         g.uniform1i(gfx.u_skinned, skinned);
         st.skinned = skinned;
     }
-    if (d.skin) |sk| {
-        var mats: [max_bones]Mat4 = undefined;
-        for (sk.bones, sk.offsets, 0..) |bn, off, i| mats[i] = mul(wl[bn], off);
-        g.uniformMatrix4fv(gfx.u_bones, @intCast(sk.bones.len), 0, @ptrCast(&mats));
-    } else if (d.attach_node) |n| {
-        const m = mul(wl[n], d.world);
-        g.uniformMatrix4fv(gfx.u_model, 1, 0, &m);
-    } else {
-        g.uniformMatrix4fv(gfx.u_model, 1, 0, if (d.dynamic) &wl[d.block] else &d.world);
-    }
+    setModelUniforms(g, scene, d, gfx.u_model, gfx.u_bones);
     if (!std.mem.eql(f32, &d.tint, &st.tint)) {
         g.uniform4f(gfx.u_tint, d.tint[0], d.tint[1], d.tint[2], d.tint[3]);
         st.tint = d.tint;
@@ -2237,6 +2511,13 @@ pub fn loopWith(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Came
 
         if (scene.instances.items.len > 0) scene.poseInstances(@as(f32, @floatFromInt(now_ms - start_ms)) / 1000.0);
 
+        // Sun shadows (optional): a depth pass from the sun's point of view.
+        var light_vp: ?Mat4 = null;
+        if (scene.fx.shadows) {
+            const sample = scene.lighting orelse defaultLighting();
+            light_vp = renderShadows(gfx, scene, cam, sample.dir[1][0], .{ .width = size.width, .height = size.height });
+        }
+
         // Sky first, without depth, centred on the eye.
         if (scene.sky) |*sk| {
             const tod_for_sky = scene.tod;
@@ -2254,6 +2535,8 @@ pub fn loopWith(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Came
             g.uniform3f(gfx.sky_sun, -sd[0], -sd[1], -sd[2]);
             const sc = sample.color[1][0];
             g.uniform3f(gfx.sky_suncol, sc[0], sc[1], sc[2]);
+            g.uniform1i(gfx.sky_modern, @intFromBool(scene.fx.modern));
+            g.uniform1f(gfx.sky_exposure, scene.fx.exposure);
             g.bindVertexArray(sk.vao);
             g.drawElements(gl.TRIANGLES, sk.index_count, gl.UNSIGNED_SHORT, null);
             g.bindVertexArray(0);
@@ -2281,6 +2564,17 @@ pub fn loopWith(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Came
             g.uniform3f(gfx.u_fogcol, s.fog_color[0], s.fog_color[1], s.fog_color[2]);
             g.uniform2f(gfx.u_fogrange, s.fog_start * scene.fog_scale, s.fog_end * scene.fog_scale);
             g.uniform3f(gfx.u_eye, eye[0], eye[1], eye[2]);
+            g.uniform1i(gfx.u_modern, @intFromBool(scene.fx.modern));
+            g.uniform1f(gfx.u_exposure, scene.fx.exposure);
+            g.uniform1i(gfx.u_shadow_on, if (light_vp != null) 1 else 0);
+            if (light_vp) |lv| {
+                g.uniformMatrix4fv(gfx.u_light_vp, 1, 0, &lv);
+                g.uniform1f(gfx.u_shadow_texel, 1.0 / @as(f32, @floatFromInt(gfx.shadow_size)));
+                g.uniform1i(gfx.u_shadow, 6);
+                g.activeTexture(gl.TEXTURE6);
+                g.bindTexture(gl.TEXTURE_2D, gfx.shadow_tex);
+                g.activeTexture(gl.TEXTURE0);
+            }
         }
         g.uniform1i(gfx.u_tex, 0);
         g.uniform1i(gfx.u_tex2, 1);

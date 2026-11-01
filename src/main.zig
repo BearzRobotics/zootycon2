@@ -318,6 +318,14 @@ pub fn main(init: std.process.Init) !void {
                 aopts.tod = try std.fmt.parseFloat(f32, rest[k]);
             } else if (std.mem.eql(u8, arg, "--clock")) {
                 aopts.tod_auto = true;
+            } else if (std.mem.eql(u8, arg, "--modern")) {
+                aopts.modern = true;
+                if (aopts.viewer.msaa == 0) aopts.viewer.msaa = 4;
+            } else if (std.mem.eql(u8, arg, "--no-shadows")) {
+                aopts.no_shadows = true;
+            } else if (std.mem.eql(u8, arg, "--msaa") and k + 1 < rest.len) {
+                k += 1;
+                aopts.viewer.msaa = try std.fmt.parseInt(u32, rest[k], 10);
             } else if (std.mem.eql(u8, arg, "--no-sim")) {
                 aopts.sim = false;
             } else if (std.mem.eql(u8, arg, "--view")) {

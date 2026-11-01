@@ -149,12 +149,15 @@ pub const Window = struct {
     }
 
     /// Creates a window that can host an OpenGL 3.3 core context.
-    pub fn createGl(title: [:0]const u8, width: u32, height: u32) Error!Window {
+    /// `samples` > 0 asks for a multisampled framebuffer (anti-aliasing).
+    pub fn createGl(title: [:0]const u8, width: u32, height: u32, samples: u32) Error!Window {
         _ = c.SDL_GL_SetAttribute(c.SDL_GL_CONTEXT_MAJOR_VERSION, 3);
         _ = c.SDL_GL_SetAttribute(c.SDL_GL_CONTEXT_MINOR_VERSION, 3);
         _ = c.SDL_GL_SetAttribute(c.SDL_GL_CONTEXT_PROFILE_MASK, c.SDL_GL_CONTEXT_PROFILE_CORE);
         _ = c.SDL_GL_SetAttribute(c.SDL_GL_DEPTH_SIZE, 24);
         _ = c.SDL_GL_SetAttribute(c.SDL_GL_DOUBLEBUFFER, 1);
+        _ = c.SDL_GL_SetAttribute(c.SDL_GL_MULTISAMPLEBUFFERS, if (samples > 0) 1 else 0);
+        _ = c.SDL_GL_SetAttribute(c.SDL_GL_MULTISAMPLESAMPLES, @intCast(samples));
         const w = c.SDL_CreateWindow(title.ptr, @intCast(width), @intCast(height), c.SDL_WINDOW_RESIZABLE | c.SDL_WINDOW_HIGH_PIXEL_DENSITY | c.SDL_WINDOW_OPENGL) orelse
             return error.WindowCreate;
         return .{ .handle = w };

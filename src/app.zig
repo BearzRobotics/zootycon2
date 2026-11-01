@@ -103,6 +103,8 @@ const MenuAction = enum {
     toggle_help,
     toggle_arrivals,
     toggle_clock,
+    toggle_modern,
+    toggle_shadows,
     speed_up,
     speed_down,
     delete_selected,
@@ -134,6 +136,9 @@ pub const Options = struct {
     tod_auto: bool = false,
     /// Directory saves are written to.
     save_dir: []const u8,
+    /// Turn on the optional modern rendering features.
+    modern: bool = false,
+    no_shadows: bool = false,
     /// Open the map picker at startup (no map was named on the command line).
     pick_map: bool = false,
     /// Build commands run at startup, separated by `;` (for tests and demos):
@@ -1160,6 +1165,7 @@ pub const App = struct {
             .{ .n = "esc", .c = 41 },
             .{ .n = "f5", .c = sc.f5 },
             .{ .n = "f9", .c = sc.f9 },
+            .{ .n = "f1", .c = sc.f1 },
             .{ .n = "f2", .c = sc.f2 },
             .{ .n = "f3", .c = sc.f3 },
             .{ .n = "shift", .c = sc.lshift },
@@ -1472,6 +1478,8 @@ pub const App = struct {
                 self.updateGuestCap();
             },
             .toggle_clock => self.tod_auto = !self.tod_auto,
+            .toggle_modern => self.scene.fx.modern = !self.scene.fx.modern,
+            .toggle_shadows => self.scene.fx.shadows = !self.scene.fx.shadows,
             .speed_up => self.speed = @min(self.speed * 2, 16),
             .speed_down => self.speed = @max(self.speed / 2, 0.25),
             .delete_selected => self.deleteSelected(),
@@ -1592,6 +1600,8 @@ pub const App = struct {
                 y += try self.menuButton(ui, y, scale, std.fmt.bufPrint(&b, "HELP TEXT: {s}", .{if (self.show_help) "ON" else "OFF"}) catch "", .{ .menu = .toggle_help }, self.show_help);
                 y += try self.menuButton(ui, y, scale, std.fmt.bufPrint(&b, "GUEST ARRIVALS: {s}", .{if (self.arrivals_on) "ON" else "OFF"}) catch "", .{ .menu = .toggle_arrivals }, self.arrivals_on);
                 y += try self.menuButton(ui, y, scale, std.fmt.bufPrint(&b, "DAY/NIGHT CLOCK: {s}", .{if (self.tod_auto) "RUNNING" else "STOPPED"}) catch "", .{ .menu = .toggle_clock }, self.tod_auto);
+                y += try self.menuButton(ui, y, scale, std.fmt.bufPrint(&b, "MODERN LIGHTING: {s}", .{if (self.scene.fx.modern) "ON" else "OFF"}) catch "", .{ .menu = .toggle_modern }, self.scene.fx.modern);
+                y += try self.menuButton(ui, y, scale, std.fmt.bufPrint(&b, "SUN SHADOWS: {s}", .{if (self.scene.fx.shadows) "ON" else "OFF"}) catch "", .{ .menu = .toggle_shadows }, self.scene.fx.shadows);
                 y += try self.menuButton(ui, y, scale, std.fmt.bufPrint(&b, "SIM SPEED: X{d:.2}  (CLICK: FASTER)", .{self.speed}) catch "", .{ .menu = .speed_up }, false);
                 y += try self.menuButton(ui, y, scale, "SIM SPEED: SLOWER", .{ .menu = .speed_down }, false);
                 y += 6 * scale;
@@ -2268,6 +2278,8 @@ pub fn run(gpa: std.mem.Allocator, io: Io, vfs: *vfs_mod.Vfs, path: []const u8, 
     scene.interactive = false;
     scene.want_skin = false;
     scene.dynamic_draws = false;
+    scene.fx.modern = opts.modern;
+    scene.fx.shadows = opts.modern and !opts.no_shadows;
 
     var look = try viewer.terrainLook(gpa, vfs, &scene, &world.terrain);
     errdefer look.deinit(gpa);
