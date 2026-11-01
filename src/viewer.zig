@@ -8,6 +8,8 @@ const gl = @import("gl.zig");
 const nif = @import("nif.zig");
 const dds = @import("dds.zig");
 const model = @import("model.zig");
+const terrain_mod = @import("terrain.zig");
+const map_mod = @import("map.zig");
 const bf = @import("bf.zig");
 const vfs_mod = @import("vfs.zig");
 const platform = @import("platform.zig");
@@ -205,6 +207,9 @@ const Skin = struct {
 };
 
 const Draw = struct {
+    /// Pose-driven draws read `Scene.world[block]` each frame; others use `world`.
+    dynamic: bool,
+    index_type: gl.Enum,
     block: u32,
     skin: ?Skin,
     vao: gl.Uint,
@@ -232,6 +237,11 @@ pub const Scene = struct {
     /// World matrix of every node/geometry block, refreshed by `pose`.
     world: []Mat4 = &.{},
     arena: std.heap.ArenaAllocator,
+    /// Single-model viewing: poses and skinning follow the animation, and the
+    /// camera frames the model's bounds. Map mode turns all of these off.
+    interactive: bool = true,
+    /// Loaded models by lowercase path, as draws relative to the model origin.
+    models: std.StringHashMapUnmanaged(?[]const Draw) = .empty,
 
     const Index = struct {
         scene: *Scene,
@@ -269,6 +279,12 @@ pub const Scene = struct {
         self.draws.deinit(self.gpa);
         self.gpa.free(self.world);
         self.arena.deinit();
+        var mit = self.models.iterator();
+        while (mit.next()) |e| {
+            self.gpa.free(e.key_ptr.*);
+            if (e.value_ptr.*) |d| self.gpa.free(d);
+        }
+        self.models.deinit(self.gpa);
         var it = self.textures.keyIterator();
         while (it.next()) |k| self.gpa.free(k.*);
         self.textures.deinit(self.gpa);
@@ -444,15 +460,37 @@ pub const Scene = struct {
             const uv: [2]f32 = if (have_uv) md.uv_sets[0][i] else .{ 0, 0 };
             buf[i * 16 + 6] = uv[0];
             buf[i * 16 + 7] = uv[1];
-            const wp = transformPoint(world, v);
-            for (0..3) |k| {
-                self.min[k] = @min(self.min[k], wp[k]);
-                self.max[k] = @max(self.max[k], wp[k]);
+            if (self.interactive) {
+                const wp = transformPoint(world, v);
+                for (0..3) |k| {
+                    self.min[k] = @min(self.min[k], wp[k]);
+                    self.max[k] = @max(self.max[k], wp[k]);
+                }
             }
         }
 
-        const skin = try self.buildSkin(nf, geo, buf, n);
+        const skin = if (self.interactive) try self.buildSkin(nf, geo, buf, n) else null;
 
+        const vao = self.uploadMesh(buf, md.indices.ptr, md.indices.len * 2);
+
+        try self.draws.append(self.gpa, .{
+            .dynamic = self.interactive,
+            .index_type = gl.UNSIGNED_SHORT,
+            .block = block,
+            .skin = skin,
+            .vao = vao,
+            .index_count = @intCast(md.indices.len),
+            .world = world,
+            .texture = tex,
+            .tint = tint,
+            .blend = blend,
+            .alpha_cut = alpha_cut,
+        });
+    }
+
+    /// Uploads interleaved vertices (16 floats each: position, normal, uv,
+    /// bone indices, bone weights) and an index buffer; returns the vertex array.
+    fn uploadMesh(self: *Scene, buf: []const f32, indices: *const anyopaque, index_bytes: usize) gl.Uint {
         const g = self.g;
         var vao: gl.Uint = 0;
         var bufs: [2]gl.Uint = undefined;
@@ -473,20 +511,137 @@ pub const Scene = struct {
         g.enableVertexAttribArray(4);
         g.vertexAttribPointer(4, 4, gl.FLOAT, 0, stride, @ptrFromInt(48));
         g.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, bufs[1]);
-        g.bufferData(gl.ELEMENT_ARRAY_BUFFER, @intCast(md.indices.len * 2), md.indices.ptr, gl.STATIC_DRAW);
+        g.bufferData(gl.ELEMENT_ARRAY_BUFFER, @intCast(index_bytes), indices, gl.STATIC_DRAW);
         g.bindVertexArray(0);
+        return vao;
+    }
 
+    /// Adds a terrain mesh: one vertex per grid point, shaded by normals.
+    pub fn addTerrain(self: *Scene, t: *const terrain_mod.Terrain, tint: [4]f32) !void {
+        const w = t.width;
+        const h = t.height;
+        const sx = t.spacingX();
+        const sy = t.spacingY();
+        const buf = try self.gpa.alloc(f32, @as(usize, w) * h * 16);
+        defer self.gpa.free(buf);
+        @memset(buf, 0);
+        for (0..h) |j| for (0..w) |i| {
+            const o = (j * w + i) * 16;
+            const z = t.z[j * w + i];
+            const zl = t.z[j * w + (if (i > 0) i - 1 else i)];
+            const zr = t.z[j * w + (if (i + 1 < w) i + 1 else i)];
+            const zd = t.z[(if (j > 0) j - 1 else j) * w + i];
+            const zu = t.z[(if (j + 1 < h) j + 1 else j) * w + i];
+            const dx = (zr - zl) / (sx * @as(f32, if (i > 0 and i + 1 < w) 2 else 1));
+            const dy = (zu - zd) / (sy * @as(f32, if (j > 0 and j + 1 < h) 2 else 1));
+            const n = normalize3(.{ -dx, -dy, 1 });
+            buf[o + 0] = @as(f32, @floatFromInt(i)) * sx;
+            buf[o + 1] = @as(f32, @floatFromInt(j)) * sy;
+            buf[o + 2] = z;
+            buf[o + 3] = n[0];
+            buf[o + 4] = n[1];
+            buf[o + 5] = n[2];
+            buf[o + 6] = @as(f32, @floatFromInt(i)) / 4.0;
+            buf[o + 7] = @as(f32, @floatFromInt(j)) / 4.0;
+        };
+        const idx = try self.gpa.alloc(u32, @as(usize, w - 1) * (h - 1) * 6);
+        defer self.gpa.free(idx);
+        var k: usize = 0;
+        for (0..h - 1) |j| for (0..w - 1) |i| {
+            const a: u32 = @intCast(j * w + i);
+            const b = a + 1;
+            const c: u32 = @intCast((j + 1) * w + i);
+            const d = c + 1;
+            idx[k..][0..6].* = .{ a, b, d, a, d, c };
+            k += 6;
+        };
+        const vao = self.uploadMesh(buf, idx.ptr, idx.len * 4);
         try self.draws.append(self.gpa, .{
-            .block = block,
-            .skin = skin,
+            .dynamic = false,
+            .index_type = gl.UNSIGNED_INT,
+            .block = 0,
+            .skin = null,
             .vao = vao,
-            .index_count = @intCast(md.indices.len),
-            .world = world,
-            .texture = tex,
+            .index_count = @intCast(idx.len),
+            .world = identity,
+            .texture = self.white,
             .tint = tint,
-            .blend = blend,
-            .alpha_cut = alpha_cut,
+            .blend = false,
+            .alpha_cut = 0,
         });
+    }
+
+    /// Loads a model by VFS path (`.bfm`, `.nif`, or either extension left
+    /// off) and returns its draws relative to the model origin. Results,
+    /// including failures, are cached.
+    pub fn loadModel(self: *Scene, path: []const u8) !?[]const Draw {
+        var key_buf: [512]u8 = undefined;
+        if (path.len == 0 or path.len > key_buf.len) return null;
+        for (path, 0..) |ch, i| key_buf[i] = if (ch == '\\') '/' else std.ascii.toLower(ch);
+        const key = key_buf[0..path.len];
+        if (self.models.get(key)) |cached| return cached;
+
+        const owned_key = try self.gpa.dupe(u8, key);
+        errdefer self.gpa.free(owned_key);
+        const result = try self.buildModel(key);
+        try self.models.put(self.gpa, owned_key, result);
+        return result;
+    }
+
+    fn buildModel(self: *Scene, key: []const u8) !?[]const Draw {
+        const gpa = self.gpa;
+        var nif_path_buf: [512]u8 = undefined;
+        var nif_path: []const u8 = key;
+        var mf: ?model.Manifest = null;
+        defer if (mf) |*m| m.deinit();
+        if (std.mem.endsWith(u8, key, ".bfm") or (!std.mem.endsWith(u8, key, ".nif") and self.tryManifest(key, &nif_path_buf, &mf))) {
+            if (mf == null) {
+                const data = self.vfs.read(gpa, key) catch return null;
+                defer gpa.free(data);
+                mf = model.parseManifest(gpa, data) catch return null;
+            }
+            nif_path = mf.?.model_name;
+        } else if (!std.mem.endsWith(u8, key, ".nif")) {
+            const with_ext = std.fmt.bufPrint(&nif_path_buf, "{s}.nif", .{key}) catch return null;
+            nif_path = with_ext;
+        }
+        const bytes = self.vfs.read(gpa, nif_path) catch return null;
+        defer gpa.free(bytes);
+        var nf = nif.parse(gpa, bytes) catch return null;
+        defer nf.deinit();
+
+        const tmp = try gpa.alloc(Mat4, nf.blocks.len);
+        defer gpa.free(tmp);
+        @memset(tmp, identity);
+        const saved = self.world;
+        self.world = tmp;
+        defer self.world = saved;
+        const start = self.draws.items.len;
+        self.pose(&nf, null, 0);
+        for (nf.roots) |r| try self.walk(&nf, r);
+        const out = try gpa.dupe(Draw, self.draws.items[start..]);
+        self.draws.shrinkRetainingCapacity(start);
+        return out;
+    }
+
+    /// True (and fills `mf`) when `<key>.bfm` exists and parses.
+    fn tryManifest(self: *Scene, key: []const u8, buf: []u8, mf: *?model.Manifest) bool {
+        const p = std.fmt.bufPrint(buf, "{s}.bfm", .{key}) catch return false;
+        if (!self.vfs.exists(p)) return false;
+        const data = self.vfs.read(self.gpa, p) catch return false;
+        defer self.gpa.free(data);
+        mf.* = model.parseManifest(self.gpa, data) catch return false;
+        return true;
+    }
+
+    /// Adds fixed copies of a model's draws, moved by `m`.
+    pub fn place(self: *Scene, draws: []const Draw, m: Mat4) !void {
+        for (draws) |d| {
+            var c = d;
+            c.world = mul(m, d.world);
+            c.dynamic = false;
+            try self.draws.append(self.gpa, c);
+        }
     }
 
     /// Fills the bone index/weight attributes (floats 8..15 of each vertex)
@@ -549,10 +704,226 @@ pub const Options = struct {
     anim: ?[]const u8 = null,
     /// Fixed pose time in seconds (otherwise the animation loops in real time).
     time: ?f32 = null,
+    /// Initial camera yaw and pitch in radians, if given.
+    yaw: ?f32 = null,
+    pitch: ?f32 = null,
+    /// Camera distance as a multiple of the default.
+    zoom: f32 = 1.0,
     width: u32 = 1280,
     height: u32 = 720,
 };
 
+// SDL scancodes (USB HID usage ids) for the camera keys.
+const key_a: u32 = 4;
+const key_d: u32 = 7;
+const key_s: u32 = 22;
+const key_w: u32 = 26;
+
+/// Window, GL context and loaded entry points. Lives in place because the
+/// scene keeps a pointer to `g`.
+const Gfx = struct {
+    plat: platform.Platform,
+    win: platform.Window,
+    ctx: platform.GlContext,
+    g: Gl,
+    prog: gl.Uint,
+    u_model: gl.Int,
+    u_vp: gl.Int,
+    u_tex: gl.Int,
+    u_tint: gl.Int,
+    u_cut: gl.Int,
+    u_skinned: gl.Int,
+    u_bones: gl.Int,
+
+    fn open(self: *Gfx, opts: Options) !void {
+        self.plat = platform.Platform.init() catch {
+            std.debug.print("SDL init failed: {s}\n", .{platform.lastError()});
+            return error.PlatformInit;
+        };
+        errdefer self.plat.deinit();
+        self.win = platform.Window.createGl("zootycon2 viewer", opts.width, opts.height) catch {
+            std.debug.print("window creation failed: {s}\n", .{platform.lastError()});
+            return error.PlatformWindow;
+        };
+        errdefer self.win.destroy();
+        self.ctx = self.win.glCreateContext() catch {
+            std.debug.print("OpenGL 3.3 context failed: {s}\n", .{platform.lastError()});
+            return error.GlContext;
+        };
+        errdefer self.ctx.destroy();
+        self.g = .{};
+        if (self.g.load(platform.glGetProcAddress)) |missing| {
+            std.debug.print("missing OpenGL function: {s}\n", .{missing});
+            return error.GlMissing;
+        }
+        if (opts.screenshot == null) {
+            if (self.g.getString(gl.RENDERER)) |r| std.debug.print("renderer: {s}\n", .{r});
+        }
+        self.prog = try makeProgram(&self.g);
+        const g = &self.g;
+        self.u_model = g.getUniformLocation(self.prog, "uModel");
+        self.u_vp = g.getUniformLocation(self.prog, "uViewProj");
+        self.u_tex = g.getUniformLocation(self.prog, "uTex");
+        self.u_tint = g.getUniformLocation(self.prog, "uTint");
+        self.u_cut = g.getUniformLocation(self.prog, "uAlphaCut");
+        self.u_skinned = g.getUniformLocation(self.prog, "uSkinned");
+        self.u_bones = g.getUniformLocation(self.prog, "uBones");
+    }
+
+    fn close(self: *Gfx) void {
+        self.ctx.destroy();
+        self.win.destroy();
+        self.plat.deinit();
+    }
+};
+
+const Playback = struct {
+    nf: *const nif.Nif,
+    anim: *const bf.Animation,
+};
+
+const Camera = struct {
+    center: [3]f32,
+    radius: f32,
+    yaw: f32 = -0.8,
+    pitch: f32 = 0.45,
+    dist: f32,
+};
+
+fn loop(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Camera, play: ?Playback, opts: Options) !void {
+    const g = &gfx.g;
+    const plat = gfx.plat;
+    var cam = cam_init;
+    if (opts.yaw) |y| cam.yaw = y;
+    if (opts.pitch) |p| cam.pitch = p;
+    cam.dist *= opts.zoom;
+    var dragging = false;
+    var last_x: f32 = 0;
+    var last_y: f32 = 0;
+    var size = gfx.win.pixelSize();
+    var held = [4]bool{ false, false, false, false }; // w a s d
+
+    g.enable(gl.DEPTH_TEST);
+    g.depthFunc(gl.LEQUAL);
+    g.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+    var frame: u32 = 0;
+    const start_ms = plat.ticksMs();
+    var prev_ms = start_ms;
+    main: while (true) {
+        while (plat.pollEvent()) |ev| switch (ev) {
+            .quit => break :main,
+            .key_down => |k| switch (k.scancode) {
+                platform.scancode_escape => break :main,
+                key_w => held[0] = true,
+                key_a => held[1] = true,
+                key_s => held[2] = true,
+                key_d => held[3] = true,
+                else => {},
+            },
+            .key_up => |k| switch (k.scancode) {
+                key_w => held[0] = false,
+                key_a => held[1] = false,
+                key_s => held[2] = false,
+                key_d => held[3] = false,
+                else => {},
+            },
+            .resized => |r| size = .{ .width = @max(r.width, 1), .height = @max(r.height, 1) },
+            .mouse_button => |b| if (b.button == 1) {
+                dragging = b.down;
+                last_x = b.x;
+                last_y = b.y;
+            },
+            .mouse_move => |m| {
+                if (dragging) {
+                    cam.yaw -= (m.x - last_x) * 0.01;
+                    cam.pitch = std.math.clamp(cam.pitch + (m.y - last_y) * 0.01, -1.5, 1.5);
+                }
+                last_x = m.x;
+                last_y = m.y;
+            },
+            .mouse_wheel => |w| cam.dist = std.math.clamp(cam.dist * std.math.pow(f32, 0.9, w.dy), cam.radius * 0.05, cam.radius * 20),
+        };
+
+        const now_ms = plat.ticksMs();
+        const dt = @as(f32, @floatFromInt(now_ms - prev_ms)) / 1000.0;
+        prev_ms = now_ms;
+        // WASD pans the look-at point across the ground plane.
+        const fwd = [2]f32{ -@cos(cam.yaw), -@sin(cam.yaw) };
+        const right = [2]f32{ fwd[1], -fwd[0] };
+        var mv = [2]f32{ 0, 0 };
+        if (held[0]) mv = .{ mv[0] + fwd[0], mv[1] + fwd[1] };
+        if (held[2]) mv = .{ mv[0] - fwd[0], mv[1] - fwd[1] };
+        if (held[3]) mv = .{ mv[0] + right[0], mv[1] + right[1] };
+        if (held[1]) mv = .{ mv[0] - right[0], mv[1] - right[1] };
+        cam.center[0] += mv[0] * cam.dist * dt * 0.8;
+        cam.center[1] += mv[1] * cam.dist * dt * 0.8;
+
+        g.viewport(0, 0, @intCast(size.width), @intCast(size.height));
+        g.clearColor(0.18, 0.2, 0.24, 1);
+        g.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+        const eye = [3]f32{
+            cam.center[0] + cam.dist * @cos(cam.pitch) * @cos(cam.yaw),
+            cam.center[1] + cam.dist * @cos(cam.pitch) * @sin(cam.yaw),
+            cam.center[2] + cam.dist * @sin(cam.pitch),
+        };
+        const aspect = @as(f32, @floatFromInt(size.width)) / @as(f32, @floatFromInt(size.height));
+        const vp = mul(perspective(0.8, aspect, cam.radius * 0.01, cam.dist + cam.radius * 10), lookAt(eye, cam.center, .{ 0, 0, 1 }));
+
+        if (play) |pb| {
+            const t: f32 = opts.time orelse blk: {
+                const secs = @as(f32, @floatFromInt(now_ms - start_ms)) / 1000.0;
+                break :blk if (pb.anim.duration > 0) @mod(secs, pb.anim.duration) else 0;
+            };
+            scene.pose(pb.nf, pb.anim, t);
+        }
+
+        g.useProgram(gfx.prog);
+        g.uniformMatrix4fv(gfx.u_vp, 1, 0, &vp);
+        g.uniform1i(gfx.u_tex, 0);
+        g.activeTexture(gl.TEXTURE0);
+        for (scene.draws.items) |d| {
+            if (d.skin) |sk| {
+                var mats: [max_bones]Mat4 = undefined;
+                for (sk.bones, sk.offsets, 0..) |bn, off, i| mats[i] = mul(scene.world[bn], off);
+                g.uniform1i(gfx.u_skinned, 1);
+                g.uniformMatrix4fv(gfx.u_bones, @intCast(sk.bones.len), 0, @ptrCast(&mats));
+            } else {
+                g.uniform1i(gfx.u_skinned, 0);
+                g.uniformMatrix4fv(gfx.u_model, 1, 0, if (d.dynamic) &scene.world[d.block] else &d.world);
+            }
+            g.uniform4f(gfx.u_tint, d.tint[0], d.tint[1], d.tint[2], d.tint[3]);
+            g.uniform1f(gfx.u_cut, d.alpha_cut);
+            g.bindTexture(gl.TEXTURE_2D, d.texture);
+            if (d.blend) g.enable(gl.BLEND) else g.disable(gl.BLEND);
+            g.bindVertexArray(d.vao);
+            g.drawElements(gl.TRIANGLES, d.index_count, d.index_type, null);
+        }
+
+        frame += 1;
+        if (opts.screenshot) |w| {
+            if (frame < 3) {
+                gfx.ctx.swap();
+                continue;
+            }
+            const px = try gpa.alloc(u8, size.width * size.height * 4);
+            defer gpa.free(px);
+            g.pixelStorei(gl.PACK_ALIGNMENT, 1);
+            g.readPixels(0, 0, @intCast(size.width), @intCast(size.height), gl.RGBA, gl.UNSIGNED_BYTE, px.ptr);
+            try w.print("P6\n{d} {d}\n255\n", .{ size.width, size.height });
+            var y: usize = size.height;
+            while (y > 0) {
+                y -= 1;
+                for (0..size.width) |x| try w.writeAll(px[(y * size.width + x) * 4 ..][0..3]);
+            }
+            return;
+        }
+        gfx.ctx.swap();
+    }
+}
+
+/// Views one model (`.nif` or `.bfm`), optionally playing an animation.
 pub fn run(gpa: std.mem.Allocator, vfs: *vfs_mod.Vfs, path: []const u8, opts: Options) !void {
     // Accept a .bfm manifest as well as a .nif.
     var nif_path: []const u8 = path;
@@ -585,150 +956,78 @@ pub fn run(gpa: std.mem.Allocator, vfs: *vfs_mod.Vfs, path: []const u8, opts: Op
         std.debug.print("animation {s}: {d:.2}s, {d} bones\n", .{ anim_path, anim.?.duration, anim.?.bones.len });
     }
 
-    const plat = platform.Platform.init() catch {
-        std.debug.print("SDL init failed: {s}\n", .{platform.lastError()});
-        return error.PlatformInit;
-    };
-    defer plat.deinit();
-    const win = platform.Window.createGl("zootycon2 viewer", opts.width, opts.height) catch {
-        std.debug.print("window creation failed: {s}\n", .{platform.lastError()});
-        return error.PlatformWindow;
-    };
-    defer win.destroy();
-    const ctx = win.glCreateContext() catch {
-        std.debug.print("OpenGL 3.3 context failed: {s}\n", .{platform.lastError()});
-        return error.GlContext;
-    };
-    defer ctx.destroy();
+    var gfx: Gfx = undefined;
+    try gfx.open(opts);
+    defer gfx.close();
 
-    var g: Gl = .{};
-    if (g.load(platform.glGetProcAddress)) |missing| {
-        std.debug.print("missing OpenGL function: {s}\n", .{missing});
-        return error.GlMissing;
-    }
-    if (opts.screenshot == null) {
-        if (g.getString(gl.RENDERER)) |r| std.debug.print("renderer: {s}\n", .{r});
-    }
-
-    const prog = try makeProgram(&g);
-    const u_model = g.getUniformLocation(prog, "uModel");
-    const u_vp = g.getUniformLocation(prog, "uViewProj");
-    const u_tex = g.getUniformLocation(prog, "uTex");
-    const u_tint = g.getUniformLocation(prog, "uTint");
-    const u_cut = g.getUniformLocation(prog, "uAlphaCut");
-    const u_skinned = g.getUniformLocation(prog, "uSkinned");
-    const u_bones = g.getUniformLocation(prog, "uBones");
-
-    var scene = try Scene.init(gpa, &g, vfs);
+    var scene = try Scene.init(gpa, &gfx.g, vfs);
     defer scene.deinit();
     try scene.addNif(&nf);
     if (scene.draws.items.len == 0) return error.NothingToDraw;
     std.debug.print("{d} meshes, {d} textures missing\n", .{ scene.draws.items.len, scene.missing_textures });
 
-    const center = [3]f32{
-        (scene.min[0] + scene.max[0]) / 2,
-        (scene.min[1] + scene.max[1]) / 2,
-        (scene.min[2] + scene.max[2]) / 2,
-    };
     const ext = [3]f32{ scene.max[0] - scene.min[0], scene.max[1] - scene.min[1], scene.max[2] - scene.min[2] };
     const radius = @max(0.001, @sqrt(ext[0] * ext[0] + ext[1] * ext[1] + ext[2] * ext[2]) / 2);
+    const cam: Camera = .{
+        .center = .{
+            (scene.min[0] + scene.max[0]) / 2,
+            (scene.min[1] + scene.max[1]) / 2,
+            (scene.min[2] + scene.max[2]) / 2,
+        },
+        .radius = radius,
+        .dist = radius * 2.4,
+    };
+    const play: ?Playback = if (anim) |*a| .{ .nf = &nf, .anim = a } else null;
+    try loop(gpa, &gfx, &scene, cam, play, opts);
+}
 
-    var yaw: f32 = -0.8;
-    var pitch: f32 = 0.45;
-    var dist: f32 = radius * 2.4;
-    var dragging = false;
-    var last_x: f32 = 0;
-    var last_y: f32 = 0;
-    var size = win.pixelSize();
+/// Views a whole map: terrain plus every placed object that has a model.
+pub fn runMap(gpa: std.mem.Allocator, vfs: *vfs_mod.Vfs, path: []const u8, opts: Options) !void {
+    const map_bytes = try vfs.read(gpa, path);
+    defer gpa.free(map_bytes);
+    var mp = try map_mod.parse(gpa, map_bytes);
+    defer mp.deinit();
 
-    g.enable(gl.DEPTH_TEST);
-    g.depthFunc(gl.LEQUAL);
-    g.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    const dir = std.fs.path.dirname(path) orelse "";
+    const terr_path = try std.fs.path.join(gpa, &.{ dir, mp.terrain_file });
+    defer gpa.free(terr_path);
+    const terr_bytes = try vfs.read(gpa, terr_path);
+    defer gpa.free(terr_bytes);
+    var terr = try terrain_mod.parse(gpa, terr_bytes);
+    defer terr.deinit();
 
-    var frame: u32 = 0;
-    const start_ms = plat.ticksMs();
-    main: while (true) {
-        while (plat.pollEvent()) |ev| switch (ev) {
-            .quit => break :main,
-            .key_down => |k| if (k.scancode == platform.scancode_escape) break :main,
-            .resized => |r| size = .{ .width = @max(r.width, 1), .height = @max(r.height, 1) },
-            .mouse_button => |b| if (b.button == 1) {
-                dragging = b.down;
-                last_x = b.x;
-                last_y = b.y;
-            },
-            .mouse_move => |m| {
-                if (dragging) {
-                    yaw -= (m.x - last_x) * 0.01;
-                    pitch = std.math.clamp(pitch + (m.y - last_y) * 0.01, -1.5, 1.5);
-                }
-                last_x = m.x;
-                last_y = m.y;
-            },
-            .mouse_wheel => |w| dist = std.math.clamp(dist * std.math.pow(f32, 0.9, w.dy), radius * 0.2, radius * 20),
-            else => {},
+    var gfx: Gfx = undefined;
+    try gfx.open(opts);
+    defer gfx.close();
+
+    var scene = try Scene.init(gpa, &gfx.g, vfs);
+    defer scene.deinit();
+    scene.interactive = false;
+    try scene.addTerrain(&terr, .{ 0.42, 0.55, 0.32, 1 });
+
+    var placed: usize = 0;
+    var missing: usize = 0;
+    for (mp.objects) |o| {
+        const draws = (try scene.loadModel(o.model)) orelse {
+            missing += 1;
+            continue;
         };
-
-        g.viewport(0, 0, @intCast(size.width), @intCast(size.height));
-        g.clearColor(0.18, 0.2, 0.24, 1);
-        g.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-
-        const eye = [3]f32{
-            center[0] + dist * @cos(pitch) * @cos(yaw),
-            center[1] + dist * @cos(pitch) * @sin(yaw),
-            center[2] + dist * @sin(pitch),
-        };
-        const aspect = @as(f32, @floatFromInt(size.width)) / @as(f32, @floatFromInt(size.height));
-        const vp = mul(perspective(0.8, aspect, radius * 0.01, dist + radius * 10), lookAt(eye, center, .{ 0, 0, 1 }));
-
-        if (anim) |*an| {
-            const t: f32 = opts.time orelse blk: {
-                const secs = @as(f32, @floatFromInt(plat.ticksMs() - start_ms)) / 1000.0;
-                break :blk if (an.duration > 0) @mod(secs, an.duration) else 0;
-            };
-            scene.pose(&nf, an, t);
-        }
-
-        g.useProgram(prog);
-        g.uniformMatrix4fv(u_vp, 1, 0, &vp);
-        g.uniform1i(u_tex, 0);
-        g.activeTexture(gl.TEXTURE0);
-        for (scene.draws.items) |d| {
-            if (d.skin) |sk| {
-                var mats: [max_bones]Mat4 = undefined;
-                for (sk.bones, sk.offsets, 0..) |bn, off, i| mats[i] = mul(scene.world[bn], off);
-                g.uniform1i(u_skinned, 1);
-                g.uniformMatrix4fv(u_bones, @intCast(sk.bones.len), 0, @ptrCast(&mats));
-            } else {
-                g.uniform1i(u_skinned, 0);
-                g.uniformMatrix4fv(u_model, 1, 0, &scene.world[d.block]);
-            }
-            g.uniform4f(u_tint, d.tint[0], d.tint[1], d.tint[2], d.tint[3]);
-            g.uniform1f(u_cut, d.alpha_cut);
-            g.bindTexture(gl.TEXTURE_2D, d.texture);
-            if (d.blend) g.enable(gl.BLEND) else g.disable(gl.BLEND);
-            g.bindVertexArray(d.vao);
-            g.drawElements(gl.TRIANGLES, d.index_count, gl.UNSIGNED_SHORT, null);
-        }
-
-        frame += 1;
-        if (opts.screenshot) |w| {
-            if (frame < 3) {
-                ctx.swap();
-                continue;
-            }
-            const px = try gpa.alloc(u8, size.width * size.height * 4);
-            defer gpa.free(px);
-            g.pixelStorei(gl.PACK_ALIGNMENT, 1);
-            g.readPixels(0, 0, @intCast(size.width), @intCast(size.height), gl.RGBA, gl.UNSIGNED_BYTE, px.ptr);
-            try w.print("P6\n{d} {d}\n255\n", .{ size.width, size.height });
-            var y: usize = size.height;
-            while (y > 0) {
-                y -= 1;
-                for (0..size.width) |x| try w.writeAll(px[(y * size.width + x) * 4 ..][0..3]);
-            }
-            return;
-        }
-        ctx.swap();
+        const m = fromTransform(.{ .translation = o.position, .rotation = o.rotation, .scale = o.scale });
+        try scene.place(draws, m);
+        placed += 1;
     }
+    std.debug.print("{s}: {d}x{d} terrain, {d} objects placed, {d} without a model, {d} textures missing\n", .{
+        path, terr.width, terr.height, placed, missing, scene.missing_textures,
+    });
+
+    const cx = terr.world_width / 2;
+    const cy = terr.world_height / 2;
+    const radius = @max(terr.world_width, terr.world_height) / 2;
+    const cam: Camera = .{
+        .center = .{ cx, cy, terr.zAt(cx, cy) },
+        .radius = radius,
+        .dist = radius * 1.3,
+        .pitch = 0.8,
+    };
+    try loop(gpa, &gfx, &scene, cam, null, opts);
 }

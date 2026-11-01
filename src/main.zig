@@ -22,6 +22,7 @@ const usage =
     \\  ddscheck [prefix]           parse every .dds texture and report formats
     \\  nifinfo <path>               print a NIF's scene graph
     \\  view <model> [--anim A] [--time S] [--shot]  view a .nif/.bfm model
+    \\  map <file.zt2> [--shot] [--yaw R] [--pitch R] [--zoom F]  view a map
     \\  mapcheck [prefix]           parse every map and its terrain
     \\  bfcheck [prefix]            parse every .bf animation and report coverage
     \\  nifcheck [prefix]           parse every .nif/.kf and report coverage
@@ -287,7 +288,7 @@ pub fn main(init: std.process.Init) !void {
             gpa.free(px);
         }
         try out.print("{d} textures: dxt1 {d}, dxt3 {d}, dxt5 {d}, rgba8 {d}; {d} cube maps; {d} with partial mip chains; {d} failed\n", .{ names.items.len, counts[0], counts[1], counts[2], counts[3], cubes, short_mips, failed });
-    } else if (std.mem.eql(u8, cmd, "view") and rest.len > 0) {
+    } else if ((std.mem.eql(u8, cmd, "view") or std.mem.eql(u8, cmd, "map")) and rest.len > 0) {
         var shot = false;
         var vopts: zootycon2.viewer.Options = .{};
         var k: usize = 1;
@@ -297,13 +298,25 @@ pub fn main(init: std.process.Init) !void {
             } else if (std.mem.eql(u8, rest[k], "--anim") and k + 1 < rest.len) {
                 k += 1;
                 vopts.anim = rest[k];
+            } else if (std.mem.eql(u8, rest[k], "--yaw") and k + 1 < rest.len) {
+                k += 1;
+                vopts.yaw = try std.fmt.parseFloat(f32, rest[k]);
+            } else if (std.mem.eql(u8, rest[k], "--pitch") and k + 1 < rest.len) {
+                k += 1;
+                vopts.pitch = try std.fmt.parseFloat(f32, rest[k]);
+            } else if (std.mem.eql(u8, rest[k], "--zoom") and k + 1 < rest.len) {
+                k += 1;
+                vopts.zoom = try std.fmt.parseFloat(f32, rest[k]);
             } else if (std.mem.eql(u8, rest[k], "--time") and k + 1 < rest.len) {
                 k += 1;
                 vopts.time = try std.fmt.parseFloat(f32, rest[k]);
             } else return fail("view <model> [--anim <name|path.bf>] [--time <s>] [--shot]\n");
         }
         if (shot) vopts.screenshot = out;
-        try zootycon2.viewer.run(gpa, &vfs, rest[0], vopts);
+        if (std.mem.eql(u8, cmd, "map"))
+            try zootycon2.viewer.runMap(gpa, &vfs, rest[0], vopts)
+        else
+            try zootycon2.viewer.run(gpa, &vfs, rest[0], vopts);
     } else if (std.mem.eql(u8, cmd, "mapcheck")) {
         const prefix = if (rest.len > 0) rest[0] else "maps/";
         var names: std.ArrayList([]const u8) = .empty;

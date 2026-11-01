@@ -37,6 +37,7 @@ pub const RGBA: Enum = 0x1908;
 pub const RGBA8: Enum = 0x8058;
 pub const UNSIGNED_BYTE: Enum = 0x1401;
 pub const UNSIGNED_SHORT: Enum = 0x1403;
+pub const UNSIGNED_INT: Enum = 0x1405;
 pub const FLOAT: Enum = 0x1406;
 pub const TRIANGLES: Enum = 0x0004;
 pub const ARRAY_BUFFER: Enum = 0x8892;
