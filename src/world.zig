@@ -76,6 +76,10 @@ pub const World = struct {
     paths: std.ArrayList(PathTile) = .empty,
     actors: std.ArrayList(Actor) = .empty,
     next_id: u32 = 1,
+    /// Zoo statistics, kept here so they are saved and loaded with the world.
+    income: f64 = 0,
+    guests_total: u32 = 0,
+    views: u32 = 0,
     /// Bumped on every edit so views know to rebuild.
     revision: u32 = 0,
     /// Bumped when actors are added or removed (separately from `revision`,
@@ -123,6 +127,9 @@ pub const World = struct {
         w.environment = try w.str(m.environment);
         w.terrain_file = try w.str(m.terrain_file);
         w.camera = m.camera;
+        w.income = m.income;
+        w.guests_total = m.guests_total;
+        w.views = m.views;
         for (m.objects) |o| _ = try w.addProp(o.model, o.position, o.rotation, o.scale, o.swaps);
         for (m.fences) |f| _ = try w.addFence(f.kind, f.position, f.rotation);
         for (m.paths) |p| _ = try w.addPath(p.texture, p.position, p.width, p.height);
@@ -246,7 +253,7 @@ pub const World = struct {
         try w.writeAll("\t<ZTMapData version=\"0\"");
         try attr(w, "name", self.name);
         try attr(w, "biome", self.biome);
-        try w.writeAll(" />\n\t<ZTWorldMgr version=\"0\"");
+        try w.print(" />\n\t<ZTStatus version=\"0\" zootycon_income=\"{d:.2}\" zootycon_guests=\"{d}\" zootycon_views=\"{d}\" />\n\t<ZTWorldMgr version=\"0\"", .{ self.income, self.guests_total, self.views });
         try attr(w, "environment", self.environment);
         try attr(w, "terrFile", terrain_name);
         try w.writeAll(">");
@@ -333,6 +340,8 @@ test "save and reload round trip" {
     w.name = "mapname:test";
     w.biome = "alpine";
     w.camera = .{ 1, 2, 3 };
+    w.income = 1234.5;
+    w.guests_total = 7;
     const swaps = [_]Swap{.{ .image = "a/b.dds", .layer = "base" }};
     const prop_id = try w.addProp("entities/objects/x", .{ 1, 2, 3 }, yawRotation(0.5), 1.5, &swaps);
     _ = try w.addFence("zoowall", .{ 6, 9, 0 }, 1.5708);
@@ -351,6 +360,8 @@ test "save and reload round trip" {
     var m = try map_mod.parse(gpa, out.written());
     defer m.deinit();
     try std.testing.expectEqualStrings("t.dat", m.terrain_file);
+    try std.testing.expectApproxEqAbs(@as(f64, 1234.5), m.income, 1e-6);
+    try std.testing.expectEqual(@as(u32, 7), m.guests_total);
     try std.testing.expectEqualStrings("alpine", m.biome);
     try std.testing.expectEqual(@as(usize, 1), m.objects.len);
     try std.testing.expectEqualStrings("entities/objects/x", m.objects[0].model);

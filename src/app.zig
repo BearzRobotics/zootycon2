@@ -202,6 +202,9 @@ pub const App = struct {
     /// Entity names visitors are made from (adults and children with a model).
     guest_names: std.ArrayList([]const u8) = .empty,
     arrivals_on: bool = true,
+    /// From `ai/guestmgr.xml`: the visitor cap is base + per_star * stars.
+    guests_base: f32 = 30,
+    guests_per_star: f32 = 20,
     catalog_arena: std.heap.ArenaAllocator,
 
     pub fn deinit(self: *App) void {
@@ -678,6 +681,9 @@ pub const App = struct {
     }
 
     fn saveWorld(self: *App) !void {
+        self.world.income = self.sim.zoo.income;
+        self.world.guests_total = self.sim.zoo.guests_total;
+        self.world.views = self.sim.zoo.views;
         var nb: [64]u8 = undefined;
         const name = self.saveName(&nb);
         const cwd = Io.Dir.cwd();
@@ -725,6 +731,10 @@ pub const App = struct {
         self.synced_terrain_rev = std.math.maxInt(u32);
         self.sim.deinit();
         self.sim = sim_mod.Sim.init(self.gpa, self.opts.seed);
+        self.sim.zoo.income = self.world.income;
+        self.sim.zoo.guests_total = self.world.guests_total;
+        self.sim.zoo.views = self.world.views;
+        self.loadGuestConfig();
         self.installHooks();
         self.say("loaded {s}", .{zt2_path});
     }
@@ -892,10 +902,41 @@ pub const App = struct {
         return null;
     }
 
+    /// Reads the game's guest manager settings (cap, arrival delays, prices).
+    fn loadGuestConfig(self: *App) void {
+        const bytes = self.vfs.read(self.gpa, "ai/guestmgr.xml") catch return;
+        defer self.gpa.free(bytes);
+        var arena: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena.deinit();
+        const root = xml.parse(arena.allocator(), bytes, null) catch return;
+        const f = struct {
+            fn get(e: *const xml.Element, name: []const u8, default: f32) f32 {
+                const v = e.attr(name) orelse return default;
+                return std.fmt.parseFloat(f32, std.mem.trim(u8, v, " ")) catch default;
+            }
+        };
+        self.guests_base = f.get(root, "MaxGuestsBase", self.guests_base);
+        self.guests_per_star = f.get(root, "MaxGuestsPerStar", self.guests_per_star);
+        self.sim.spawn_delay = .{ f.get(root, "MinDelaySecs", 1), f.get(root, "MaxDelaySecs", 6) };
+        self.sim.adult_price = f.get(root, "NormalAdultAdmission", 24);
+        self.sim.child_price = f.get(root, "NormalChildAdmission", 12);
+    }
+
+    /// Star rating from how happy guests are: 1 to 5.
+    pub fn stars(self: *const App) f32 {
+        const h = self.sim.happiness();
+        return std.math.clamp(1 + @floor(h / 25.0), 1, 5);
+    }
+
     fn installHooks(self: *App) void {
         self.sim.hooks = .{ .ctx = self, .brain = hookBrain, .anim_len = hookAnimLen };
         self.sim.guest_binders = self.guest_names.items;
-        self.sim.max_guests = if (self.arrivals_on) 50 else 0;
+        self.updateGuestCap();
+    }
+
+    fn updateGuestCap(self: *App) void {
+        const cap = self.guests_base + self.guests_per_star * self.stars();
+        self.sim.max_guests = if (self.arrivals_on) @intFromFloat(cap) else 0;
     }
 
     // ------------------------------------------------------- virtual input
@@ -1099,7 +1140,7 @@ pub const App = struct {
                     },
                     sc.g => {
                         self.arrivals_on = !self.arrivals_on;
-                        self.sim.max_guests = if (self.arrivals_on) 50 else 0;
+                        self.updateGuestCap();
                         self.say("guest arrivals {s}", .{if (self.arrivals_on) "on" else "off"});
                     },
                     sc.f2 => self.jumpPhase(-1),
@@ -1414,8 +1455,8 @@ pub const App = struct {
 
         // Zoo statistics: guests, takings, how happy they are.
         const z = &self.sim.zoo;
-        const stats = std.fmt.bufPrint(&buf, "GUESTS {d}   TAKINGS ${d:.0}   VIEWS {d}   HAPPY {d:.0}", .{
-            self.sim.liveGuests(), z.income, z.views, self.sim.happiness(),
+        const stats = std.fmt.bufPrint(&buf, "GUESTS {d}/{d}   TAKINGS ${d:.0}   VIEWS {d}   HAPPY {d:.0}   STARS {d:.0}", .{
+            self.sim.liveGuests(), self.sim.max_guests, z.income, z.views, self.sim.happiness(), self.stars(),
         }) catch "";
         const stw = viewer.Ui.textWidth(stats, scale);
         try ui.label(ui.width - stw - pad, pad + line + 2 * scale, scale, stats, white);
@@ -1574,6 +1615,7 @@ pub const App = struct {
 
         // Simulation.
         if (self.opts.sim) {
+            self.updateGuestCap();
             if (!self.paused) self.sim.advance(&self.world, ctx.dt * self.speed);
             for (self.actor_ids.items, 0..) |id, i| {
                 const ag = self.sim.agentFor(id) orelse continue;
@@ -1676,6 +1718,10 @@ pub fn run(gpa: std.mem.Allocator, io: Io, vfs: *vfs_mod.Vfs, path: []const u8, 
         .catalog_arena = .init(gpa),
     };
     defer app.deinit();
+    app.sim.zoo.income = app.world.income;
+    app.sim.zoo.guests_total = app.world.guests_total;
+    app.sim.zoo.views = app.world.views;
+    app.loadGuestConfig();
     app.installHooks();
     try app.buildCatalogs();
     app.runScript(opts.script);

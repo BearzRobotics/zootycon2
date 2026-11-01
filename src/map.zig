@@ -75,6 +75,10 @@ pub const Map = struct {
     fences: []const Fence,
     paths: []const PathDecal,
     actors: []const Actor,
+    /// Zoo statistics saved by this engine (zero in the game's own maps).
+    income: f64 = 0,
+    guests_total: u32 = 0,
+    views: u32 = 0,
 
     pub fn deinit(self: *Map) void {
         self.arena.deinit();
@@ -273,6 +277,14 @@ pub fn parse(gpa: std.mem.Allocator, data: []const u8) Error!Map {
     var col: Collector = .{ .a = a };
     try col.visit(root);
 
+    var income: f64 = 0;
+    var guests_total: u32 = 0;
+    var views: u32 = 0;
+    if (root.child("ZTStatus")) |st| {
+        income = attrFloat(st, "zootycon_income", 0);
+        guests_total = @intFromFloat(attrFloat(st, "zootycon_guests", 0));
+        views = @intFromFloat(attrFloat(st, "zootycon_views", 0));
+    }
     const objects = try col.list.toOwnedSlice(a);
     const fences = try col.fences.toOwnedSlice(a);
     const paths = try col.paths.toOwnedSlice(a);
@@ -288,6 +300,9 @@ pub fn parse(gpa: std.mem.Allocator, data: []const u8) Error!Map {
         .fences = fences,
         .paths = paths,
         .actors = actors,
+        .income = income,
+        .guests_total = guests_total,
+        .views = views,
     };
 }
 
