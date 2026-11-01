@@ -68,6 +68,8 @@ pub const Actor = struct {
     swaps: []const Swap = &.{},
 };
 
+pub const starting_cash: f64 = 20000;
+
 pub const Map = struct {
     arena: std.heap.ArenaAllocator,
     name: []const u8,
@@ -295,11 +297,12 @@ pub fn parse(gpa: std.mem.Allocator, data: []const u8) Error!Map {
     var col: Collector = .{ .a = a };
     try col.visit(root);
 
-    var income: f64 = 0;
+    // A fresh map starts with a budget; saves carry their own balance.
+    var income: f64 = starting_cash;
     var guests_total: u32 = 0;
     var views: u32 = 0;
     if (root.child("ZTStatus")) |st| {
-        income = attrFloat(st, "zootycon_income", 0);
+        income = attrFloat(st, "zootycon_income", starting_cash);
         guests_total = @intFromFloat(attrFloat(st, "zootycon_guests", 0));
         views = @intFromFloat(attrFloat(st, "zootycon_views", 0));
     }

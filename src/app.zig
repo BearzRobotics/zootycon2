@@ -120,7 +120,7 @@ const Sel = struct { kind: SelKind, id: u32 };
 /// Something the undo key can reverse.
 const UndoOp = union(enum) {
     /// Remove records that were added.
-    added: []u32,
+    added: struct { ids: []u32, cost: f64 },
     /// Put back a removed record.
     removed_prop: world_mod.Prop,
     removed_fence: world_mod.Fence,
@@ -266,7 +266,7 @@ pub const App = struct {
     catalog_arena: std.heap.ArenaAllocator,
 
     pub fn deinit(self: *App) void {
-        for (self.undo.items) |op| if (op == .added) self.gpa.free(op.added);
+        for (self.undo.items) |op| if (op == .added) self.gpa.free(op.added.ids);
         self.undo.deinit(self.gpa);
         self.input_cmds.deinit(self.gpa);
         self.hits.deinit(self.gpa);
@@ -597,17 +597,51 @@ pub const App = struct {
         return @round(v / grid) * grid;
     }
 
-    fn pushAdded(self: *App, ids: []const u32) void {
+    fn pushAdded(self: *App, ids: []const u32, cost: f64) void {
         const copy = self.gpa.dupe(u32, ids) catch return;
-        self.undo.append(self.gpa, .{ .added = copy }) catch self.gpa.free(copy);
+        self.undo.append(self.gpa, .{ .added = .{ .ids = copy, .cost = cost } }) catch self.gpa.free(copy);
+    }
+
+    /// Purchase price of an entity: the `cost` of its `ZTEconomyComponent`
+    /// (most specific binder wins), or `fallback` when the data has none.
+    fn costOf(self: *App, name: []const u8, fallback: f64) f64 {
+        const b = self.reg.get(name) orelse return fallback;
+        const ch = self.reg.chain(self.gpa, b) catch return fallback;
+        defer self.gpa.free(ch);
+        var i = ch.len;
+        while (i > 0) {
+            i -= 1;
+            if (findCost(ch[i].root)) |v| return v;
+        }
+        return fallback;
+    }
+
+    fn findCost(e: *const xml.Element) ?f64 {
+        if (std.ascii.eqlIgnoreCase(e.name, "ZTEconomyComponent")) {
+            if (e.attr("cost")) |c| return std.fmt.parseFloat(f64, c) catch null;
+        }
+        for (e.children) |c| if (findCost(c)) |v| return v;
+        return null;
+    }
+
+    /// Takes `cost` from the budget; refuses (and says so) when it cannot be paid.
+    fn charge(self: *App, cost: f64, what: []const u8) bool {
+        if (cost <= 0) return true;
+        if (self.sim.zoo.income < cost) {
+            self.say("cannot afford {s}: ${d:.0}, have ${d:.0}", .{ what, cost, self.sim.zoo.income });
+            return false;
+        }
+        self.sim.zoo.income -= cost;
+        return true;
     }
 
     fn placeProp(self: *App, at: [3]f32) !void {
         if (self.props.items.len == 0) return;
         const model = self.props.items[self.prop_i];
+        if (!self.charge(prop_cost, std.fs.path.basename(model))) return;
         const id = try self.world.addProp(model, at, world_mod.yawRotation(self.yaw), 1.0, &.{});
-        self.pushAdded(&.{id});
-        self.say("placed {s}", .{std.fs.path.basename(model)});
+        self.pushAdded(&.{id}, prop_cost);
+        self.say("placed {s} (${d:.0})", .{ std.fs.path.basename(model), prop_cost });
     }
 
     fn placeActor(self: *App, at: [3]f32) !void {
@@ -618,18 +652,22 @@ pub const App = struct {
             return;
         };
         _ = def;
+        const cost = self.costOf(name, 100);
+        if (!self.charge(cost, name)) return;
         const id = try self.world.addActor(name, at, world_mod.yawRotation(self.yaw), &.{});
-        self.pushAdded(&.{id});
-        self.say("placed {s}", .{name});
+        self.pushAdded(&.{id}, cost);
+        self.say("placed {s} (${d:.0})", .{ name, cost });
     }
 
     fn placeFood(self: *App, at: [3]f32) !void {
         if (self.food_names.items.len == 0) return;
         const name = self.food_names.items[self.food_i];
         const m = viewer.binderModel(self.gpa, &self.reg, name, "mainObj") orelse return;
+        const cost = self.costOf(name, 50);
+        if (!self.charge(cost, name)) return;
         const id = try self.world.addPropEx(m.file, at, world_mod.yawRotation(self.yaw), m.scale, &.{}, name, 100);
-        self.pushAdded(&.{id});
-        self.say("placed {s}", .{name});
+        self.pushAdded(&.{id}, cost);
+        self.say("placed {s} (${d:.0})", .{ name, cost });
     }
 
     /// The model a prop is drawn with: feeders show a full or empty look.
@@ -644,6 +682,8 @@ pub const App = struct {
     }
 
     const refill_cost: f64 = 10;
+    const prop_cost: f64 = 50;
+    const path_cost: f64 = 5;
 
     /// Refills the selected feeder (Shift: every feeder) for a small fee.
     fn refill(self: *App) void {
@@ -666,8 +706,9 @@ pub const App = struct {
         for (self.world.paths.items) |p| {
             if (@abs(p.position[0] - x) < 1.0 and @abs(p.position[1] - y) < 1.0) return;
         }
+        if (!self.charge(path_cost, "path")) return;
         const id = try self.world.addPath(self.path_textures.items[self.path_i], .{ x, y }, 6, 6);
-        self.pushAdded(&.{id});
+        self.pushAdded(&.{id}, path_cost);
     }
 
     fn placeFenceLine(self: *App, a: [2]f32, b: [2]f32) !void {
@@ -682,6 +723,9 @@ pub const App = struct {
         const theta: f32 = if (horizontal) (if (dx >= 0) 0 else std.math.pi) else (if (dy >= 0) std.math.pi / 2.0 else 3.0 * std.math.pi / 2.0);
         var ids: std.ArrayList(u32) = .empty;
         defer ids.deinit(self.gpa);
+        const each = self.costOf(kind, 20);
+        const total = each * @as(f64, @floatFromInt(n));
+        if (!self.charge(total, kind)) return;
         for (0..n) |i| {
             const k = @as(f32, @floatFromInt(i)) * 3.0;
             const x = a[0] + @cos(theta) * k;
@@ -689,8 +733,8 @@ pub const App = struct {
             const id = try self.world.addFence(kind, .{ x, y, 0 }, theta);
             try ids.append(self.gpa, id);
         }
-        self.pushAdded(ids.items);
-        self.say("fence: {d} x {s}", .{ n, kind });
+        self.pushAdded(ids.items, total);
+        self.say("fence: {d} x {s} (${d:.0})", .{ n, kind, total });
     }
 
     fn deleteSelected(self: *App) void {
@@ -720,9 +764,10 @@ pub const App = struct {
     fn doUndo(self: *App) void {
         const op = self.undo.pop() orelse return self.say("nothing to undo", .{});
         switch (op) {
-            .added => |ids| {
-                for (ids) |id| _ = self.world.remove(id);
-                self.gpa.free(ids);
+            .added => |a| {
+                for (a.ids) |id| _ = self.world.remove(id);
+                self.sim.zoo.income += a.cost;
+                self.gpa.free(a.ids);
             },
             .removed_prop => |p| _ = self.world.addProp(p.model, p.position, p.rotation, p.scale, p.swaps) catch {},
             .removed_fence => |f| _ = self.world.addFence(f.kind, f.position, f.rotation) catch {},
@@ -847,7 +892,7 @@ pub const App = struct {
         self.world = fresh;
         self.look.deinit(self.gpa);
         self.look = try viewer.terrainLook(self.gpa, self.vfs, self.scene, &self.world.terrain);
-        for (self.undo.items) |op| if (op == .added) self.gpa.free(op.added);
+        for (self.undo.items) |op| if (op == .added) self.gpa.free(op.added.ids);
         self.undo.clearRetainingCapacity();
         self.selected = null;
         self.fence_start = null;
@@ -1855,7 +1900,7 @@ pub const App = struct {
 
     fn statsText(self: *const App, buf: []u8) []const u8 {
         const z = &self.sim.zoo;
-        return std.fmt.bufPrint(buf, "GUESTS {d}/{d}  TAKINGS ${d:.0}  VIEWS {d}  HAPPY {d:.0}  ANIMALS {d:.0}  STARS {d:.0}", .{
+        return std.fmt.bufPrint(buf, "GUESTS {d}/{d}  MONEY ${d:.0}  VIEWS {d}  HAPPY {d:.0}  ANIMALS {d:.0}  STARS {d:.0}", .{
             self.sim.liveGuests(), self.sim.max_guests, z.income, z.views, self.sim.happiness(), self.sim.animalWelfare(), self.stars(),
         }) catch "";
     }
