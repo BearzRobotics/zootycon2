@@ -267,6 +267,25 @@ pub fn main(init: std.process.Init) !void {
             const px = [3]u8{ @intCast(@as(u32, rgba[pi * 4]) * a / 255), @intCast(@as(u32, rgba[pi * 4 + 1]) * a / 255), @intCast(@as(u32, rgba[pi * 4 + 2]) * a / 255) };
             try out.writeAll(&px);
         }
+    } else if (std.mem.eql(u8, cmd, "typecount")) {
+        // Debug: how many concrete entities sit under each of the first type-path levels.
+        var reg = zootycon2.entity.Registry.init(gpa);
+        defer reg.deinit();
+        try reg.load(&vfs);
+        var counts = std.StringHashMap(u32).init(gpa);
+        defer counts.deinit();
+        var it = reg.binders.valueIterator();
+        while (it.next()) |b| {
+            if (b.*.abstract) continue;
+            const tp = b.*.type_path;
+            if (tp.len < 2) continue;
+            const depth = @min(tp.len, if (rest.len > 0) (std.fmt.parseInt(usize, rest[0], 10) catch 3) else 3);
+            const key = try std.mem.join(gpa, "/", tp[0..depth]);
+            const e = try counts.getOrPutValue(key, 0);
+            e.value_ptr.* += 1;
+        }
+        var cit = counts.iterator();
+        while (cit.next()) |e| try out.print("{d:5} {s}\n", .{ e.value_ptr.*, e.key_ptr.* });
     } else if (std.mem.eql(u8, cmd, "terrstat")) {
         // Debug: height range of a terrain file and how much lies below z = 6 (the base).
         if (rest.len < 1) return fail("terrstat <file.dat>\n");
@@ -284,6 +303,21 @@ pub fn main(init: std.process.Init) !void {
             if (z < 6.0) below += 1;
             if (z < 5.0) below1 += 1;
         }
+        // The most common height (0.05 bins) and how much of the map sits there.
+        var hist = std.AutoHashMap(i32, u32).init(gpa);
+        defer hist.deinit();
+        for (t.z) |z| {
+            const e = try hist.getOrPutValue(@intFromFloat(@round(z * 20)), 0);
+            e.value_ptr.* += 1;
+        }
+        var mode_bin: i32 = 0;
+        var mode_n: u32 = 0;
+        var hit = hist.iterator();
+        while (hit.next()) |e| if (e.value_ptr.* > mode_n) {
+            mode_n = e.value_ptr.*;
+            mode_bin = e.key_ptr.*;
+        };
+        try out.print("mode {d:.2} share {d:.0}% | ", .{ @as(f32, @floatFromInt(mode_bin)) / 20.0, 100.0 * @as(f32, @floatFromInt(mode_n)) / @as(f32, @floatFromInt(t.z.len)) });
         try out.print("{s}: {d}x{d} z {d:.1}..{d:.1} below6 {d:.1}% below5 {d:.1}% stride {d}\n", .{ rest[0], t.width, t.height, lo, hi, 100.0 * @as(f32, @floatFromInt(below)) / @as(f32, @floatFromInt(t.z.len)), 100.0 * @as(f32, @floatFromInt(below1)) / @as(f32, @floatFromInt(t.z.len)), t.stride });
     } else if (std.mem.eql(u8, cmd, "headcheck")) {
         // Debug: where the Link_Head node goes in every animation of a model.

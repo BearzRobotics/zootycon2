@@ -140,6 +140,7 @@ const vs_src: [:0]const u8 =
     \\uniform mat4 uViewProj;
     \\out vec3 vN;
     \\out vec3 vP;
+    \\uniform vec2 uUvScroll;
     \\out vec2 vUv;
     \\void main() {
     \\  mat4 m = uModel;
@@ -150,8 +151,8 @@ const vs_src: [:0]const u8 =
     \\  vec4 w = m * vec4(aPos, 1.0);
     \\  vP = w.xyz;
     \\  vN = mat3(m) * aNormal;
-    \\  vUv = aUv;
-    \\  vUv2 = aUv2;
+    \\  vUv = aUv + uUvScroll;
+    \\  vUv2 = aUv2 - uUvScroll;
     \\  vW = aWeight;
     \\  gl_Position = uViewProj * w;
     \\}
@@ -804,6 +805,8 @@ pub const Draw = struct {
     flat_extra: [3]gl.Uint = .{ 0, 0, 0 },
     /// Second texture for terrain (steep slopes); 0 for ordinary draws.
     texture2: gl.Uint = 0,
+    /// Offset added to texture coordinates (water drifts).
+    uv_scroll: [2]f32 = .{ 0, 0 },
     /// Pose-driven draws read `Scene.world[block]` each frame; others use `world`.
     dynamic: bool,
     index_type: gl.Enum,
@@ -929,9 +932,8 @@ pub const Scene = struct {
     terrain: ?Draw = null,
     /// Draws of animated figures (each refers to an entry of `instances`).
     actor_draws: std.ArrayList(Draw) = .empty,
-    /// The water surface (one quad over the map), if the map has water.
-    water: ?Draw = null,
-    water_size: [2]f32 = .{ 0, 0 },
+    /// The map's lakes, rivers and seas, one surface mesh per body of water.
+    water: std.ArrayList(Draw) = .empty,
     /// Translucent extras drawn last: previews, highlights.
     overlay: std.ArrayList(Draw) = .empty,
     /// Per model path: horizontal radius and height from its vertices.
@@ -992,7 +994,8 @@ pub const Scene = struct {
         self.draws.deinit(self.gpa);
         self.gpa.free(self.world);
         if (self.sky) |*sk| sk.deinit(self.gpa);
-        if (self.water) |wd| self.freeDraw(wd);
+        for (self.water.items) |wd| self.freeDraw(wd);
+        self.water.deinit(self.gpa);
         self.actor_draws.deinit(self.gpa);
         self.overlay.deinit(self.gpa);
         var bit = self.model_bounds.keyIterator();
@@ -1522,29 +1525,55 @@ pub const Scene = struct {
         };
     }
 
-    /// Builds (or rebuilds) the water surface: a translucent quad over the map
-    /// at `level`, textured and tinted like the main biome's water.
-    pub fn setWater(self: *Scene, width: f32, height: f32, level: f32, tex: gl.Uint, tint: [4]f32) !void {
-        if (self.water) |old| self.freeDraw(old);
-        self.water = null;
-        var buf: [4 * vf]f32 = @splat(0);
-        const corners = [4][2]f32{ .{ 0, 0 }, .{ width, 0 }, .{ width, height }, .{ 0, height } };
-        for (corners, 0..) |c, i| {
-            const o = i * vf;
-            buf[o + 0] = c[0];
-            buf[o + 1] = c[1];
-            buf[o + 2] = level;
-            buf[o + 5] = 1; // normal straight up
-            buf[o + 6] = c[0] / 18.0;
-            buf[o + 7] = c[1] / 18.0;
-            buf[o + 16] = buf[o + 6];
-            buf[o + 17] = buf[o + 7];
-            buf[o + 12] = 1;
-        }
-        const idx = [6]u32{ 0, 1, 2, 0, 2, 3 };
-        const up = self.uploadMeshOwned(&buf, &idx, idx.len * 4);
-        self.water_size = .{ width, height };
-        self.water = .{
+    /// Forgets the current water surfaces.
+    pub fn clearWater(self: *Scene) void {
+        for (self.water.items) |wd| self.freeDraw(wd);
+        self.water.clearRetainingCapacity();
+    }
+
+    /// Adds the surface of one body of water: a translucent quad for every
+    /// terrain tile that touches the body, at its level. The depth test hides
+    /// the parts that lie under dry ground.
+    pub fn addWater(self: *Scene, t: *const terrain_mod.Terrain, body: terrain_mod.WaterBody, tex: gl.Uint, tint: [4]f32) !void {
+        const w = t.width;
+        const h = t.height;
+        const inside = try self.gpa.alloc(bool, @as(usize, w) * h);
+        defer self.gpa.free(inside);
+        @memset(inside, false);
+        for (body.verts) |v| if (v < inside.len) {
+            inside[v] = true;
+        };
+        var buf: std.ArrayList(f32) = .empty;
+        defer buf.deinit(self.gpa);
+        var idx: std.ArrayList(u32) = .empty;
+        defer idx.deinit(self.gpa);
+        const sx = t.spacingX();
+        const sy = t.spacingY();
+        for (0..h - 1) |j| for (0..w - 1) |i| {
+            const a = j * w + i;
+            if (!(inside[a] or inside[a + 1] or inside[a + w] or inside[a + w + 1])) continue;
+            // Skip tiles whose four corners are all above the surface.
+            if (t.z[a] > body.level and t.z[a + 1] > body.level and t.z[a + w] > body.level and t.z[a + w + 1] > body.level) continue;
+            const base: u32 = @intCast(buf.items.len / vf);
+            const corners = [4][2]usize{ .{ i, j }, .{ i + 1, j }, .{ i + 1, j + 1 }, .{ i, j + 1 } };
+            for (corners) |c| {
+                var vert: [vf]f32 = @splat(0);
+                vert[0] = @as(f32, @floatFromInt(c[0])) * sx;
+                vert[1] = @as(f32, @floatFromInt(c[1])) * sy;
+                vert[2] = body.level;
+                vert[5] = 1;
+                vert[6] = vert[0] / 18.0;
+                vert[7] = vert[1] / 18.0;
+                vert[16] = vert[0] / 24.0;
+                vert[17] = vert[1] / 24.0;
+                vert[12] = 1;
+                try buf.appendSlice(self.gpa, &vert);
+            }
+            try idx.appendSlice(self.gpa, &.{ base, base + 1, base + 2, base, base + 2, base + 3 });
+        };
+        if (idx.items.len == 0) return;
+        const up = self.uploadMeshOwned(buf.items, idx.items.ptr, idx.items.len * 4);
+        try self.water.append(self.gpa, .{
             .light_set = 0,
             .owned = up.bufs,
             .dynamic = false,
@@ -1552,39 +1581,19 @@ pub const Scene = struct {
             .block = 0,
             .skin = null,
             .vao = up.vao,
-            .index_count = 6,
+            .index_count = @intCast(idx.items.len),
             .world = identity,
             .texture = tex,
             .tint = tint,
             .blend = true,
             .alpha_cut = 0,
             .depth_write = false,
-            .bound = .{ 0, 0, level, -1 },
-        };
+        });
     }
 
-    /// Slides the water texture so the surface drifts.
+    /// Slides the water textures so the surface drifts.
     pub fn scrollWater(self: *Scene, secs: f32) void {
-        const wd = self.water orelse return;
-        var buf: [4 * vf]f32 = @splat(0);
-        const corners = [4][2]f32{ .{ 0, 0 }, .{ self.water_size[0], 0 }, .{ self.water_size[0], self.water_size[1] }, .{ 0, self.water_size[1] } };
-        // The level is stored in the first vertex; keep it by reading nothing:
-        // the quad's z never changes, so it is rewritten from the draw's bound.
-        const level: f32 = wd.bound[2];
-        for (corners, 0..) |c, i| {
-            const o = i * vf;
-            buf[o + 0] = c[0];
-            buf[o + 1] = c[1];
-            buf[o + 2] = level;
-            buf[o + 5] = 1;
-            buf[o + 6] = c[0] / 18.0 + secs * 0.012;
-            buf[o + 7] = c[1] / 18.0 + secs * 0.007;
-            buf[o + 16] = c[0] / 24.0 - secs * 0.008;
-            buf[o + 17] = c[1] / 24.0 + secs * 0.011;
-            buf[o + 12] = 1;
-        }
-        self.g.bindBuffer(gl.ARRAY_BUFFER, wd.owned[0]);
-        self.g.bufferData(gl.ARRAY_BUFFER, @intCast(buf.len * 4), &buf, gl.DYNAMIC_DRAW);
+        for (self.water.items) |*wd| wd.uv_scroll = .{ secs * 0.012, secs * 0.007 };
     }
 
     /// Drapes path tiles over the terrain: one blended mesh per texture.
@@ -2141,6 +2150,7 @@ pub const Gfx = struct {
     u_terrain: gl.Int,
     u_decal: gl.Int,
     u_decal_mode: gl.Int,
+    u_uvscroll: gl.Int,
     u_flat: [3]gl.Int,
     u_lightset: gl.Int,
     u_amb: gl.Int,
@@ -2245,6 +2255,7 @@ pub const Gfx = struct {
         self.u_terrain = g.getUniformLocation(self.prog, "uTerrain");
         self.u_decal = g.getUniformLocation(self.prog, "uDecal");
         self.u_decal_mode = g.getUniformLocation(self.prog, "uDecalMode");
+        self.u_uvscroll = g.getUniformLocation(self.prog, "uUvScroll");
         self.u_flat = .{
             g.getUniformLocation(self.prog, "uFlat1"),
             g.getUniformLocation(self.prog, "uFlat2"),
@@ -2801,6 +2812,7 @@ const DrawState = struct {
     vao: gl.Uint = std.math.maxInt(u32),
     tint: [4]f32 = .{ -1, -1, -1, -1 },
     cut: f32 = -1,
+    scroll: [2]f32 = .{ -1, -1 },
 };
 
 fn drawItem(gfx: *Gfx, scene: *Scene, d: Draw, fr: *const Frustum, st: *DrawState) void {
@@ -2829,6 +2841,10 @@ fn drawItem(gfx: *Gfx, scene: *Scene, d: Draw, fr: *const Frustum, st: *DrawStat
             g.bindTexture(gl.TEXTURE_2D, tx);
             st.flat[i] = tx;
         };
+    }
+    if (d.uv_scroll[0] != st.scroll[0] or d.uv_scroll[1] != st.scroll[1]) {
+        g.uniform2f(gfx.u_uvscroll, d.uv_scroll[0], d.uv_scroll[1]);
+        st.scroll = d.uv_scroll;
     }
     const mode: i32 = if (d.decal != 0) d.decal_mode else 0;
     if (mode != st.decal_mode) {
@@ -3184,7 +3200,7 @@ pub fn loopWith(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Came
         if (scene.terrain) |t| drawItem(gfx, scene, t, &frustum, &dstate);
         for (scene.draws.items) |d| drawItem(gfx, scene, d, &frustum, &dstate);
         for (scene.actor_draws.items) |d| drawItem(gfx, scene, d, &frustum, &dstate);
-        if (scene.water) |wd| drawItem(gfx, scene, wd, &frustum, &dstate);
+        for (scene.water.items) |wd| drawItem(gfx, scene, wd, &frustum, &dstate);
         for (scene.overlay.items) |d| drawItem(gfx, scene, d, &frustum, &dstate);
         if (use_post) {
             const near = nearFor(cam);
@@ -3381,45 +3397,42 @@ pub const TerrainLook = struct {
     }
 };
 
-/// Sets up the water surface from the map's main biome (`biomes/<name>.xml`
-/// has the water texture and colour).
+/// Builds the map's water: each body of water, styled by its own biome
+/// (`biomes/<name>.xml` has the water texture and colour).
 pub fn waterLook(gpa: std.mem.Allocator, vfs: *vfs_mod.Vfs, scene: *Scene, terr: *const terrain_mod.Terrain) !void {
-    var counts: [256]usize = @splat(0);
-    for (terr.paint) |b| counts[b] += 1;
-    var best: usize = 0;
-    for (terr.biomes, 0..) |_, bi| if (counts[bi] > counts[best]) {
-        best = bi;
-    };
-    var tex = scene.white;
-    var tint = [4]f32{ 0.78, 0.9, 1.0, 0.55 };
-    if (best < terr.biomes.len) {
-        var path_buf: [128]u8 = undefined;
-        if (std.fmt.bufPrint(&path_buf, "biomes/{s}.xml", .{terr.biomes[best]})) |bpath| {
-            if (vfs.read(gpa, bpath)) |bytes| {
-                defer gpa.free(bytes);
-                var arena: std.heap.ArenaAllocator = .init(gpa);
-                defer arena.deinit();
-                if (@import("xml.zig").parse(arena.allocator(), bytes, null)) |root| {
-                    if (root.child("water")) |w| {
-                        if (w.child("texture")) |t| if (t.attr("name")) |tn| {
-                            tex = scene.loadTexturePath(tn);
-                        };
-                        if (w.attr("vertexColorMed")) |vc| {
-                            var it = std.mem.tokenizeScalar(u8, vc, ' ');
-                            var comps: [4]f32 = .{ 200, 200, 200, 150 };
-                            var k: usize = 0;
-                            while (it.next()) |tok| : (k += 1) {
-                                if (k >= 4) break;
-                                comps[k] = std.fmt.parseFloat(f32, tok) catch comps[k];
+    scene.clearWater();
+    for (terr.water) |body| {
+        var tex = scene.white;
+        var tint = [4]f32{ 0.78, 0.9, 1.0, 0.55 };
+        if (body.biome < terr.biomes.len) {
+            var path_buf: [128]u8 = undefined;
+            if (std.fmt.bufPrint(&path_buf, "biomes/{s}.xml", .{terr.biomes[body.biome]})) |bpath| {
+                if (vfs.read(gpa, bpath)) |bytes| {
+                    defer gpa.free(bytes);
+                    var arena: std.heap.ArenaAllocator = .init(gpa);
+                    defer arena.deinit();
+                    if (@import("xml.zig").parse(arena.allocator(), bytes, null)) |root| {
+                        if (root.child("water")) |w| {
+                            if (w.child("texture")) |t| if (t.attr("name")) |tn| {
+                                tex = scene.loadTexturePath(tn);
+                            };
+                            if (w.attr("vertexColorMed")) |vc| {
+                                var it = std.mem.tokenizeScalar(u8, vc, ' ');
+                                var comps: [4]f32 = .{ 200, 200, 200, 150 };
+                                var k: usize = 0;
+                                while (it.next()) |tok| : (k += 1) {
+                                    if (k >= 4) break;
+                                    comps[k] = std.fmt.parseFloat(f32, tok) catch comps[k];
+                                }
+                                tint = .{ comps[0] / 255, comps[1] / 255, comps[2] / 255, comps[3] / 255 };
                             }
-                            tint = .{ comps[0] / 255, comps[1] / 255, comps[2] / 255, comps[3] / 255 };
                         }
-                    }
+                    } else |_| {}
                 } else |_| {}
             } else |_| {}
-        } else |_| {}
+        }
+        try scene.addWater(terr, body, tex, tint);
     }
-    try scene.setWater(terr.world_width, terr.world_height, terrain_mod.water_level, tex, tint);
 }
 
 pub fn terrainLook(gpa: std.mem.Allocator, vfs: *vfs_mod.Vfs, scene: *Scene, terr: *const terrain_mod.Terrain) !TerrainLook {

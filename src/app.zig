@@ -69,6 +69,8 @@ pub const Tool = enum {
     flatten,
     actor,
     food,
+    /// Any entity from the buy panel's item tabs (buildings, scenery, toys, shelters, plants...).
+    item,
 
     fn label(self: Tool) []const u8 {
         return switch (self) {
@@ -81,6 +83,7 @@ pub const Tool = enum {
             .flatten => "flatten terrain",
             .actor => "place animal/guest",
             .food => "place food or water",
+            .item => "place item",
         };
     }
 };
@@ -104,7 +107,7 @@ const Alert = struct {
 };
 
 /// Tabs of the buy panel, as in the game's own panel.
-pub const BuyTab = enum { fence, path, building, scenery, animal, food, staff, deform };
+pub const BuyTab = enum { fence, path, building, scenery, animal, food, staff, deform, enrich, shelter, tree, plant, rock };
 
 /// Which full-screen menu is open (if any).
 const Menu = enum { none, pause, maps, saves, settings, finances, new_zoo, save_as, main };
@@ -345,7 +348,10 @@ pub const App = struct {
     buy_tab: BuyTab = .fence,
     buy_scroll: usize = 0,
     buy_rect: [4]f32 = .{ 0, 0, 0, 0 },
-    buy_lists: [8]std.ArrayList(u32) = @splat(.empty),
+    buy_lists: [13]std.ArrayList(u32) = @splat(.empty),
+    /// Every entity offered on the item tabs, by name; lists hold indices into this.
+    item_names: std.ArrayList([]const u8) = .empty,
+    item_sel: usize = 0,
     /// Item icon files by name (`lion_adult_f` -> .../lion_adult_f_icon.dds).
     icons: std.StringHashMapUnmanaged([]const u8) = .empty,
     /// The game's entity info panel: which tab, whether it drew this frame,
@@ -358,6 +364,7 @@ pub const App = struct {
     pub fn deinit(self: *App) void {
         if (self.audio) |*a| a.deinit();
         for (&self.buy_lists) |*l| l.deinit(self.gpa);
+        self.item_names.deinit(self.gpa);
         self.icons.deinit(self.gpa);
         if (self.hud) |*h| {
             h.shell.deinit();
@@ -598,6 +605,11 @@ pub const App = struct {
 
     fn rebuildTerrain(self: *App) !void {
         try self.scene.addTerrain(&self.world.terrain, .{ 1, 1, 1, 1 }, self.look.flat, self.look.steep, self.look.slot_of);
+        // On a blank zoo the sea covers the whole map, so dug-out ground fills with water.
+        const t = &self.world.terrain;
+        if (t.water.len == 1 and t.water[0].verts.len == @as(usize, t.width) * t.height) {
+            viewer.waterLook(self.gpa, self.vfs, self.scene, t) catch {};
+        }
     }
 
     fn syncScene(self: *App, secs: f32) !void {
@@ -804,6 +816,22 @@ pub const App = struct {
         const cost = self.costOf(name, 100);
         if (!self.charge(cost, name, if (sim_mod.classify(name) == .person) .staff else .animals)) return;
         const id = try self.world.addActor(name, at, world_mod.yawRotation(self.yaw), &.{});
+        self.pushAdded(&.{id}, cost);
+        self.sfx("placement");
+        self.say("placed {s} (${d:.0})", .{ name, cost });
+    }
+
+    /// Places any entity chosen on the buy panel's item tabs: its main model,
+    /// its price from the data, and its binder so shops, feeders and shelters
+    /// behave as the data says.
+    fn placeItem(self: *App, at: [3]f32) !void {
+        if (self.item_sel >= self.item_names.items.len) return;
+        const name = self.item_names.items[self.item_sel];
+        const m = viewer.binderModel(self.gpa, &self.reg, name, "mainObj") orelse return;
+        const cost = self.costOf(name, 50);
+        if (!self.charge(cost, name, .construction)) return;
+        const food: f32 = if (self.feederKind(name) != null) 100 else -1;
+        const id = try self.world.addPropEx(m.file, at, world_mod.yawRotation(self.yaw), m.scale, &.{}, name, food);
         self.pushAdded(&.{id}, cost);
         self.sfx("placement");
         self.say("placed {s} (${d:.0})", .{ name, cost });
@@ -1225,6 +1253,17 @@ pub const App = struct {
             self.nz_size = @intFromFloat(try num(it.next()));
             self.nz_biome = @intFromFloat(try num(it.next()));
             self.startBlankZoo();
+        } else if (std.mem.eql(u8, verb, "pathz")) {
+            var lo: f32 = 1e9;
+            var hi: f32 = -1e9;
+            for (self.world.paths.items) |pt| {
+                const z = self.world.terrain.zAt(pt.position[0], pt.position[1]);
+                lo = @min(lo, z);
+                hi = @max(hi, z);
+            }
+            var plo: f32 = 1e9;
+            for (self.world.props.items) |pr| plo = @min(plo, pr.position[2]);
+            std.debug.print("pathz: {d} tiles, ground z {d:.2}..{d:.2}; lowest prop z {d:.2}\n", .{ self.world.paths.items.len, lo, hi, plo });
         } else if (std.mem.eql(u8, verb, "needy")) {
             try self.sim.sync(&self.world);
             for (self.sim.agents.items) |*ag| if (ag.is_guest) {
@@ -2320,12 +2359,45 @@ pub const App = struct {
         }.f;
         for (0..self.fence_kinds.items.len) |i| add(self, .fence, i);
         for (0..self.path_textures.items.len) |i| add(self, .path, i);
-        for (0..self.props.items.len) |i| add(self, .scenery, i);
         for (self.food_names.items, 0..) |n, i| {
             // Water-only feeders (reefs, buoys) need a water surface we do not have yet.
             const aquatic = std.ascii.startsWithIgnoreCase(n, "artificialreef") or std.ascii.startsWithIgnoreCase(n, "buoy");
             if (self.feederKind(n) != null and !aquatic) add(self, .food, i);
-            if (self.reg.get(n)) |b| if (venueNeed(b) != null) add(self, .building, i);
+        }
+        // Buildings, scenery, toys, shelters, trees, plants and rocks come straight
+        // from the entity data, sorted by name, when they have a model to place.
+        self.item_names.clearRetainingCapacity();
+        var names: std.ArrayList(struct { name: []const u8, tab: BuyTab }) = .empty;
+        defer names.deinit(self.gpa);
+        const ca = self.catalog_arena.allocator();
+        var bit = self.reg.binders.valueIterator();
+        while (bit.next()) |b| {
+            const bd = b.*;
+            if (bd.abstract or bd.type_path.len < 2) continue;
+            const kind = bd.type_path[1];
+            const eq = std.ascii.eqlIgnoreCase;
+            var tab: ?BuyTab = null;
+            if (eq(kind, "building")) {
+                if (bd.type_path.len > 2 and (eq(bd.type_path[2], "Rubble") or std.ascii.findIgnoreCase(bd.type_path[2], "Reward") != null)) continue;
+                tab = .building;
+            } else if (eq(kind, "scenery") or eq(kind, "prop")) tab = .scenery
+            else if (eq(kind, "enrichment")) tab = .enrich
+            else if (eq(kind, "shelters")) tab = .shelter
+            else if (eq(kind, "tree")) tab = .tree
+            else if (eq(kind, "foliage")) tab = .plant
+            else if (eq(kind, "rock")) tab = .rock;
+            const t = tab orelse continue;
+            if (viewer.binderModel(self.gpa, &self.reg, bd.name, "mainObj") == null) continue;
+            names.append(self.gpa, .{ .name = ca.dupe(u8, bd.name) catch continue, .tab = t }) catch {};
+        }
+        std.mem.sort(@TypeOf(names.items[0]), names.items, {}, struct {
+            fn less(_: void, a: @TypeOf(names.items[0]), b: @TypeOf(names.items[0])) bool {
+                return std.ascii.lessThanIgnoreCase(a.name, b.name);
+            }
+        }.less);
+        for (names.items) |e| {
+            self.item_names.append(self.gpa, e.name) catch continue;
+            add(self, e.tab, self.item_names.items.len - 1);
         }
         for (self.actor_names.items, 0..) |n, i| {
             if (sim_mod.classify(n) == .animal) {
@@ -2340,8 +2412,8 @@ pub const App = struct {
         var name: []const u8 = switch (tab) {
             .fence => self.fence_kinds.items[idx],
             .path => return self.path_textures.items[idx],
-            .scenery => std.fs.path.stem(self.props.items[idx]),
-            .building, .food => self.food_names.items[idx],
+            .food => self.food_names.items[idx],
+            .building, .scenery, .enrich, .shelter, .tree, .plant, .rock => self.item_names.items[idx],
             .animal, .staff => self.actor_names.items[idx],
             .deform => return null,
         };
@@ -2360,8 +2432,8 @@ pub const App = struct {
         return switch (tab) {
             .fence => self.fence_kinds.items[idx],
             .path => std.fs.path.stem(self.path_textures.items[idx]),
-            .scenery => std.fs.path.stem(self.props.items[idx]),
-            .building, .food => self.food_names.items[idx],
+            .food => self.food_names.items[idx],
+            .building, .scenery, .enrich, .shelter, .tree, .plant, .rock => self.item_names.items[idx],
             .animal, .staff => self.actor_names.items[idx],
             .deform => "",
         };
@@ -2371,8 +2443,8 @@ pub const App = struct {
         return switch (tab) {
             .fence => self.costOf(self.fence_kinds.items[idx], 20),
             .path => path_cost,
-            .scenery => prop_cost,
-            .building, .food => self.costOf(self.food_names.items[idx], 50),
+            .food => self.costOf(self.food_names.items[idx], 50),
+            .building, .scenery, .enrich, .shelter, .tree, .plant, .rock => self.costOf(self.item_names.items[idx], 50),
             .animal, .staff => self.costOf(self.actor_names.items[idx], 100),
             .deform => 0,
         };
@@ -2382,8 +2454,8 @@ pub const App = struct {
         return switch (tab) {
             .fence => .fence,
             .path => .path,
-            .building, .food => .food,
-            .scenery => .prop,
+            .food => .food,
+            .building, .scenery, .enrich, .shelter, .tree, .plant, .rock => .item,
             .animal, .staff => .actor,
             .deform => .raise,
         };
@@ -2416,8 +2488,8 @@ pub const App = struct {
     fn buyTabCat(tab: BuyTab) u8 {
         return switch (tab) {
             .fence, .path, .building, .scenery => 0,
-            .animal, .food => 1,
-            .deform => 2,
+            .animal, .food, .enrich, .shelter => 1,
+            .deform, .tree, .plant, .rock => 2,
             .staff => 3,
         };
     }
@@ -2432,6 +2504,11 @@ pub const App = struct {
         if (eq(name, "Animal Food Tab")) return .food;
         if (eq(name, "Staff Tab")) return .staff;
         if (eq(name, "Terrain Deformation Tab")) return .deform;
+        if (eq(name, "Animal Enrichment Tab")) return .enrich;
+        if (eq(name, "Animal Shelter Tab")) return .shelter;
+        if (eq(name, "Tree Tab")) return .tree;
+        if (eq(name, "Plant Tab")) return .plant;
+        if (eq(name, "Rock Tab")) return .rock;
         return null;
     }
 
@@ -2443,8 +2520,8 @@ pub const App = struct {
         switch (self.buy_tab) {
             .fence => self.fence_i = idx,
             .path => self.path_i = idx,
-            .scenery => self.prop_i = idx,
-            .building, .food => self.food_i = idx,
+            .food => self.food_i = idx,
+            .building, .scenery, .enrich, .shelter, .tree, .plant, .rock => self.item_sel = idx,
             .animal, .staff => {
                 if (self.actorDef(self.actor_names.items[idx]) == null) {
                     self.say("{s} has no model", .{self.actor_names.items[idx]});
@@ -2463,8 +2540,8 @@ pub const App = struct {
         return switch (self.buy_tab) {
             .fence => self.fence_i,
             .path => self.path_i,
-            .scenery => self.prop_i,
-            .building, .food => self.food_i,
+            .food => self.food_i,
+            .building, .scenery, .enrich, .shelter, .tree, .plant, .rock => self.item_sel,
             .animal, .staff => self.actor_i,
             .deform => 0,
         };
@@ -2533,9 +2610,16 @@ pub const App = struct {
             self.hits.append(self.gpa, .{ .x = x, .y = y, .w = cell_w - 2 * s, .h = cell_h - 2 * s, .action = .{ .buy_item = pos } }) catch {};
         }
         // Name of the hovered or chosen item.
-        var shown: usize = cur;
-        if (self.buy_hover) |hv| shown = self.buy_lists[@intFromEnum(hv.tab)].items[hv.pos];
-        if (shown < 100000) {
+        var shown: usize = std.math.maxInt(usize);
+        if (self.buy_hover) |hv| {
+            shown = self.buy_lists[@intFromEnum(hv.tab)].items[hv.pos];
+        } else if (tabTool(self.buy_tab) == self.tool) {
+            // The current choice, if it belongs to this tab.
+            for (list) |li| if (li == cur) {
+                shown = cur;
+            };
+        }
+        if (shown != std.math.maxInt(usize)) {
             const nm = self.itemName(self.buy_tab, @min(shown, self.itemCountForTab(self.buy_tab) -| 1));
             if (nm.len > 0) ui.label(gx, oy + 214 * s, ts, nm[0..@min(nm.len, 48)], .{ 1, 0.92, 0.5, 1 }) catch {};
         }
@@ -2699,8 +2783,8 @@ pub const App = struct {
         return switch (tab) {
             .fence => self.fence_kinds.items.len,
             .path => self.path_textures.items.len,
-            .scenery => self.props.items.len,
-            .building, .food => self.food_names.items.len,
+            .food => self.food_names.items.len,
+            .building, .scenery, .enrich, .shelter, .tree, .plant, .rock => self.item_names.items.len,
             .animal, .staff => self.actor_names.items.len,
             .deform => 0,
         };
@@ -3193,12 +3277,14 @@ pub const App = struct {
                 const gh = 300 * s;
                 try ui.rect(gx, gy, gw, gh, .{ 0, 0, 0, 0.35 });
                 const n: usize = z.history_n;
-                if (n == 0) {
-                    _ = try ui.text(gx + 20 * s, gy + gh / 2, ts, "NO FINISHED MONTHS YET", grey);
+                // The month in progress is the last bar, drawn paler.
+                const cur_net = z.month.totalEarned() - z.month.totalSpent();
+                if (n == 0 and cur_net == 0) {
+                    _ = try ui.text(gx + 20 * s, gy + gh / 2, ts, "NO FINANCES TO GRAPH YET", grey);
                 } else {
-                    var maxv: f64 = 1;
+                    var maxv: f64 = @max(1, @abs(cur_net));
                     for (z.history[0..n]) |v| maxv = @max(maxv, @abs(v));
-                    const bw2 = @min(gw / @as(f32, @floatFromInt(@max(n, 8))), 40 * s);
+                    const bw2 = @min(gw / @as(f32, @floatFromInt(@max(n + 1, 8))), 40 * s);
                     const mid = gy + gh / 2;
                     try ui.rect(gx, mid, gw, s, .{ 1, 1, 1, 0.4 });
                     for (z.history[0..n], 0..) |v, i| {
@@ -3207,10 +3293,16 @@ pub const App = struct {
                         const col: [4]f32 = if (v >= 0) .{ 0.4, 0.85, 0.4, 1 } else .{ 0.9, 0.4, 0.35, 1 };
                         try ui.rect(x, if (hgt >= 0) mid - hgt else mid, bw2 * 0.7, @abs(hgt), col);
                     }
+                    {
+                        const hgt: f32 = @floatCast(cur_net / maxv * @as(f64, gh / 2 - 12 * s));
+                        const x = gx + 10 * s + @as(f32, @floatFromInt(n)) * bw2;
+                        const col: [4]f32 = if (cur_net >= 0) .{ 0.4, 0.85, 0.4, 0.55 } else .{ 0.9, 0.4, 0.35, 0.55 };
+                        try ui.rect(x, if (hgt >= 0) mid - hgt else mid, bw2 * 0.7, @abs(hgt), col);
+                    }
                     var ab: [40]u8 = undefined;
                     _ = try ui.text(gx + 6 * s, gy + 6 * s, ts * 0.8, std.fmt.bufPrint(&ab, "LARGEST MONTH ${d:.0}", .{maxv}) catch "", grey);
                 }
-                _ = try ui.text(gx, gy + gh + 10 * s, ts * 0.8, "EACH BAR IS A FINISHED MONTH (OLDEST LEFT).", grey);
+                _ = try ui.text(gx, gy + gh + 10 * s, ts * 0.8, "EACH BAR IS A MONTH, OLDEST AT LEFT. THE PALE BAR IS THIS MONTH.", grey);
             },
         }
         // Close button.
@@ -3377,6 +3469,7 @@ pub const App = struct {
             .prop => if (hit) |h| self.placeProp(h) catch {},
             .actor => if (hit) |h| self.placeActor(h) catch {},
             .food => if (hit) |h| self.placeFood(h) catch {},
+            .item => if (hit) |h| self.placeItem(h) catch {},
             .path => if (hit) |h| self.placePath(h) catch {},
             .fence => if (hit) |h| {
                 const p = [2]f32{ snap(h[0], 3.0), snap(h[1], 3.0) };
@@ -3483,6 +3576,7 @@ pub const App = struct {
     fn toolHint(self: *const App) []const u8 {
         return switch (self.tool) {
             .select => "CLICK AN OBJECT, ANIMAL OR PERSON. DEL OR X REMOVES IT",
+            .item => "CLICK THE GROUND TO PLACE. R ROTATES",
             .prop => "CLICK THE GROUND TO PLACE. [ ] CHANGE OBJECT, R ROTATES",
             .fence => "CLICK WHERE THE FENCE STARTS, THEN CLICK EACH CORNER. C ENDS THE LINE",
             .path => "CLICK OR DRAG TO PAINT PATH TILES. [ ] CHANGE PATH",

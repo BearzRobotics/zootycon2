@@ -37,6 +37,8 @@ pub const Terrain = struct {
     raw: []const u8,
     first_record: usize,
     stride: usize,
+    /// Lakes, rivers and seas (see `WaterBody`).
+    water: []const WaterBody = &.{},
 
     pub fn deinit(self: *Terrain) void {
         self.arena.deinit();
@@ -80,12 +82,18 @@ pub const Terrain = struct {
 
 pub const Error = error{ BadTerrain, OutOfMemory };
 
-/// Height of the water surface. Stock maps keep their flat ground at 13 and
-/// every pool, river and sea floor lies below this level (lakes bottom out
-/// around 3.5), so terrain under it is under water.
-pub const water_level: f32 = 12.0;
+/// A body of water listed after the vertex grid: its surface height (stored
+/// relative to the vertex base, so add `base`), the biome that styles it, and
+/// the grid vertices it covers. Maps without lakes, rivers or seas list none.
+pub const WaterBody = struct {
+    level: f32,
+    biome: u32,
+    verts: []const u32,
+};
 /// Where the flat ground of a new map sits.
 pub const ground_level: f32 = 13.0;
+/// Where water stands on a blank map (one unit below its ground).
+pub const water_level: f32 = 12.0;
 
 fn u32le(d: []const u8, at: usize) u32 {
     return std.mem.readInt(u32, d[at..][0..4], .little);
@@ -161,6 +169,31 @@ pub fn parse(gpa: std.mem.Allocator, data: []const u8) Error!Terrain {
         out.* = f32le(data, rec) + f32le(data, rec + 18);
         pt.* = @intCast(@min(u32le(data, rec + 8), 255));
     }
+    // Water bodies follow the grid: a count, then per body a level (above the
+    // vertex base), a biome index and the covered vertices.
+    var bodies: std.ArrayList(WaterBody) = .empty;
+    const tail = pos + count * stride;
+    if (tail + 4 <= data.len) {
+        const nb = u32le(data, tail);
+        var p = tail + 4;
+        const base0 = f32le(data, pos + 18);
+        if (nb > 0 and nb <= 32) {
+            var k: u32 = 0;
+            while (k < nb) : (k += 1) {
+                if (p + 12 > data.len) break;
+                const lvl = f32le(data, p);
+                const bio = u32le(data, p + 4);
+                const n = u32le(data, p + 8);
+                p += 12;
+                if (!plausible(lvl) or n > count or p + @as(usize, n) * 4 > data.len) break;
+                const verts = try a.alloc(u32, n);
+                for (verts, 0..) |*v, i| v.* = u32le(data, p + i * 4);
+                p += @as(usize, n) * 4;
+                try bodies.append(a, .{ .level = lvl + base0, .biome = bio, .verts = verts });
+            }
+        }
+    }
+    const water = try bodies.toOwnedSlice(a);
     // Allocate everything before copying the arena into the result.
     const raw = try a.dupe(u8, data);
     return .{
@@ -175,6 +208,7 @@ pub fn parse(gpa: std.mem.Allocator, data: []const u8) Error!Terrain {
         .raw = raw,
         .first_record = pos,
         .stride = stride,
+        .water = water,
     };
 }
 
@@ -193,7 +227,8 @@ pub fn blank(gpa: std.mem.Allocator, tiles_x: u32, tiles_y: u32, biome: u8) Erro
     const rs = 28;
     var names_len: usize = 0;
     for (blank_biomes) |n| names_len += 4 + n.len + 1;
-    const total = 48 + names_len + @as(usize, gw) * gh * rs;
+    // One body of water covering the whole map, so digging below `water_level` makes a lake.
+    const total = 48 + names_len + @as(usize, gw) * gh * rs + 16 + @as(usize, gw) * gh * 4;
     const buf = try gpa.alloc(u8, total);
     defer gpa.free(buf);
     @memset(buf, 0);
@@ -225,6 +260,13 @@ pub fn blank(gpa: std.mem.Allocator, tiles_x: u32, tiles_y: u32, biome: u8) Erro
         w(u32, buf[rec + 18 ..][0..4], @bitCast(@as(f32, 6.0)), .little);
         w(u32, buf[rec + 22 ..][0..4], @bitCast(@as(f32, 26.0)), .little);
     }
+    var tp = pos + count * rs;
+    w(u32, buf[tp..][0..4], 1, .little);
+    w(u32, buf[tp + 4 ..][0..4], @bitCast(water_level - 6.0), .little);
+    w(u32, buf[tp + 8 ..][0..4], biome, .little);
+    w(u32, buf[tp + 12 ..][0..4], @intCast(count), .little);
+    tp += 16;
+    for (0..count) |i| w(u32, buf[tp + i * 4 ..][0..4], @intCast(i), .little);
     return parse(gpa, buf);
 }
 
@@ -238,6 +280,9 @@ test "blank terrain parses back flat with the chosen biome" {
     try std.testing.expectApproxEqAbs(ground_level, t.z[100], 1e-6);
     try std.testing.expectEqual(@as(u8, 7), t.paint[50]);
     try std.testing.expectEqualStrings("savannah", t.biomes[t.paint[50]]);
+    try std.testing.expectEqual(@as(usize, 1), t.water.len);
+    try std.testing.expectApproxEqAbs(water_level, t.water[0].level, 1e-6);
+    try std.testing.expectEqual(@as(usize, 17 * 13), t.water[0].verts.len);
 }
 
 test "synthetic 3x2 terrain" {
