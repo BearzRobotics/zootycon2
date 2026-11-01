@@ -144,13 +144,20 @@ const fs_src: [:0]const u8 =
     \\in vec3 vP;
     \\in vec2 vUv;
     \\uniform sampler2D uTex;
+    \\uniform sampler2D uTex2;
+    \\uniform int uTerrain;
     \\uniform vec4 uTint;
     \\uniform float uAlphaCut;
     \\out vec4 outColor;
     \\void main() {
-    \\  vec4 c = texture(uTex, vUv) * uTint;
-    \\  if (c.a < uAlphaCut) discard;
     \\  vec3 n = dot(vN, vN) > 1e-6 ? normalize(vN) : normalize(cross(dFdx(vP), dFdy(vP)));
+    \\  vec4 c = texture(uTex, vUv) * uTint;
+    \\  if (uTerrain == 1) {
+    \\    // Flat ground shows the cover texture, steep slopes the cliff texture.
+    \\    float steep = smoothstep(0.2, 0.5, 1.0 - n.z);
+    \\    c = mix(c, texture(uTex2, vUv * 0.5), steep);
+    \\  }
+    \\  if (c.a < uAlphaCut) discard;
     \\  vec3 l = normalize(vec3(0.4, -0.5, 0.8));
     \\  float d = abs(dot(n, l));
     \\  outColor = vec4(c.rgb * (0.4 + 0.6 * d), c.a);
@@ -207,6 +214,8 @@ const Skin = struct {
 };
 
 const Draw = struct {
+    /// Second texture for terrain (steep slopes); 0 for ordinary draws.
+    texture2: gl.Uint = 0,
     /// Pose-driven draws read `Scene.world[block]` each frame; others use `world`.
     dynamic: bool,
     index_type: gl.Enum,
@@ -517,7 +526,7 @@ pub const Scene = struct {
     }
 
     /// Adds a terrain mesh: one vertex per grid point, shaded by normals.
-    pub fn addTerrain(self: *Scene, t: *const terrain_mod.Terrain, tint: [4]f32) !void {
+    pub fn addTerrain(self: *Scene, t: *const terrain_mod.Terrain, tint: [4]f32, flat_tex: gl.Uint, steep_tex: gl.Uint) !void {
         const w = t.width;
         const h = t.height;
         const sx = t.spacingX();
@@ -564,11 +573,21 @@ pub const Scene = struct {
             .vao = vao,
             .index_count = @intCast(idx.len),
             .world = identity,
-            .texture = self.white,
+            .texture = flat_tex,
+            .texture2 = steep_tex,
             .tint = tint,
             .blend = false,
             .alpha_cut = 0,
         });
+    }
+
+    /// Loads a texture by its exact VFS path; the white texture if missing.
+    pub fn loadTexturePath(self: *Scene, path: []const u8) gl.Uint {
+        const bytes = self.vfs.read(self.gpa, path) catch return self.white;
+        defer self.gpa.free(bytes);
+        var img = dds.parse(self.gpa, bytes) catch return self.white;
+        defer img.deinit();
+        return upload(self.g, &img);
     }
 
     /// Loads a model by VFS path (`.bfm`, `.nif`, or either extension left
@@ -734,6 +753,8 @@ const Gfx = struct {
     u_cut: gl.Int,
     u_skinned: gl.Int,
     u_bones: gl.Int,
+    u_tex2: gl.Int,
+    u_terrain: gl.Int,
 
     fn open(self: *Gfx, opts: Options) !void {
         self.plat = platform.Platform.init() catch {
@@ -768,6 +789,8 @@ const Gfx = struct {
         self.u_cut = g.getUniformLocation(self.prog, "uAlphaCut");
         self.u_skinned = g.getUniformLocation(self.prog, "uSkinned");
         self.u_bones = g.getUniformLocation(self.prog, "uBones");
+        self.u_tex2 = g.getUniformLocation(self.prog, "uTex2");
+        self.u_terrain = g.getUniformLocation(self.prog, "uTerrain");
     }
 
     fn close(self: *Gfx) void {
@@ -882,8 +905,12 @@ fn loop(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Camera, play
         g.useProgram(gfx.prog);
         g.uniformMatrix4fv(gfx.u_vp, 1, 0, &vp);
         g.uniform1i(gfx.u_tex, 0);
-        g.activeTexture(gl.TEXTURE0);
+        g.uniform1i(gfx.u_tex2, 1);
         for (scene.draws.items) |d| {
+            g.activeTexture(gl.TEXTURE0 + 1);
+            g.bindTexture(gl.TEXTURE_2D, d.texture2);
+            g.uniform1i(gfx.u_terrain, if (d.texture2 != 0) 1 else 0);
+            g.activeTexture(gl.TEXTURE0);
             if (d.skin) |sk| {
                 var mats: [max_bones]Mat4 = undefined;
                 for (sk.bones, sk.offsets, 0..) |bn, off, i| mats[i] = mul(scene.world[bn], off);
@@ -1003,7 +1030,23 @@ pub fn runMap(gpa: std.mem.Allocator, vfs: *vfs_mod.Vfs, path: []const u8, opts:
     var scene = try Scene.init(gpa, &gfx.g, vfs);
     defer scene.deinit();
     scene.interactive = false;
-    try scene.addTerrain(&terr, .{ 0.42, 0.55, 0.32, 1 });
+    // Ground textures come from the map's biome definition.
+    var flat_tex = scene.white;
+    var steep_tex = scene.white;
+    {
+        var biome_path_buf: [128]u8 = undefined;
+        const biome_path = std.fmt.bufPrint(&biome_path_buf, "biomes/{s}.xml", .{mp.biome}) catch "";
+        if (vfs.read(gpa, biome_path)) |bytes| {
+            defer gpa.free(bytes);
+            var arena: std.heap.ArenaAllocator = .init(gpa);
+            defer arena.deinit();
+            if (@import("xml.zig").parse(arena.allocator(), bytes, null)) |root| {
+                if (root.attr("groundCoverTexture")) |t| flat_tex = scene.loadTexturePath(t);
+                if (root.attr("cliffHoriz")) |t| steep_tex = scene.loadTexturePath(t);
+            } else |_| {}
+        } else |_| {}
+    }
+    try scene.addTerrain(&terr, .{ 1, 1, 1, 1 }, flat_tex, steep_tex);
 
     var placed: usize = 0;
     var missing: usize = 0;
