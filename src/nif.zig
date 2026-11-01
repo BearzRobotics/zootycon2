@@ -101,6 +101,26 @@ pub const Material = struct {
     alpha: f32,
 };
 
+pub const SkinWeight = struct { vertex: u16, weight: f32 };
+
+pub const SkinBone = struct {
+    /// Maps geometry (bind-pose) space into this bone's space.
+    transform: Transform,
+    weights: []const SkinWeight,
+};
+
+pub const SkinInstance = struct {
+    data: Ref,
+    root: Ref,
+    /// Bone node for each entry of the skin data.
+    bones: []const Ref,
+};
+
+pub const SkinData = struct {
+    overall: Transform,
+    bones: []const SkinBone,
+};
+
 pub const Block = union(enum) {
     node: Node,
     geometry: Geometry,
@@ -113,6 +133,8 @@ pub const Block = union(enum) {
     string_extra: struct { name: []const u8, value: []const u8 },
     integer_extra: struct { name: []const u8, value: u32 },
     boolean_extra: struct { name: []const u8, value: bool },
+    skin_instance: SkinInstance,
+    skin_data: SkinData,
     /// Parsed for layout only; contents are not kept.
     other,
 };
@@ -608,25 +630,33 @@ fn readBlock(r: *Reader, type_name: []const u8) Error!Block {
 
     // ---- skinning ----
     if (eql(u8, type_name, "NiSkinInstance")) {
-        try r.skip(8); // data, skeleton root
-        const n = try r.count(try r.u32_(), 4);
-        try r.skip(n * 4);
-        return .other;
+        const data = try r.i32_();
+        const root = try r.i32_();
+        const bones = try r.refs();
+        return .{ .skin_instance = .{ .data = data, .root = root, .bones = bones } };
     }
     if (eql(u8, type_name, "NiSkinData")) {
-        try r.skip(52); // skin transform
+        const overall = try r.transform();
         const n_bones = try r.count(try r.u32_(), 52 + 16 + 2);
         try r.skip(4); // skin partition ref
         const has_weights = try r.bool_();
-        for (0..n_bones) |_| {
-            try r.skip(52 + 16);
+        const bones = try r.a.alloc(SkinBone, n_bones);
+        for (bones) |*b| {
+            b.transform = try r.transform();
+            try r.skip(16); // bounding sphere
             const n = try r.count(try r.u16_(), 0);
+            b.weights = &.{};
             if (has_weights) {
                 _ = try r.count(@intCast(n), 6);
-                try r.skip(n * 6);
+                const w = try r.a.alloc(SkinWeight, n);
+                for (w) |*e| {
+                    e.vertex = try r.u16_();
+                    e.weight = try r.f32_();
+                }
+                b.weights = w;
             }
         }
-        return .other;
+        return .{ .skin_data = .{ .overall = overall, .bones = bones } };
     }
     if (eql(u8, type_name, "NiSkinPartition")) {
         const n_parts = try r.count(try r.u32_(), 10);

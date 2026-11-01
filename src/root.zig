@@ -12,6 +12,7 @@ pub const nif = @import("nif.zig");
 pub const dds = @import("dds.zig");
 pub const model = @import("model.zig");
 pub const viewer = @import("viewer.zig");
+pub const bf = @import("bf.zig");
 
 test {
     _ = archive;
@@ -25,4 +26,5 @@ test {
     _ = dds;
     _ = model;
     _ = viewer;
+    _ = bf;
 }

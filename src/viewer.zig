@@ -8,6 +8,7 @@ const gl = @import("gl.zig");
 const nif = @import("nif.zig");
 const dds = @import("dds.zig");
 const model = @import("model.zig");
+const bf = @import("bf.zig");
 const vfs_mod = @import("vfs.zig");
 const platform = @import("platform.zig");
 
@@ -44,6 +45,23 @@ fn transformPoint(m: Mat4, p: nif.Vec3) nif.Vec3 {
         m[0] * p[0] + m[4] * p[1] + m[8] * p[2] + m[12],
         m[1] * p[0] + m[5] * p[1] + m[9] * p[2] + m[13],
         m[2] * p[0] + m[6] * p[1] + m[10] * p[2] + m[14],
+    };
+}
+
+/// Rotation matrix for a unit quaternion (x, y, z, w), times `scale`,
+/// written into the upper 3x3 of `m` (column-major).
+fn setRotation(m: *Mat4, q: [4]f32, scale: f32) void {
+    const x = q[0];
+    const y = q[1];
+    const z = q[2];
+    const w = q[3];
+    const r = [9]f32{ // row-major
+        1 - 2 * (y * y + z * z), 2 * (x * y - z * w),     2 * (x * z + y * w),
+        2 * (x * y + z * w),     1 - 2 * (x * x + z * z), 2 * (y * z - x * w),
+        2 * (x * z - y * w),     2 * (y * z + x * w),     1 - 2 * (x * x + y * y),
+    };
+    for (0..3) |col| for (0..3) |row| {
+        m[col * 4 + row] = r[row * 3 + col] * scale;
     };
 }
 
@@ -95,15 +113,24 @@ const vs_src: [:0]const u8 =
     \\layout(location=0) in vec3 aPos;
     \\layout(location=1) in vec3 aNormal;
     \\layout(location=2) in vec2 aUv;
+    \\layout(location=3) in vec4 aIdx;
+    \\layout(location=4) in vec4 aWeight;
+    \\uniform mat4 uBones[96];
+    \\uniform int uSkinned;
     \\uniform mat4 uModel;
     \\uniform mat4 uViewProj;
     \\out vec3 vN;
     \\out vec3 vP;
     \\out vec2 vUv;
     \\void main() {
-    \\  vec4 w = uModel * vec4(aPos, 1.0);
+    \\  mat4 m = uModel;
+    \\  if (uSkinned == 1) {
+    \\    m = aWeight.x * uBones[int(aIdx.x)] + aWeight.y * uBones[int(aIdx.y)]
+    \\      + aWeight.z * uBones[int(aIdx.z)] + aWeight.w * uBones[int(aIdx.w)];
+    \\  }
+    \\  vec4 w = m * vec4(aPos, 1.0);
     \\  vP = w.xyz;
-    \\  vN = mat3(uModel) * aNormal;
+    \\  vN = mat3(m) * aNormal;
     \\  vUv = aUv;
     \\  gl_Position = uViewProj * w;
     \\}
@@ -168,7 +195,18 @@ fn makeProgram(g: *const Gl) !gl.Uint {
 
 // ------------------------------------------------------------------ scene
 
+const max_bones = 96;
+
+const Skin = struct {
+    /// NIF block index of each bone node.
+    bones: []const u32,
+    /// Geometry space -> bone space, per bone.
+    offsets: []const Mat4,
+};
+
 const Draw = struct {
+    block: u32,
+    skin: ?Skin,
     vao: gl.Uint,
     index_count: gl.Sizei,
     world: Mat4,
@@ -191,6 +229,9 @@ pub const Scene = struct {
     min: nif.Vec3 = .{ 1e30, 1e30, 1e30 },
     max: nif.Vec3 = .{ -1e30, -1e30, -1e30 },
     missing_textures: u32 = 0,
+    /// World matrix of every node/geometry block, refreshed by `pose`.
+    world: []Mat4 = &.{},
+    arena: std.heap.ArenaAllocator,
 
     const Index = struct {
         scene: *Scene,
@@ -211,7 +252,7 @@ pub const Scene = struct {
     };
 
     pub fn init(gpa: std.mem.Allocator, g: *const Gl, vfs: *vfs_mod.Vfs) !Scene {
-        var s: Scene = .{ .gpa = gpa, .g = g, .vfs = vfs };
+        var s: Scene = .{ .gpa = gpa, .g = g, .vfs = vfs, .arena = .init(gpa) };
         try vfs.forEach(Index{ .scene = &s }, Index.add);
         // 1x1 white fallback texture.
         const px = [4]u8{ 255, 255, 255, 255 };
@@ -226,6 +267,8 @@ pub const Scene = struct {
 
     pub fn deinit(self: *Scene) void {
         self.draws.deinit(self.gpa);
+        self.gpa.free(self.world);
+        self.arena.deinit();
         var it = self.textures.keyIterator();
         while (it.next()) |k| self.gpa.free(k.*);
         self.textures.deinit(self.gpa);
@@ -289,31 +332,68 @@ pub const Scene = struct {
 
     /// Walks the scene graph from every root, adding a draw per geometry.
     pub fn addNif(self: *Scene, nf: *const nif.Nif) !void {
-        for (nf.roots) |r| try self.walk(nf, r, identity);
+        self.world = try self.gpa.alloc(Mat4, nf.blocks.len);
+        @memset(self.world, identity);
+        self.pose(nf, null, 0);
+        for (nf.roots) |r| try self.walk(nf, r);
     }
 
-    fn walk(self: *Scene, nf: *const nif.Nif, ref: nif.Ref, parent: Mat4) !void {
+    /// Recomputes every node's world matrix, with bone transforms taken from
+    /// `anim` at time `t` where it has tracks for them.
+    pub fn pose(self: *Scene, nf: *const nif.Nif, anim: ?*const bf.Animation, t: f32) void {
+        for (nf.roots) |r| self.poseNode(nf, r, identity, anim, t);
+    }
+
+    fn poseNode(self: *Scene, nf: *const nif.Nif, ref: nif.Ref, parent: Mat4, anim: ?*const bf.Animation, t: f32) void {
+        if (ref < 0) return;
+        const idx: usize = @intCast(ref);
+        switch (nf.blocks[idx]) {
+            .node => |n| {
+                if (n.av.flags & 1 != 0) return; // hidden
+                var local = fromTransform(n.av.transform);
+                if (anim) |an| if (an.bone(n.av.net.name)) |bone| {
+                    if (bf.sampleRot(bone, t)) |q| setRotation(&local, q, n.av.transform.scale);
+                    if (bf.samplePos(bone, t)) |p| {
+                        local[12] = p[0];
+                        local[13] = p[1];
+                        local[14] = p[2];
+                    }
+                };
+                const w = mul(parent, local);
+                self.world[idx] = w;
+                if (n.kind == .lod) {
+                    // Child 0 is the most detailed level.
+                    if (n.children.len > 0) self.poseNode(nf, n.children[0], w, anim, t);
+                    return;
+                }
+                for (n.children) |c| self.poseNode(nf, c, w, anim, t);
+            },
+            .geometry => |geo| self.world[idx] = mul(parent, fromTransform(geo.av.transform)),
+            else => {},
+        }
+    }
+
+    fn walk(self: *Scene, nf: *const nif.Nif, ref: nif.Ref) !void {
         if (ref < 0) return;
         switch (nf.blocks[@intCast(ref)]) {
             .node => |n| {
                 if (n.av.flags & 1 != 0) return; // hidden
-                const world = mul(parent, fromTransform(n.av.transform));
                 if (n.kind == .lod) {
-                    // Child 0 is the most detailed level.
-                    if (n.children.len > 0) try self.walk(nf, n.children[0], world);
+                    if (n.children.len > 0) try self.walk(nf, n.children[0]);
                     return;
                 }
-                for (n.children) |c| try self.walk(nf, c, world);
+                for (n.children) |c| try self.walk(nf, c);
             },
             .geometry => |geo| {
                 if (geo.av.flags & 1 != 0) return;
-                try self.addGeometry(nf, geo, mul(parent, fromTransform(geo.av.transform)));
+                try self.addGeometry(nf, geo, @intCast(ref));
             },
             else => {},
         }
     }
 
-    fn addGeometry(self: *Scene, nf: *const nif.Nif, geo: nif.Geometry, world: Mat4) !void {
+    fn addGeometry(self: *Scene, nf: *const nif.Nif, geo: nif.Geometry, block: u32) !void {
+        const world = self.world[block];
         if (geo.data < 0) return;
         const md = switch (nf.blocks[@intCast(geo.data)]) {
             .mesh_data => |m| m,
@@ -347,28 +427,31 @@ pub const Scene = struct {
 
         // Interleave position, normal, uv.
         const n = md.vertices.len;
-        const buf = try self.gpa.alloc(f32, n * 8);
+        const buf = try self.gpa.alloc(f32, n * 16);
+        @memset(buf, 0);
         defer self.gpa.free(buf);
         const have_n = md.normals.len == n;
         const have_uv = md.uv_sets.len > 0 and md.uv_sets[0].len == n;
         for (0..n) |i| {
             const v = md.vertices[i];
-            buf[i * 8 + 0] = v[0];
-            buf[i * 8 + 1] = v[1];
-            buf[i * 8 + 2] = v[2];
+            buf[i * 16 + 0] = v[0];
+            buf[i * 16 + 1] = v[1];
+            buf[i * 16 + 2] = v[2];
             const nr: nif.Vec3 = if (have_n) md.normals[i] else .{ 0, 0, 0 };
-            buf[i * 8 + 3] = nr[0];
-            buf[i * 8 + 4] = nr[1];
-            buf[i * 8 + 5] = nr[2];
+            buf[i * 16 + 3] = nr[0];
+            buf[i * 16 + 4] = nr[1];
+            buf[i * 16 + 5] = nr[2];
             const uv: [2]f32 = if (have_uv) md.uv_sets[0][i] else .{ 0, 0 };
-            buf[i * 8 + 6] = uv[0];
-            buf[i * 8 + 7] = uv[1];
+            buf[i * 16 + 6] = uv[0];
+            buf[i * 16 + 7] = uv[1];
             const wp = transformPoint(world, v);
             for (0..3) |k| {
                 self.min[k] = @min(self.min[k], wp[k]);
                 self.max[k] = @max(self.max[k], wp[k]);
             }
         }
+
+        const skin = try self.buildSkin(nf, geo, buf, n);
 
         const g = self.g;
         var vao: gl.Uint = 0;
@@ -378,18 +461,24 @@ pub const Scene = struct {
         g.genBuffers(2, &bufs);
         g.bindBuffer(gl.ARRAY_BUFFER, bufs[0]);
         g.bufferData(gl.ARRAY_BUFFER, @intCast(buf.len * 4), buf.ptr, gl.STATIC_DRAW);
-        const stride: gl.Sizei = 32;
+        const stride: gl.Sizei = 64;
         g.enableVertexAttribArray(0);
         g.vertexAttribPointer(0, 3, gl.FLOAT, 0, stride, @ptrFromInt(0));
         g.enableVertexAttribArray(1);
         g.vertexAttribPointer(1, 3, gl.FLOAT, 0, stride, @ptrFromInt(12));
         g.enableVertexAttribArray(2);
         g.vertexAttribPointer(2, 2, gl.FLOAT, 0, stride, @ptrFromInt(24));
+        g.enableVertexAttribArray(3);
+        g.vertexAttribPointer(3, 4, gl.FLOAT, 0, stride, @ptrFromInt(32));
+        g.enableVertexAttribArray(4);
+        g.vertexAttribPointer(4, 4, gl.FLOAT, 0, stride, @ptrFromInt(48));
         g.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, bufs[1]);
         g.bufferData(gl.ELEMENT_ARRAY_BUFFER, @intCast(md.indices.len * 2), md.indices.ptr, gl.STATIC_DRAW);
         g.bindVertexArray(0);
 
         try self.draws.append(self.gpa, .{
+            .block = block,
+            .skin = skin,
             .vao = vao,
             .index_count = @intCast(md.indices.len),
             .world = world,
@@ -399,6 +488,55 @@ pub const Scene = struct {
             .alpha_cut = alpha_cut,
         });
     }
+
+    /// Fills the bone index/weight attributes (floats 8..15 of each vertex)
+    /// and returns the bone table, or null for unskinned geometry.
+    fn buildSkin(self: *Scene, nf: *const nif.Nif, geo: nif.Geometry, buf: []f32, n: usize) !?Skin {
+        if (geo.skin < 0) return null;
+        const inst = switch (nf.blocks[@intCast(geo.skin)]) {
+            .skin_instance => |i| i,
+            else => return null,
+        };
+        if (inst.data < 0) return null;
+        const sd = switch (nf.blocks[@intCast(inst.data)]) {
+            .skin_data => |d| d,
+            else => return null,
+        };
+        if (sd.bones.len == 0 or sd.bones.len > max_bones or sd.bones.len != inst.bones.len) return null;
+
+        // Keep the four strongest influences per vertex.
+        const Infl = struct { bone: u32 = 0, w: f32 = 0 };
+        const infl = try self.gpa.alloc([4]Infl, n);
+        defer self.gpa.free(infl);
+        @memset(infl, .{ .{}, .{}, .{}, .{} });
+        for (sd.bones, 0..) |b, bi| for (b.weights) |wt| {
+            if (wt.vertex >= n or wt.weight <= 0) continue;
+            const slot = &infl[wt.vertex];
+            var min_i: usize = 0;
+            for (1..4) |k| if (slot[k].w < slot[min_i].w) {
+                min_i = k;
+            };
+            if (wt.weight > slot[min_i].w) slot[min_i] = .{ .bone = @intCast(bi), .w = wt.weight };
+        };
+        for (0..n) |v| {
+            var sum: f32 = 0;
+            for (infl[v]) |e| sum += e.w;
+            for (0..4) |k| {
+                buf[v * 16 + 8 + k] = @floatFromInt(infl[v][k].bone);
+                buf[v * 16 + 12 + k] = if (sum > 0) infl[v][k].w / sum else if (k == 0) 1 else 0;
+            }
+        }
+
+        const a = self.arena.allocator();
+        const bones = try a.alloc(u32, sd.bones.len);
+        const offsets = try a.alloc(Mat4, sd.bones.len);
+        for (sd.bones, 0..) |b, i| {
+            if (inst.bones[i] < 0) return null;
+            bones[i] = @intCast(inst.bones[i]);
+            offsets[i] = fromTransform(b.transform);
+        }
+        return .{ .bones = bones, .offsets = offsets };
+    }
 };
 
 // ----------------------------------------------------------------- viewer
@@ -407,6 +545,10 @@ pub const Options = struct {
     /// When set, render a few frames, write the framebuffer as a binary PPM
     /// to this writer, and return (no interactive loop).
     screenshot: ?*std.Io.Writer = null,
+    /// Animation to play: a `.bf` path, or a name from the `.bfm` manifest.
+    anim: ?[]const u8 = null,
+    /// Fixed pose time in seconds (otherwise the animation loops in real time).
+    time: ?f32 = null,
     width: u32 = 1280,
     height: u32 = 720,
 };
@@ -426,6 +568,22 @@ pub fn run(gpa: std.mem.Allocator, vfs: *vfs_mod.Vfs, path: []const u8, opts: Op
     defer gpa.free(nif_bytes);
     var nf = try nif.parse(gpa, nif_bytes);
     defer nf.deinit();
+
+    // Optional animation, by `.bf` path or by manifest name.
+    var anim: ?bf.Animation = null;
+    defer if (anim) |*a| a.deinit();
+    if (opts.anim) |name| {
+        const anim_path = if (std.ascii.endsWithIgnoreCase(name, ".bf"))
+            name
+        else if (manifest) |*m|
+            (m.animation(name) orelse return error.UnknownAnimation).path
+        else
+            return error.UnknownAnimation;
+        const abytes = try vfs.read(gpa, anim_path);
+        defer gpa.free(abytes);
+        anim = try bf.parse(gpa, abytes);
+        std.debug.print("animation {s}: {d:.2}s, {d} bones\n", .{ anim_path, anim.?.duration, anim.?.bones.len });
+    }
 
     const plat = platform.Platform.init() catch {
         std.debug.print("SDL init failed: {s}\n", .{platform.lastError()});
@@ -458,6 +616,8 @@ pub fn run(gpa: std.mem.Allocator, vfs: *vfs_mod.Vfs, path: []const u8, opts: Op
     const u_tex = g.getUniformLocation(prog, "uTex");
     const u_tint = g.getUniformLocation(prog, "uTint");
     const u_cut = g.getUniformLocation(prog, "uAlphaCut");
+    const u_skinned = g.getUniformLocation(prog, "uSkinned");
+    const u_bones = g.getUniformLocation(prog, "uBones");
 
     var scene = try Scene.init(gpa, &g, vfs);
     defer scene.deinit();
@@ -486,6 +646,7 @@ pub fn run(gpa: std.mem.Allocator, vfs: *vfs_mod.Vfs, path: []const u8, opts: Op
     g.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
 
     var frame: u32 = 0;
+    const start_ms = plat.ticksMs();
     main: while (true) {
         while (plat.pollEvent()) |ev| switch (ev) {
             .quit => break :main,
@@ -520,12 +681,28 @@ pub fn run(gpa: std.mem.Allocator, vfs: *vfs_mod.Vfs, path: []const u8, opts: Op
         const aspect = @as(f32, @floatFromInt(size.width)) / @as(f32, @floatFromInt(size.height));
         const vp = mul(perspective(0.8, aspect, radius * 0.01, dist + radius * 10), lookAt(eye, center, .{ 0, 0, 1 }));
 
+        if (anim) |*an| {
+            const t: f32 = opts.time orelse blk: {
+                const secs = @as(f32, @floatFromInt(plat.ticksMs() - start_ms)) / 1000.0;
+                break :blk if (an.duration > 0) @mod(secs, an.duration) else 0;
+            };
+            scene.pose(&nf, an, t);
+        }
+
         g.useProgram(prog);
         g.uniformMatrix4fv(u_vp, 1, 0, &vp);
         g.uniform1i(u_tex, 0);
         g.activeTexture(gl.TEXTURE0);
         for (scene.draws.items) |d| {
-            g.uniformMatrix4fv(u_model, 1, 0, &d.world);
+            if (d.skin) |sk| {
+                var mats: [max_bones]Mat4 = undefined;
+                for (sk.bones, sk.offsets, 0..) |bn, off, i| mats[i] = mul(scene.world[bn], off);
+                g.uniform1i(u_skinned, 1);
+                g.uniformMatrix4fv(u_bones, @intCast(sk.bones.len), 0, @ptrCast(&mats));
+            } else {
+                g.uniform1i(u_skinned, 0);
+                g.uniformMatrix4fv(u_model, 1, 0, &scene.world[d.block]);
+            }
             g.uniform4f(u_tint, d.tint[0], d.tint[1], d.tint[2], d.tint[3]);
             g.uniform1f(u_cut, d.alpha_cut);
             g.bindTexture(gl.TEXTURE_2D, d.texture);

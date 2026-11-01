@@ -21,7 +21,8 @@ const usage =
     \\  modelcheck [prefix]         parse every .bfm manifest and .bfmat material
     \\  ddscheck [prefix]           parse every .dds texture and report formats
     \\  nifinfo <path>               print a NIF's scene graph
-    \\  view <model> [--shot]       view a .nif/.bfm model (--shot: PPM to stdout)
+    \\  view <model> [--anim A] [--time S] [--shot]  view a .nif/.bfm model
+    \\  bfcheck [prefix]            parse every .bf animation and report coverage
     \\  nifcheck [prefix]           parse every .nif/.kf and report coverage
     \\  xmlcheck [prefix]            parse every .xml and report failures
     \\
@@ -141,6 +142,30 @@ pub fn main(init: std.process.Init) !void {
             }
         }.less);
         for (names.items) |n| try out.print("{s}\n", .{n});
+    } else if (std.mem.eql(u8, cmd, "export") and rest.len > 1) {
+        // export <prefix-or-suffix> <dir>: extract matching files for offline analysis.
+        const pat = rest[0];
+        var names: std.ArrayList([]const u8) = .empty;
+        defer names.deinit(gpa);
+        const Match = struct {
+            list: *std.ArrayList([]const u8),
+            gpa: std.mem.Allocator,
+            pat: []const u8,
+            fn add(c: @This(), name: []const u8) anyerror!void {
+                if (std.mem.startsWith(u8, name, c.pat) or std.mem.endsWith(u8, name, c.pat)) try c.list.append(c.gpa, name);
+            }
+        };
+        try vfs.forEach(Match{ .list = &names, .gpa = gpa, .pat = pat }, Match.add);
+        const root = Io.Dir.cwd();
+        for (names.items) |n| {
+            const dest = try std.fs.path.join(gpa, &.{ rest[1], n });
+            defer gpa.free(dest);
+            if (std.fs.path.dirname(dest)) |d| try root.createDirPath(io, d);
+            const data = try vfs.read(gpa, n);
+            defer gpa.free(data);
+            try root.writeFile(io, .{ .sub_path = dest, .data = data });
+        }
+        try out.print("exported {d} files\n", .{names.items.len});
     } else if (std.mem.eql(u8, cmd, "cat") and rest.len > 0) {
         const data = try vfs.read(gpa, rest[0]);
         defer gpa.free(data);
@@ -262,8 +287,51 @@ pub fn main(init: std.process.Init) !void {
         }
         try out.print("{d} textures: dxt1 {d}, dxt3 {d}, dxt5 {d}, rgba8 {d}; {d} cube maps; {d} with partial mip chains; {d} failed\n", .{ names.items.len, counts[0], counts[1], counts[2], counts[3], cubes, short_mips, failed });
     } else if (std.mem.eql(u8, cmd, "view") and rest.len > 0) {
-        const shot = rest.len > 1 and std.mem.eql(u8, rest[1], "--shot");
-        try zootycon2.viewer.run(gpa, &vfs, rest[0], .{ .screenshot = if (shot) out else null });
+        var shot = false;
+        var vopts: zootycon2.viewer.Options = .{};
+        var k: usize = 1;
+        while (k < rest.len) : (k += 1) {
+            if (std.mem.eql(u8, rest[k], "--shot")) {
+                shot = true;
+            } else if (std.mem.eql(u8, rest[k], "--anim") and k + 1 < rest.len) {
+                k += 1;
+                vopts.anim = rest[k];
+            } else if (std.mem.eql(u8, rest[k], "--time") and k + 1 < rest.len) {
+                k += 1;
+                vopts.time = try std.fmt.parseFloat(f32, rest[k]);
+            } else return fail("view <model> [--anim <name|path.bf>] [--time <s>] [--shot]\n");
+        }
+        if (shot) vopts.screenshot = out;
+        try zootycon2.viewer.run(gpa, &vfs, rest[0], vopts);
+    } else if (std.mem.eql(u8, cmd, "bfcheck")) {
+        const prefix = if (rest.len > 0) rest[0] else "";
+        var names: std.ArrayList([]const u8) = .empty;
+        defer names.deinit(gpa);
+        const Pick = struct {
+            list: *std.ArrayList([]const u8),
+            gpa: std.mem.Allocator,
+            prefix: []const u8,
+            fn add(c: @This(), name: []const u8) anyerror!void {
+                if (std.mem.startsWith(u8, name, c.prefix) and std.mem.endsWith(u8, name, ".bf")) try c.list.append(c.gpa, name);
+            }
+        };
+        try vfs.forEach(Pick{ .list = &names, .gpa = gpa, .prefix = prefix }, Pick.add);
+        var ok: usize = 0;
+        var failed: usize = 0;
+        var skipped: usize = 0;
+        for (names.items) |n| {
+            const data = try vfs.read(gpa, n);
+            defer gpa.free(data);
+            var anim = zootycon2.bf.parse(gpa, data) catch {
+                failed += 1;
+                if (failed <= 10) try out.print("  fail {s}\n", .{n});
+                continue;
+            };
+            defer anim.deinit();
+            ok += 1;
+            skipped += anim.skipped_tracks;
+        }
+        try out.print("{d} animations: {d} parsed, {d} failed; {d} tracks of undecoded types\n", .{ names.items.len, ok, failed, skipped });
     } else if (std.mem.eql(u8, cmd, "nifinfo") and rest.len > 0) {
         const data = try vfs.read(gpa, rest[0]);
         defer gpa.free(data);
