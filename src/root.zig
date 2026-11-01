@@ -19,6 +19,7 @@ pub const world = @import("world.zig");
 pub const sim = @import("sim.zig");
 pub const app = @import("app.zig");
 pub const font = @import("font.zig");
+pub const environment = @import("environment.zig");
 
 test {
     _ = archive;
@@ -39,4 +40,5 @@ test {
     _ = sim;
     _ = app;
     _ = font;
+    _ = environment;
 }

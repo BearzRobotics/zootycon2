@@ -309,6 +309,11 @@ pub fn main(init: std.process.Init) !void {
             } else if (std.mem.eql(u8, arg, "--script") and k + 1 < rest.len) {
                 k += 1;
                 aopts.script = rest[k];
+            } else if (std.mem.eql(u8, arg, "--tod") and k + 1 < rest.len) {
+                k += 1;
+                aopts.tod = try std.fmt.parseFloat(f32, rest[k]);
+            } else if (std.mem.eql(u8, arg, "--clock")) {
+                aopts.tod_auto = true;
             } else if (std.mem.eql(u8, arg, "--no-sim")) {
                 aopts.sim = false;
             } else if (std.mem.eql(u8, arg, "--view")) {
@@ -520,7 +525,25 @@ pub fn main(init: std.process.Init) !void {
                     .geometry => |g| {
                         try o.print("[{d}] {s} \"{s}\"", .{ ref, nf.typeName(@intCast(ref)), g.av.net.name });
                         if (g.data >= 0) switch (nf.blocks[@intCast(g.data)]) {
-                            .mesh_data => |m| try o.print(" verts={d} tris={d} uvsets={d}", .{ m.vertices.len, m.indices.len / 3, m.uv_sets.len }),
+                            .mesh_data => |m| {
+                                try o.print(" verts={d} tris={d} uvsets={d}", .{ m.vertices.len, m.indices.len / 3, m.uv_sets.len });
+                                if (m.colors.len == m.vertices.len and m.colors.len > 0) {
+                                    // Vertex colours at the highest, lowest and most horizontal vertices.
+                                    var hi: usize = 0;
+                                    var lo: usize = 0;
+                                    var mid: usize = 0;
+                                    for (m.vertices, 0..) |v, vi| {
+                                        if (v[2] > m.vertices[hi][2]) hi = vi;
+                                        if (v[2] < m.vertices[lo][2]) lo = vi;
+                                        if (@abs(v[2]) < @abs(m.vertices[mid][2])) mid = vi;
+                                    }
+                                    try o.print(" colors: top z={d:.0} ({d:.2},{d:.2},{d:.2}) mid z={d:.0} ({d:.2},{d:.2},{d:.2}) low z={d:.0} ({d:.2},{d:.2},{d:.2})", .{
+                                        m.vertices[hi][2],  m.colors[hi][0],  m.colors[hi][1],  m.colors[hi][2],
+                                        m.vertices[mid][2], m.colors[mid][0], m.colors[mid][1], m.colors[mid][2],
+                                        m.vertices[lo][2],  m.colors[lo][0],  m.colors[lo][1],  m.colors[lo][2],
+                                    });
+                                }
+                            },
                             else => {},
                         };
                         if (g.skin >= 0) try o.writeAll(" skinned");

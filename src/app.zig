@@ -18,6 +18,8 @@ const entity = @import("entity.zig");
 const platform = @import("platform.zig");
 const map_mod = @import("map.zig");
 const terrain_mod = @import("terrain.zig");
+const environment = @import("environment.zig");
+const xml = @import("xml.zig");
 const vfs_mod = @import("vfs.zig");
 
 const Mat4 = viewer.Mat4;
@@ -36,7 +38,10 @@ const sc = struct {
     const rbracket: u32 = 48;
     const comma: u32 = 54;
     const period: u32 = 55;
+    const t: u32 = 23;
     const f1: u32 = 58;
+    const f2: u32 = 59;
+    const f3: u32 = 60;
     const f5: u32 = 62;
     const f9: u32 = 66;
     const delete: u32 = 76;
@@ -88,6 +93,9 @@ pub const Options = struct {
     tools: bool = true,
     sim: bool = true,
     seed: u64 = 1,
+    /// Time of day to start at (0..1; 0.42 is noon) and whether it advances.
+    tod: f32 = 0.42,
+    tod_auto: bool = false,
     /// Directory saves are written to.
     save_dir: []const u8,
     /// Build commands run at startup, separated by `;` (for tests and demos):
@@ -122,6 +130,12 @@ pub const App = struct {
     sim: sim_mod.Sim,
     look: viewer.TerrainLook,
     opts: Options,
+
+    env: ?environment.Environment = null,
+    tod: f32 = 0.42,
+    tod_auto: bool = false,
+    /// Real seconds per simulated day when the clock runs.
+    day_len: f32 = 480,
 
     synced_rev: u32 = std.math.maxInt(u32),
     synced_terrain_rev: u32 = std.math.maxInt(u32),
@@ -185,6 +199,7 @@ pub const App = struct {
         self.actor_scales.deinit(self.gpa);
         self.inst_anim.deinit(self.gpa);
         self.sim.deinit();
+        if (self.env) |*e| e.deinit();
         self.look.deinit(self.gpa);
         self.reg.deinit();
         self.world.deinit();
@@ -756,6 +771,8 @@ pub const App = struct {
             self.fence_i = pickByName(self.fence_kinds.items, it.rest()) orelse return error.NotFound;
         } else if (std.mem.eql(u8, verb, "yaw")) {
             self.yaw = try num(it.next());
+        } else if (std.mem.eql(u8, verb, "tod")) {
+            self.tod = try num(it.next());
         } else return error.UnknownCommand;
     }
 
@@ -781,6 +798,8 @@ pub const App = struct {
             .{ .n = "esc", .c = 41 },
             .{ .n = "f5", .c = sc.f5 },
             .{ .n = "f9", .c = sc.f9 },
+            .{ .n = "f2", .c = sc.f2 },
+            .{ .n = "f3", .c = sc.f3 },
             .{ .n = "shift", .c = sc.lshift },
         };
         for (names) |e| if (std.ascii.eqlIgnoreCase(e.n, name)) return e.c;
@@ -873,6 +892,29 @@ pub const App = struct {
 
     // ------------------------------------------------------------- events
 
+    const phase_times = [_]f32{ 0.0, 0.07, 0.13, 0.42, 0.7, 0.9 };
+    const phase_names = [_][]const u8{ "NIGHT", "SUNRISE", "MORNING", "NOON", "AFTERNOON", "SUNSET" };
+
+    fn phaseIndex(tod: f32) usize {
+        var idx: usize = 0;
+        for (phase_times, 0..) |pt, i| if (pt <= tod + 1e-4) {
+            idx = i;
+        };
+        return idx;
+    }
+
+    /// Moves the clock to the previous or next named part of the day.
+    fn jumpPhase(self: *App, delta: i32) void {
+        const n: i32 = phase_times.len;
+        const cur: i32 = @intCast(phaseIndex(self.tod));
+        // If between phases, "next" goes forward and "previous" snaps back to this one.
+        var target = cur + delta;
+        if (delta < 0 and self.tod > phase_times[@intCast(cur)] + 0.01) target = cur;
+        target = @mod(target, n);
+        self.tod = phase_times[@intCast(target)];
+        self.say("time: {s}", .{phase_names[@intCast(target)]});
+    }
+
     fn cycle(i: *usize, len: usize, delta: i32) void {
         if (len == 0) return;
         const n: i64 = @intCast(len);
@@ -926,6 +968,12 @@ pub const App = struct {
                         self.title_dirty = true;
                     },
                     sc.f1 => self.show_help = !self.show_help,
+                    sc.t => {
+                        self.tod_auto = !self.tod_auto;
+                        self.say("time of day {s}", .{if (self.tod_auto) "running" else "stopped"});
+                    },
+                    sc.f2 => self.jumpPhase(-1),
+                    sc.f3 => self.jumpPhase(1),
                     sc.f5 => self.saveWorld() catch |e| self.say("save failed: {s}", .{@errorName(e)}),
                     sc.f9 => self.loadSaved() catch |e| self.say("load failed: {s}", .{@errorName(e)}),
                     else => if (self.opts.tools) self.toolKey(k.scancode),
@@ -1125,10 +1173,13 @@ pub const App = struct {
         }
 
         // Top right: simulation status.
-        const status = std.fmt.bufPrint(&buf, "{s} X{d:.2}   {d} AGENTS", .{
+        const status = std.fmt.bufPrint(&buf, "{s} X{d:.2}   {d} AGENTS   {s} {d:.2}{s}", .{
             if (self.paused) "PAUSED" else "RUNNING",
             self.speed,
             self.sim.agents.items.len,
+            phase_names[phaseIndex(self.tod)],
+            self.tod,
+            if (self.tod_auto) "+" else "",
         }) catch "";
         const sw = viewer.Ui.textWidth(status, scale);
         try ui.label(ui.width - sw - pad, pad, scale, status, white);
@@ -1145,10 +1196,12 @@ pub const App = struct {
             const lines = if (self.opts.tools) [_][]const u8{
                 "1 SELECT  2 OBJECT  3 FENCE  4 PATH  5 RAISE  6 LOWER  7 FLATTEN  8 ANIMAL/PERSON",
                 "[ ] CHOOSE (SHIFT: x10)  R ROTATE  Z UNDO  TAB PAUSE  , . SPEED  F5 SAVE  F9 LOAD",
+                "T RUN/STOP CLOCK   F2 F3 PREVIOUS/NEXT TIME OF DAY",
                 "RIGHT-DRAG ORBIT   WHEEL ZOOM   WASD PAN   F1 HIDE THIS   ESC QUIT",
             } else [_][]const u8{
-                "TAB PAUSE  , . SPEED",
+                "TAB PAUSE  , . SPEED   T RUN/STOP CLOCK   F2 F3 TIME OF DAY",
                 "RIGHT OR LEFT-DRAG ORBIT   WHEEL ZOOM   WASD PAN   ESC QUIT",
+                "",
                 "",
             };
             var by = ui.height - pad - line * @as(f32, @floatFromInt(lines.len));
@@ -1195,6 +1248,12 @@ pub const App = struct {
 
     pub fn frame(self: *App, ctx: *viewer.FrameCtx) !void {
         self.playInput(ctx);
+        if (self.tod_auto) {
+            self.tod += ctx.dt * (if (self.paused) 0 else self.speed) / self.day_len;
+            self.tod -= @floor(self.tod);
+        }
+        self.scene.tod = self.tod;
+        self.scene.lighting = if (self.env) |*e| e.sample(self.tod) else null;
         try self.syncScene(ctx.secs);
 
         // Hover point under the mouse.
@@ -1256,6 +1315,25 @@ pub fn loadWorld(gpa: std.mem.Allocator, io: Io, vfs: *vfs_mod.Vfs, path: []cons
     return world_mod.World.fromMap(gpa, &mp, terr);
 }
 
+/// Loads the lights, fog and sky timing for a map's environment file; null
+/// if it cannot be found (the renderer then uses plain lighting).
+fn loadEnvironment(gpa: std.mem.Allocator, vfs: *vfs_mod.Vfs, env_path: []const u8) ?environment.Environment {
+    if (env_path.len == 0) return null;
+    const env_bytes = vfs.read(gpa, env_path) catch return null;
+    defer gpa.free(env_bytes);
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const root = xml.parse(arena.allocator(), env_bytes, null) catch return null;
+    const lights_path = root.attr("lights") orelse return null;
+    const lights = vfs.read(gpa, lights_path) catch return null;
+    defer gpa.free(lights);
+    const fog: ?[]u8 = if (root.child("fog")) |f| (if (f.attr("file")) |p| vfs.read(gpa, p) catch null else null) else null;
+    defer if (fog) |b| gpa.free(b);
+    const sky: ?[]u8 = if (root.child("skylayers")) |f| (if (f.attr("file")) |p| vfs.read(gpa, p) catch null else null) else null;
+    defer if (sky) |b| gpa.free(b);
+    return environment.Environment.parse(gpa, lights, fog, sky) catch null;
+}
+
 pub fn run(gpa: std.mem.Allocator, io: Io, vfs: *vfs_mod.Vfs, path: []const u8, opts: Options) !void {
     var world = try loadWorld(gpa, io, vfs, path);
     errdefer world.deinit();
@@ -1272,6 +1350,9 @@ pub fn run(gpa: std.mem.Allocator, io: Io, vfs: *vfs_mod.Vfs, path: []const u8, 
 
     var look = try viewer.terrainLook(gpa, vfs, &scene, &world.terrain);
     errdefer look.deinit(gpa);
+    var env = loadEnvironment(gpa, vfs, world.environment);
+    errdefer if (env) |*e| e.deinit();
+    scene.loadSky(if (env) |e| e.sky_times else &.{}) catch |e| std.debug.print("no sky: {s}\n", .{@errorName(e)});
 
     var reg = entity.Registry.init(gpa);
     errdefer reg.deinit();
@@ -1287,6 +1368,9 @@ pub fn run(gpa: std.mem.Allocator, io: Io, vfs: *vfs_mod.Vfs, path: []const u8, 
         .reg = reg,
         .sim = sim_mod.Sim.init(gpa, opts.seed),
         .look = look,
+        .env = env,
+        .tod = opts.tod,
+        .tod_auto = opts.tod_auto,
         .opts = opts,
         .catalog_arena = .init(gpa),
     };

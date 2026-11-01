@@ -98,6 +98,7 @@ pub const Gl = struct {
     getUniformLocation: *const fn (Uint, [*:0]const u8) callconv(C) Int = undefined,
     uniform1i: *const fn (Int, Int) callconv(C) void = undefined,
     uniform1f: *const fn (Int, Float) callconv(C) void = undefined,
+    uniform3fv: *const fn (Int, Sizei, [*]const Float) callconv(C) void = undefined,
     uniform3f: *const fn (Int, Float, Float, Float) callconv(C) void = undefined,
     uniform4f: *const fn (Int, Float, Float, Float, Float) callconv(C) void = undefined,
     uniformMatrix4fv: *const fn (Int, Sizei, u8, [*]const Float) callconv(C) void = undefined,

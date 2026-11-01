@@ -59,6 +59,7 @@ shows the current tool, the selected item, and the last message.
 | `8` | place an animal or person (`[` `]` choose) |
 | `Z` | undo |
 | `Tab`, `,`, `.` | pause, slower, faster simulation |
+| `T`, `F2`, `F3` | run or stop the clock, previous or next time of day |
 | `F5`, `F9` | save, load the last save |
 
 An on-screen display shows the current tool, a hint for it, the simulation
@@ -104,6 +105,7 @@ zootycon2 play maps/default/alpinesml.zt2 --shot \
 | `nif.zig`, `bf.zig`, `dds.zig`, `model.zig` | models, skeletal animation, textures, manifests/materials |
 | `terrain.zig`, `map.zig` | `.dat` terrain and `.zt2` maps/saves |
 | `world.zig` | the editable world and its save format |
+| `environment.zig` | time-of-day lights, ambient and fog from the game's lighting files |
 | `sim.zig` | agents, walkway graph, idle/walk tasks, fence blocking |
 | `viewer.zig`, `gl.zig`, `platform/` | OpenGL 3.3 renderer, SDL3 binding |
 | `app.zig` | the interactive app: tools, picking, undo, save/load, input driver |

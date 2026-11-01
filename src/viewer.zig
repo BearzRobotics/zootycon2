@@ -12,6 +12,7 @@ const terrain_mod = @import("terrain.zig");
 const map_mod = @import("map.zig");
 const entity = @import("entity.zig");
 const font = @import("font.zig");
+const environment = @import("environment.zig");
 const bf = @import("bf.zig");
 const vfs_mod = @import("vfs.zig");
 const platform = @import("platform.zig");
@@ -160,6 +161,13 @@ const fs_src: [:0]const u8 =
     \\uniform sampler2D uTex;
     \\uniform sampler2D uTex2;
     \\uniform int uTerrain;
+    \\uniform int uLightSet;      // 0 terrain and ground decals, 1 objects
+    \\uniform vec3 uAmb[2];
+    \\uniform vec3 uLdir[6];
+    \\uniform vec3 uLcol[6];
+    \\uniform vec3 uFogColor;
+    \\uniform vec2 uFogRange;
+    \\uniform vec3 uEye;
     \\uniform vec4 uTint;
     \\uniform float uAlphaCut;
     \\out vec4 outColor;
@@ -177,9 +185,15 @@ const fs_src: [:0]const u8 =
     \\    c = mix(flat_c, texture(uTex2, vUv * 0.5), steep);
     \\  }
     \\  if (c.a < uAlphaCut) discard;
-    \\  vec3 l = normalize(vec3(0.4, -0.5, 0.8));
-    \\  float d = abs(dot(n, l));
-    \\  outColor = vec4(c.rgb * (0.4 + 0.6 * d), c.a);
+    \\  // Two-sided lighting: flip the normal towards the viewer.
+    \\  vec3 toEye = uEye - vP;
+    \\  if (dot(n, toEye) < 0.0) n = -n;
+    \\  vec3 lit = uAmb[uLightSet];
+    \\  for (int i = 0; i < 3; i++) {
+    \\    lit += uLcol[uLightSet * 3 + i] * max(dot(n, -uLdir[uLightSet * 3 + i]), 0.0);
+    \\  }
+    \\  float fogF = clamp((length(toEye) - uFogRange.x) / max(uFogRange.y - uFogRange.x, 1.0), 0.0, 1.0);
+    \\  outColor = vec4(mix(c.rgb * lit, uFogColor, fogF), c.a);
     \\}
 ;
 
@@ -273,6 +287,39 @@ fn poseNode(world: []Mat4, nf: *const nif.Nif, ref: nif.Ref, parent: Mat4, anim:
         else => {},
     }
 }
+
+const sky_vs: [:0]const u8 =
+    \\#version 330 core
+    \\layout(location=0) in vec3 aPos;
+    \\layout(location=1) in vec3 aColor;
+    \\uniform mat4 uVP;
+    \\uniform vec3 uEye;
+    \\uniform float uScale;
+    \\out vec3 vColor;
+    \\out vec3 vDir;
+    \\void main() {
+    \\  vColor = aColor;
+    \\  vDir = aPos;
+    \\  gl_Position = uVP * vec4(aPos * uScale + uEye, 1.0);
+    \\}
+;
+
+const sky_fs: [:0]const u8 =
+    \\#version 330 core
+    \\in vec3 vColor;
+    \\in vec3 vDir;
+    \\uniform vec3 uSunDir;   // unit vector towards the sun (or moon)
+    \\uniform vec3 uSunCol;
+    \\out vec4 outColor;
+    \\void main() {
+    \\  vec3 d = normalize(vDir);
+    \\  float s = dot(d, uSunDir);
+    \\  float disc = smoothstep(0.9988, 0.9994, s);
+    \\  float glow = pow(max(s, 0.0), 48.0) * 0.45;
+    \\  vec3 col = vColor + uSunCol * (disc + glow);
+    \\  outColor = vec4(col, 1.0);
+    \\}
+;
 
 const ui_vs: [:0]const u8 =
     \\#version 330 core
@@ -379,7 +426,31 @@ const Skin = struct {
     offsets: []const Mat4,
 };
 
+fn dist_far_for(cam: Camera) f32 {
+    return cam.dist + cam.radius * 10;
+}
+
+/// Plain lighting for scenes without an environment.
+pub fn defaultLighting() environment.Sample {
+    return .{
+        .ambient = .{ .{ 0.4, 0.4, 0.4 }, .{ 0.4, 0.4, 0.4 } },
+        .dir = .{
+            .{ .{ -0.4, 0.5, -0.8 }, .{ 0, 0, -1 }, .{ 0, 0, -1 } },
+            .{ .{ -0.4, 0.5, -0.8 }, .{ 0, 0, -1 }, .{ 0, 0, -1 } },
+        },
+        .color = .{
+            .{ .{ 0.6, 0.6, 0.6 }, .{ 0, 0, 0 }, .{ 0, 0, 0 } },
+            .{ .{ 0.6, 0.6, 0.6 }, .{ 0, 0, 0 }, .{ 0, 0, 0 } },
+        },
+        .fog_color = .{ 0.6, 0.7, 0.8 },
+        .fog_start = 0,
+        .fog_end = 1000,
+    };
+}
+
 pub const Draw = struct {
+    /// Which light set shades this draw: 0 terrain and ground decals, 1 objects.
+    light_set: i32 = 1,
     /// Camera distances (near, far) between which this draw is shown, for
     /// models with levels of detail.
     lod_range: [2]f32 = .{ 0, std.math.inf(f32) },
@@ -432,6 +503,34 @@ pub const ActorHead = struct {
 pub fn rotationZ(yaw: f32) Mat4 {
     return fromTransform(.{ .translation = .{ 0, 0, 0 }, .rotation = .{ @cos(yaw), -@sin(yaw), 0, @sin(yaw), @cos(yaw), 0, 0, 0, 1 }, .scale = 1 });
 }
+
+/// A sky dome whose vertex colours are blended between time-of-day models.
+pub const SkyDome = struct {
+    vao: gl.Uint,
+    col_vbo: gl.Uint,
+    index_count: gl.Sizei,
+    /// `keys[k]` holds the 3 floats of colour per vertex for keyframe k.
+    keys: [][]f32,
+    times: []f32,
+    scratch: []f32,
+
+    fn deinit(self: *SkyDome, gpa: std.mem.Allocator) void {
+        for (self.keys) |k| gpa.free(k);
+        gpa.free(self.keys);
+        gpa.free(self.times);
+        gpa.free(self.scratch);
+    }
+
+    /// Blends the keyframes for `tod` and uploads the colours.
+    fn update(self: *SkyDome, g: *const Gl, tod: f32) void {
+        const b = environment.skyBlend(self.times, tod);
+        const a = self.keys[@min(b.i, self.keys.len - 1)];
+        const c = self.keys[@min(b.j, self.keys.len - 1)];
+        for (self.scratch, a, c) |*out, x, y| out.* = x + (y - x) * b.f;
+        g.bindBuffer(gl.ARRAY_BUFFER, self.col_vbo);
+        g.bufferSubData(gl.ARRAY_BUFFER, 0, @intCast(self.scratch.len * 4), self.scratch.ptr);
+    }
+};
 
 /// An animated figure: its own copy of the node transforms.
 pub const Instance = struct {
@@ -492,6 +591,12 @@ pub const Scene = struct {
     build_h: f32 = 0,
     /// While building placed models: keep every LOD level, tagged by range.
     lod_all: bool = false,
+    /// Light, fog and sky for the current time of day.
+    lighting: ?environment.Sample = null,
+    sky: ?SkyDome = null,
+    /// Time of day, 0..1, used for the sky colours.
+    tod: f32 = 0.42,
+    fog_scale: f32 = 800.0,
     cur_lod: [2]f32 = .{ 0, std.math.inf(f32) },
     /// Multiplies LOD distances: the data's ranges are tuned for the
     /// original game's closer camera.
@@ -537,6 +642,7 @@ pub const Scene = struct {
     pub fn deinit(self: *Scene) void {
         self.draws.deinit(self.gpa);
         self.gpa.free(self.world);
+        if (self.sky) |*sk| sk.deinit(self.gpa);
         self.actor_draws.deinit(self.gpa);
         self.overlay.deinit(self.gpa);
         var bit = self.model_bounds.keyIterator();
@@ -883,6 +989,85 @@ pub const Scene = struct {
         self.g.deleteVertexArrays(1, @ptrCast(&d.vao));
     }
 
+    /// Loads the sky dome from the generic time-of-day models. `times` are
+    /// the keyframe times from the environment (seven expected; defaults are
+    /// used otherwise). Missing files leave the scene without a sky.
+    pub fn loadSky(self: *Scene, times: []const f32) !void {
+        const names = [_][]const u8{ "night", "sunrise", "midmorning", "noon", "afternoon", "sunset", "night" };
+        const default_times = [_]f32{ 0, 0.07, 0.13, 0.42, 0.7, 0.9, 1.0 };
+        const use_times: []const f32 = if (times.len == names.len) times else &default_times;
+        var keys: std.ArrayList([]f32) = .empty;
+        errdefer {
+            for (keys.items) |k| self.gpa.free(k);
+            keys.deinit(self.gpa);
+        }
+        var positions: ?[]f32 = null;
+        defer if (positions) |p| self.gpa.free(p);
+        var indices: ?[]u16 = null;
+        defer if (indices) |p| self.gpa.free(p);
+        var n_verts: usize = 0;
+        for (names) |nm| {
+            var path_buf: [128]u8 = undefined;
+            const path = std.fmt.bufPrint(&path_buf, "world/environments/sky/blueinterp/skysphere_{s}.nif", .{nm}) catch return;
+            const bytes = self.vfs.read(self.gpa, path) catch return;
+            defer self.gpa.free(bytes);
+            var nf = nif.parse(self.gpa, bytes) catch return;
+            defer nf.deinit();
+            var md: ?nif.MeshData = null;
+            for (nf.blocks) |blk| switch (blk) {
+                .mesh_data => |m| if (md == null) {
+                    md = m;
+                },
+                else => {},
+            };
+            const m = md orelse return;
+            if (m.colors.len != m.vertices.len or m.vertices.len == 0) return;
+            if (positions == null) {
+                n_verts = m.vertices.len;
+                const p = try self.gpa.alloc(f32, n_verts * 3);
+                for (m.vertices, 0..) |v, i| {
+                    p[i * 3] = v[0];
+                    p[i * 3 + 1] = v[1];
+                    p[i * 3 + 2] = v[2];
+                }
+                positions = p;
+                indices = try self.gpa.dupe(u16, m.indices);
+            } else if (m.vertices.len != n_verts) return;
+            const col = try self.gpa.alloc(f32, n_verts * 3);
+            for (m.colors, 0..) |c, i| {
+                col[i * 3] = c[0];
+                col[i * 3 + 1] = c[1];
+                col[i * 3 + 2] = c[2];
+            }
+            try keys.append(self.gpa, col);
+        }
+        const g = self.g;
+        var vao: gl.Uint = 0;
+        var bufs: [3]gl.Uint = undefined;
+        g.genVertexArrays(1, @ptrCast(&vao));
+        g.bindVertexArray(vao);
+        g.genBuffers(3, &bufs);
+        g.bindBuffer(gl.ARRAY_BUFFER, bufs[0]);
+        g.bufferData(gl.ARRAY_BUFFER, @intCast(positions.?.len * 4), positions.?.ptr, gl.STATIC_DRAW);
+        g.enableVertexAttribArray(0);
+        g.vertexAttribPointer(0, 3, gl.FLOAT, 0, 12, @ptrFromInt(0));
+        g.bindBuffer(gl.ARRAY_BUFFER, bufs[1]);
+        g.bufferData(gl.ARRAY_BUFFER, @intCast(n_verts * 12), keys.items[0].ptr, gl.DYNAMIC_DRAW);
+        g.enableVertexAttribArray(1);
+        g.vertexAttribPointer(1, 3, gl.FLOAT, 0, 12, @ptrFromInt(0));
+        g.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, bufs[2]);
+        g.bufferData(gl.ELEMENT_ARRAY_BUFFER, @intCast(indices.?.len * 2), indices.?.ptr, gl.STATIC_DRAW);
+        g.bindVertexArray(0);
+        self.sky = .{
+            .vao = vao,
+            .col_vbo = bufs[1],
+            .index_count = @intCast(indices.?.len),
+            .keys = try keys.toOwnedSlice(self.gpa),
+            .times = try self.gpa.dupe(f32, use_times),
+            .scratch = try self.gpa.alloc(f32, n_verts * 3),
+        };
+    }
+
     /// Drops every static draw (props, fences, paths), keeping the terrain,
     /// the animated figures and all cached models.
     pub fn clearStatic(self: *Scene) void {
@@ -960,6 +1145,7 @@ pub const Scene = struct {
         const up = self.uploadMeshOwned(buf, idx.ptr, idx.len * 4);
         if (self.terrain) |old| self.freeDraw(old);
         self.terrain = .{
+            .light_set = 0,
             .owned = up.bufs,
             .dynamic = false,
             .index_type = gl.UNSIGNED_INT,
@@ -1021,6 +1207,7 @@ pub const Scene = struct {
             const up = self.uploadMeshOwned(verts.items, idx.items.ptr, idx.items.len * 4);
             const vao = up.vao;
             try self.draws.append(self.gpa, .{
+                .light_set = 0,
                 .owned = up.bufs,
                 .depth_write = false,
                 .dynamic = false,
@@ -1461,6 +1648,20 @@ pub const Gfx = struct {
     u_decal: gl.Int,
     u_decal_mode: gl.Int,
     u_flat: [3]gl.Int,
+    u_lightset: gl.Int,
+    u_amb: gl.Int,
+    u_ldir: gl.Int,
+    u_lcol: gl.Int,
+    u_fogcol: gl.Int,
+    u_fogrange: gl.Int,
+    u_eye: gl.Int,
+    // sky dome
+    sky_prog: gl.Uint,
+    sky_vp: gl.Int,
+    sky_eye: gl.Int,
+    sky_scale: gl.Int,
+    sky_sun: gl.Int,
+    sky_suncol: gl.Int,
     // 2D overlay
     ui_prog: gl.Uint,
     ui_screen: gl.Int,
@@ -1511,6 +1712,19 @@ pub const Gfx = struct {
             g.getUniformLocation(self.prog, "uFlat2"),
             g.getUniformLocation(self.prog, "uFlat3"),
         };
+        self.u_lightset = g.getUniformLocation(self.prog, "uLightSet");
+        self.u_amb = g.getUniformLocation(self.prog, "uAmb");
+        self.u_ldir = g.getUniformLocation(self.prog, "uLdir");
+        self.u_lcol = g.getUniformLocation(self.prog, "uLcol");
+        self.u_fogcol = g.getUniformLocation(self.prog, "uFogColor");
+        self.u_fogrange = g.getUniformLocation(self.prog, "uFogRange");
+        self.u_eye = g.getUniformLocation(self.prog, "uEye");
+        self.sky_prog = try makeProgramFrom(g, sky_vs, sky_fs);
+        self.sky_vp = g.getUniformLocation(self.sky_prog, "uVP");
+        self.sky_eye = g.getUniformLocation(self.sky_prog, "uEye");
+        self.sky_scale = g.getUniformLocation(self.sky_prog, "uScale");
+        self.sky_sun = g.getUniformLocation(self.sky_prog, "uSunDir");
+        self.sky_suncol = g.getUniformLocation(self.sky_prog, "uSunCol");
         try self.initUi();
     }
 
@@ -1705,6 +1919,7 @@ fn drawItem(gfx: *Gfx, scene: *Scene, d: Draw, fr: *const Frustum) void {
     g.activeTexture(gl.TEXTURE0 + 1);
     g.bindTexture(gl.TEXTURE_2D, d.texture2);
     g.uniform1i(gfx.u_terrain, if (d.texture2 != 0) 1 else 0);
+    g.uniform1i(gfx.u_lightset, d.light_set);
     if (d.texture2 != 0) for (d.flat_extra, 0..) |tx, i| {
         g.activeTexture(gl.TEXTURE0 + 3 + @as(gl.Enum, @intCast(i)));
         g.bindTexture(gl.TEXTURE_2D, tx);
@@ -1831,7 +2046,8 @@ pub fn loopWith(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Came
         cam.center[1] += mv[1] * cam.dist * dt * 0.8;
 
         g.viewport(0, 0, @intCast(size.width), @intCast(size.height));
-        g.clearColor(0.18, 0.2, 0.24, 1);
+        // Beyond the map edge shows the fog colour, like distant haze.
+        if (scene.lighting) |lt| g.clearColor(lt.fog_color[0], lt.fog_color[1], lt.fog_color[2], 1) else g.clearColor(0.18, 0.2, 0.24, 1);
         g.depthMask(1); // decals turn depth writes off; clearing needs them on
         g.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
@@ -1853,8 +2069,51 @@ pub fn loopWith(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Came
 
         if (scene.instances.items.len > 0) scene.poseInstances(@as(f32, @floatFromInt(now_ms - start_ms)) / 1000.0);
 
+        // Sky first, without depth, centred on the eye.
+        if (scene.sky) |*sk| {
+            const tod_for_sky = scene.tod;
+            sk.update(g, tod_for_sky);
+            const sample = scene.lighting orelse defaultLighting();
+            // The sun is where the main light comes from.
+            const sd = sample.dir[1][0];
+            g.disable(gl.DEPTH_TEST);
+            g.depthMask(0);
+            g.disable(gl.BLEND);
+            g.useProgram(gfx.sky_prog);
+            g.uniformMatrix4fv(gfx.sky_vp, 1, 0, &vp);
+            g.uniform3f(gfx.sky_eye, eye[0], eye[1], eye[2]);
+            g.uniform1f(gfx.sky_scale, (dist_far_for(cam)) * 0.45 / 3.0);
+            g.uniform3f(gfx.sky_sun, -sd[0], -sd[1], -sd[2]);
+            const sc = sample.color[1][0];
+            g.uniform3f(gfx.sky_suncol, sc[0], sc[1], sc[2]);
+            g.bindVertexArray(sk.vao);
+            g.drawElements(gl.TRIANGLES, sk.index_count, gl.UNSIGNED_SHORT, null);
+            g.bindVertexArray(0);
+            g.enable(gl.DEPTH_TEST);
+            g.depthMask(1);
+        }
+
         g.useProgram(gfx.prog);
         g.uniformMatrix4fv(gfx.u_vp, 1, 0, &vp);
+        {
+            const s = scene.lighting orelse defaultLighting();
+            var amb: [6]f32 = undefined;
+            var dirs: [18]f32 = undefined;
+            var cols: [18]f32 = undefined;
+            for (0..2) |si| {
+                for (0..3) |k| amb[si * 3 + k] = s.ambient[si][k];
+                for (0..3) |li| for (0..3) |k| {
+                    dirs[(si * 3 + li) * 3 + k] = s.dir[si][li][k];
+                    cols[(si * 3 + li) * 3 + k] = s.color[si][li][k];
+                };
+            }
+            g.uniform3fv(gfx.u_amb, 2, &amb);
+            g.uniform3fv(gfx.u_ldir, 6, &dirs);
+            g.uniform3fv(gfx.u_lcol, 6, &cols);
+            g.uniform3f(gfx.u_fogcol, s.fog_color[0], s.fog_color[1], s.fog_color[2]);
+            g.uniform2f(gfx.u_fogrange, s.fog_start * scene.fog_scale, s.fog_end * scene.fog_scale);
+            g.uniform3f(gfx.u_eye, eye[0], eye[1], eye[2]);
+        }
         g.uniform1i(gfx.u_tex, 0);
         g.uniform1i(gfx.u_tex2, 1);
         g.uniform1i(gfx.u_decal, 2);
