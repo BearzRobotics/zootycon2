@@ -352,6 +352,56 @@ pub fn parseDiag(gpa: std.mem.Allocator, data: []const u8, diag: ?*Diagnostic) E
     return nif;
 }
 
+const GeometryCommon = struct {
+    num_vertices: usize,
+    vertices: []const Vec3,
+    normals: []const Vec3,
+    colors: []const [4]f32,
+    uv_sets: []const []const [2]f32,
+};
+
+/// The NiGeometryData fields shared by every geometry data block.
+fn readGeometryCommon(r: *Reader) Error!GeometryCommon {
+    const a = r.a;
+    const n_verts = try r.u16_();
+    const nv: usize = n_verts;
+    var vertices: []const Vec3 = &.{};
+    if (try r.bool_()) {
+        _ = try r.count(n_verts, 12);
+        const v = try a.alloc(Vec3, nv);
+        for (v) |*x| x.* = try r.vec3();
+        vertices = v;
+    }
+    const data_flags = try r.u16_();
+    var normals: []const Vec3 = &.{};
+    if (try r.bool_()) {
+        _ = try r.count(n_verts, 12);
+        const v = try a.alloc(Vec3, nv);
+        for (v) |*x| x.* = try r.vec3();
+        normals = v;
+        // Tangents and bitangents follow when bit 12 of the data flags is set.
+        if (data_flags & 0x1000 != 0) try r.skip(nv * 24);
+    }
+    try r.skip(16); // bounding sphere
+    var colors: []const [4]f32 = &.{};
+    if (try r.bool_()) {
+        _ = try r.count(n_verts, 16);
+        const v = try a.alloc([4]f32, nv);
+        for (v) |*x| x.* = .{ try r.f32_(), try r.f32_(), try r.f32_(), try r.f32_() };
+        colors = v;
+    }
+    const num_uv = data_flags & 63;
+    const uv_sets = try a.alloc([]const [2]f32, num_uv);
+    for (uv_sets) |*set| {
+        _ = try r.count(n_verts, 8);
+        const v = try a.alloc([2]f32, nv);
+        for (v) |*x| x.* = .{ try r.f32_(), try r.f32_() };
+        set.* = v;
+    }
+    try r.skip(2); // consistency flags
+    return .{ .num_vertices = nv, .vertices = vertices, .normals = normals, .colors = colors, .uv_sets = uv_sets };
+}
+
 fn readBlock(r: *Reader, type_name: []const u8) Error!Block {
     const a = r.a;
     const eql = std.mem.eql;
@@ -363,7 +413,6 @@ fn readBlock(r: *Reader, type_name: []const u8) Error!Block {
         var kind: NodeKind = .node;
         if (eql(u8, type_name, "NiBillboardNode")) {
             kind = .billboard;
-            try r.skip(0);
         } else if (eql(u8, type_name, "NiLODNode")) {
             kind = .lod;
             try r.skip(4 + 12); // index, LOD center
@@ -373,7 +422,9 @@ fn readBlock(r: *Reader, type_name: []const u8) Error!Block {
         return .{ .node = .{ .kind = kind, .av = av, .children = children, .effects = effects } };
     }
 
-    if (eql(u8, type_name, "NiTriShape") or eql(u8, type_name, "NiTriStrips")) {
+    if (eql(u8, type_name, "NiTriShape") or eql(u8, type_name, "NiTriStrips") or
+        eql(u8, type_name, "NiParticles") or eql(u8, type_name, "NiParticleMeshes"))
+    {
         const av = try r.avObject();
         const data = try r.i32_();
         const skin = try r.i32_();
@@ -386,44 +437,18 @@ fn readBlock(r: *Reader, type_name: []const u8) Error!Block {
         return .{ .geometry = .{ .av = av, .data = data, .skin = skin, .shader_name = shader } };
     }
 
-    if (eql(u8, type_name, "NiTriShapeData") or eql(u8, type_name, "NiTriStripsData")) {
-        const n_verts = try r.u16_();
-        const nv: usize = try r.count(n_verts, 0);
-        var vertices: []const Vec3 = &.{};
-        if (try r.bool_()) {
-            _ = try r.count(n_verts, 12);
-            const v = try a.alloc(Vec3, nv);
-            for (v) |*x| x.* = try r.vec3();
-            vertices = v;
-        }
-        const data_flags = try r.u16_();
-        var normals: []const Vec3 = &.{};
-        if (try r.bool_()) {
-            _ = try r.count(n_verts, 12);
-            const v = try a.alloc(Vec3, nv);
-            for (v) |*x| x.* = try r.vec3();
-            normals = v;
-            // Tangents and bitangents follow when bit 12 of the data flags is set.
-            if (data_flags & 0x1000 != 0) try r.skip(nv * 24);
-        }
-        try r.skip(16); // bounding sphere
-        var colors: []const [4]f32 = &.{};
-        if (try r.bool_()) {
-            _ = try r.count(n_verts, 16);
-            const v = try a.alloc([4]f32, nv);
-            for (v) |*x| x.* = .{ try r.f32_(), try r.f32_(), try r.f32_(), try r.f32_() };
-            colors = v;
-        }
-        const num_uv = data_flags & 63;
-        const uv_sets = try a.alloc([]const [2]f32, num_uv);
-        for (uv_sets) |*set| {
-            _ = try r.count(n_verts, 8);
-            const v = try a.alloc([2]f32, nv);
-            for (v) |*x| x.* = .{ try r.f32_(), try r.f32_() };
-            set.* = v;
-        }
-        try r.skip(2); // consistency flags
+    if (eql(u8, type_name, "NiParticlesData") or eql(u8, type_name, "NiParticleMeshesData")) {
+        const g = try readGeometryCommon(r);
+        try r.skip(4); // particle radius
+        try r.skip(2); // number of active particles
+        if (try r.bool_()) try r.skip(g.num_vertices * 4); // sizes
+        if (try r.bool_()) try r.skip(g.num_vertices * 16); // rotations
+        if (eql(u8, type_name, "NiParticleMeshesData")) try r.skip(4); // container node
+        return .{ .mesh_data = .{ .vertices = g.vertices, .normals = g.normals, .colors = g.colors, .uv_sets = g.uv_sets, .indices = &.{} } };
+    }
 
+    if (eql(u8, type_name, "NiTriShapeData") or eql(u8, type_name, "NiTriStripsData")) {
+        const g = try readGeometryCommon(r);
         var indices: std.ArrayList(u16) = .empty;
         if (eql(u8, type_name, "NiTriShapeData")) {
             const n_tris = try r.u16_();
@@ -461,10 +486,10 @@ fn readBlock(r: *Reader, type_name: []const u8) Error!Block {
             }
         }
         return .{ .mesh_data = .{
-            .vertices = vertices,
-            .normals = normals,
-            .colors = colors,
-            .uv_sets = uv_sets,
+            .vertices = g.vertices,
+            .normals = g.normals,
+            .colors = g.colors,
+            .uv_sets = g.uv_sets,
             .indices = indices.items,
         } };
     }
@@ -670,6 +695,139 @@ fn readBlock(r: *Reader, type_name: []const u8) Error!Block {
         }
         const n2 = try r.count(try r.u32_(), 4);
         try r.skip(n2 * 4);
+        return .other;
+    }
+
+
+    // ---- lights and effects ----
+    if (eql(u8, type_name, "NiDirectionalLight") or eql(u8, type_name, "NiAmbientLight") or eql(u8, type_name, "NiPointLight")) {
+        _ = try r.avObject();
+        try r.skip(4 + 36); // dimmer, ambient/diffuse/specular
+        if (eql(u8, type_name, "NiPointLight")) try r.skip(12);
+        return .other;
+    }
+    if (eql(u8, type_name, "NiTextureEffect")) {
+        _ = try r.avObject();
+        try r.skip(36 + 12 + 4 * 4 + 4 + 1 + 16 + 4);
+        return .other;
+    }
+
+    // ---- particle system ----
+    if (eql(u8, type_name, "NiParticleSystemController")) {
+        try r.controllerBase();
+        try r.skip(24 + 12 + 16 + 4 + 4 + 4 + 1 + 4 + 4 + 4 + 1 + 1 + 12 + 4);
+        try r.skip(2 + 4 + 2 + 4 + 4); // spawn generations .. dir chaos
+        const n_particles = try r.u16_();
+        try r.skip(2); // num valid
+        _ = try r.count(n_particles, 40);
+        try r.skip(@as(usize, n_particles) * 40);
+        try r.skip(4 + 4 + 4 + 1); // emitter modifier, particle modifier, collider, static target bound
+        return .other;
+    }
+    if (eql(u8, type_name, "NiParticleGrowFade")) {
+        try r.skip(8 + 8);
+        return .other;
+    }
+    if (eql(u8, type_name, "NiParticleRotation")) {
+        try r.skip(8 + 1 + 12 + 4);
+        return .other;
+    }
+    if (eql(u8, type_name, "NiParticleColorModifier")) {
+        try r.skip(8 + 4);
+        return .other;
+    }
+    if (eql(u8, type_name, "NiGravity")) {
+        try r.skip(8 + 4 + 4 + 4 + 12 + 12);
+        return .other;
+    }
+    if (eql(u8, type_name, "NiPlanarCollider")) {
+        try r.skip(8 + 4 + 1 + 1 + 4 + 4 + 12 + 12 + 12 + 16);
+        return .other;
+    }
+    if (eql(u8, type_name, "NiParticleMeshModifier")) {
+        try r.skip(8);
+        const n = try r.count(try r.u32_(), 4);
+        try r.skip(n * 4);
+        return .other;
+    }
+
+    // ---- more controllers and their data ----
+    if (eql(u8, type_name, "NiAlphaController") or eql(u8, type_name, "NiMaterialColorController") or eql(u8, type_name, "NiVisController")) {
+        try r.controllerBase();
+        try r.skip(4);
+        return .other;
+    }
+    if (eql(u8, type_name, "NiUVController")) {
+        try r.controllerBase();
+        try r.skip(2 + 4);
+        return .other;
+    }
+    if (eql(u8, type_name, "NiGeomMorpherController")) {
+        try r.controllerBase();
+        try r.skip(4 + 1);
+        return .other;
+    }
+    if (eql(u8, type_name, "NiFloatData")) {
+        try r.keyGroup(1);
+        return .other;
+    }
+    if (eql(u8, type_name, "NiPosData")) {
+        try r.keyGroup(3);
+        return .other;
+    }
+    if (eql(u8, type_name, "NiColorData")) {
+        try r.keyGroup(4);
+        return .other;
+    }
+    if (eql(u8, type_name, "NiUVData")) {
+        for (0..4) |_| try r.keyGroup(1);
+        return .other;
+    }
+    if (eql(u8, type_name, "NiVisData")) {
+        const n = try r.count(try r.u32_(), 5);
+        try r.skip(n * 5);
+        return .other;
+    }
+    if (eql(u8, type_name, "NiMorphData")) {
+        const n_morphs = try r.count(try r.u32_(), 8);
+        const n_verts = try r.u32_();
+        try r.skip(1); // relative targets
+        for (0..n_morphs) |_| {
+            const n_keys = try r.u32_();
+            const interp = try r.u32_();
+            const per: usize = switch (interp) {
+                1, 5 => 8,
+                2 => 16,
+                3 => 20,
+                else => return error.BadData,
+            };
+            _ = try r.count(n_keys, per);
+            try r.skip(@as(usize, n_keys) * per);
+            _ = try r.count(n_verts, 12);
+            try r.skip(@as(usize, n_verts) * 12);
+        }
+        return .other;
+    }
+    if (eql(u8, type_name, "NiControllerSequence")) {
+        _ = try r.string(); // name
+        _ = try r.string(); // accum root name
+        try r.skip(4); // text keys
+        const n = try r.count(try r.u32_(), 8);
+        for (0..n) |_| {
+            _ = try r.string(); // target name
+            try r.skip(4); // controller
+        }
+        return .other;
+    }
+
+    // ---- embedded pixel data ----
+    if (eql(u8, type_name, "NiPixelData")) {
+        try r.skip(4 + 16 + 4 + 8 + 4); // format, masks, bpp, fast compare, palette
+        const n_mips = try r.count(try r.u32_(), 12);
+        try r.skip(4); // bytes per pixel
+        try r.skip(n_mips * 12);
+        const n_pixels = try r.count(try r.u32_(), 1);
+        try r.skip(n_pixels);
         return .other;
     }
 
