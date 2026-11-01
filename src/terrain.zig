@@ -28,10 +28,15 @@ pub const Terrain = struct {
     world_width: f32,
     world_height: f32,
     biomes: []const []const u8,
-    /// World-space z for each vertex, row-major, x fastest.
-    z: []const f32,
+    /// World-space z for each vertex, row-major, x fastest. Editable;
+    /// `encode` writes edits back into the original file layout.
+    z: []f32,
     /// Biome painted on each vertex: an index into `biomes`.
     paint: []const u8,
+    /// The file as read, so everything not understood survives a save.
+    raw: []const u8,
+    first_record: usize,
+    stride: usize,
 
     pub fn deinit(self: *Terrain) void {
         self.arena.deinit();
@@ -43,6 +48,17 @@ pub const Terrain = struct {
 
     pub fn spacingY(self: *const Terrain) f32 {
         return self.world_height / @as(f32, @floatFromInt(self.height - 1));
+    }
+
+    /// The terrain file with the current heights written into it.
+    pub fn encode(self: *const Terrain, gpa: std.mem.Allocator) ![]u8 {
+        const out = try gpa.dupe(u8, self.raw);
+        for (self.z, 0..) |z, i| {
+            const rec = self.first_record + i * self.stride;
+            const base = f32le(out, rec + 18);
+            std.mem.writeInt(u32, out[rec..][0..4], @bitCast(z - base), .little);
+        }
+        return out;
     }
 
     /// Bilinearly interpolated ground height at a world position (clamped to the map).
@@ -147,6 +163,9 @@ pub fn parse(gpa: std.mem.Allocator, data: []const u8) Error!Terrain {
         .biomes = names,
         .z = z,
         .paint = paint,
+        .raw = try a.dupe(u8, data),
+        .first_record = pos,
+        .stride = stride,
     };
 }
 
@@ -177,6 +196,14 @@ test "synthetic 3x2 terrain" {
     try std.testing.expectApproxEqAbs(@as(f32, 11.0), t.z[5], 1e-6);
     // x spacing 3, y spacing 3: halfway along x on row 0 averages z[0], z[1]
     try std.testing.expectApproxEqAbs(@as(f32, 6.5), t.zAt(1.5, 0), 1e-5);
+    // edits survive an encode/parse round trip
+    t.z[4] = 20.0;
+    const enc = try t.encode(std.testing.allocator);
+    defer std.testing.allocator.free(enc);
+    var t2 = try parse(std.testing.allocator, enc);
+    defer t2.deinit();
+    try std.testing.expectApproxEqAbs(@as(f32, 20.0), t2.z[4], 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.0), t2.z[0], 1e-5);
 }
 
 test "rejects garbage" {

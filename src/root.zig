@@ -15,6 +15,7 @@ pub const viewer = @import("viewer.zig");
 pub const bf = @import("bf.zig");
 pub const terrain = @import("terrain.zig");
 pub const map = @import("map.zig");
+pub const world = @import("world.zig");
 
 test {
     _ = archive;
@@ -31,4 +32,5 @@ test {
     _ = bf;
     _ = terrain;
     _ = map;
+    _ = world;
 }

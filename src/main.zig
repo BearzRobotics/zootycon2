@@ -23,6 +23,7 @@ const usage =
     \\  nifinfo <path>               print a NIF's scene graph
     \\  view <model> [--anim A] [--time S] [--shot]  view a .nif/.bfm model
     \\  map <file.zt2> [--shot] [--at X Y] [--yaw R] [--pitch R] [--zoom F]  view a map
+    \\  elements <prefix> <suffix> [name-prefix]  count XML element names in matching files
     \\  mapcheck [prefix]           parse every map and its terrain
     \\  bfcheck [prefix]            parse every .bf animation and report coverage
     \\  nifcheck [prefix]           parse every .nif/.kf and report coverage
@@ -320,6 +321,52 @@ pub fn main(init: std.process.Init) !void {
             try zootycon2.viewer.runMap(gpa, &vfs, rest[0], vopts)
         else
             try zootycon2.viewer.run(gpa, &vfs, rest[0], vopts);
+    } else if (std.mem.eql(u8, cmd, "elements") and rest.len >= 2) {
+        const name_prefix = if (rest.len > 2) rest[2] else "";
+        var names: std.ArrayList([]const u8) = .empty;
+        defer names.deinit(gpa);
+        const Pick = struct {
+            list: *std.ArrayList([]const u8),
+            gpa: std.mem.Allocator,
+            prefix: []const u8,
+            suffix: []const u8,
+            fn add(c: @This(), name: []const u8) anyerror!void {
+                if (std.mem.startsWith(u8, name, c.prefix) and std.mem.endsWith(u8, name, c.suffix)) try c.list.append(c.gpa, name);
+            }
+        };
+        try vfs.forEach(Pick{ .list = &names, .gpa = gpa, .prefix = rest[0], .suffix = rest[1] }, Pick.add);
+        var counts: std.StringHashMapUnmanaged(usize) = .empty;
+        // The map and the parsed trees share this arena, so one deinit frees all.
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        const Walk = struct {
+            fn visit(c: *std.StringHashMapUnmanaged(usize), a: std.mem.Allocator, e: *const zootycon2.xml.Element, pre: []const u8) !void {
+                if (std.mem.startsWith(u8, e.name, pre)) {
+                    const gop = try c.getOrPut(a, e.name);
+                    if (!gop.found_existing) gop.value_ptr.* = 0;
+                    gop.value_ptr.* += 1;
+                }
+                for (e.children) |ch| try visit(c, a, ch, pre);
+            }
+        };
+        for (names.items) |n| {
+            const data = try vfs.read(gpa, n);
+            defer gpa.free(data);
+            const root = zootycon2.xml.parse(arena.allocator(), data, null) catch continue;
+            try Walk.visit(&counts, arena.allocator(), root, name_prefix);
+        }
+        const Entry = struct { name: []const u8, n: usize };
+        var entries: std.ArrayList(Entry) = .empty;
+        defer entries.deinit(gpa);
+        var it = counts.iterator();
+        while (it.next()) |e| try entries.append(gpa, .{ .name = e.key_ptr.*, .n = e.value_ptr.* });
+        std.mem.sort(Entry, entries.items, {}, struct {
+            fn less(_: void, a: Entry, b: Entry) bool {
+                return a.n > b.n;
+            }
+        }.less);
+        try out.print("{d} files\n", .{names.items.len});
+        for (entries.items[0..@min(entries.items.len, 60)]) |e| try out.print("{d:>7} {s}\n", .{ e.n, e.name });
     } else if (std.mem.eql(u8, cmd, "mapcheck")) {
         const prefix = if (rest.len > 0) rest[0] else "maps/";
         var names: std.ArrayList([]const u8) = .empty;
