@@ -61,6 +61,34 @@ pub fn build(b: *std.Build) void {
     sdl_c.addIncludePath(sdl_lib.getEmittedIncludeTree());
     mod.addImport("sdl_c", sdl_c.createModule());
 
+    // Lua 5.0 runs the game's compiled scenario scripts. Vendored, patched for
+    // their 32-bit bytecode (see vendor/README.md).
+    const lua_lib = b.addLibrary(.{
+        .name = "lua50",
+        .linkage = .static,
+        .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }),
+    });
+    lua_lib.root_module.addCSourceFiles(.{
+        .root = b.path("vendor/lua50/src"),
+        .files = &.{
+            "lapi.c",    "lcode.c",    "ldebug.c",  "ldo.c",       "ldump.c",    "lfunc.c",
+            "lgc.c",     "llex.c",     "lmem.c",    "lobject.c",   "lopcodes.c", "lparser.c",
+            "lstate.c",  "lstring.c",  "ltable.c",  "ltm.c",       "lundump.c",  "lvm.c",
+            "lzio.c",    "lauxlib.c",  "lbaselib.c", "lmathlib.c", "lstrlib.c",  "ltablib.c",
+        },
+        .flags = &.{ "-std=gnu99", "-fno-sanitize=undefined", "-w" },
+    });
+    lua_lib.root_module.addIncludePath(b.path("vendor/lua50/include"));
+    lua_lib.root_module.addIncludePath(b.path("vendor/lua50/src"));
+    mod.linkLibrary(lua_lib);
+    const lua_c = b.addTranslateC(.{
+        .root_source_file = b.path("src/lua_c.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lua_c.addIncludePath(b.path("vendor/lua50/include"));
+    mod.addImport("lua_c", lua_c.createModule());
+
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
     // to the module defined above, it's sometimes preferable to split business

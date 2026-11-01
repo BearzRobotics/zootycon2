@@ -788,6 +788,32 @@ pub fn main(init: std.process.Init) !void {
         var fit = failures.iterator();
         while (fit.next()) |e| try out.print("{d:>5}  {s}   e.g. {s}\n", .{ e.value_ptr.*, e.key_ptr.*, examples.get(e.key_ptr.*).? });
         try out.print("{d} files: {d} parsed, {d} failed\n", .{ names.items.len, ok, other_err });
+    } else if (std.mem.eql(u8, cmd, "luacheck")) {
+        // Loads every compiled script (running its top level, which only
+        // defines functions) and reports the ones that fail.
+        const prefix = if (rest.len > 0) rest[0] else "scenario/scripts";
+        var names: std.ArrayList([]const u8) = .empty;
+        defer names.deinit(gpa);
+        const Collect = struct {
+            list: *std.ArrayList([]const u8),
+            gpa: std.mem.Allocator,
+            prefix: []const u8,
+            fn add(c: @This(), name: []const u8) anyerror!void {
+                if (std.mem.startsWith(u8, name, c.prefix) and std.mem.endsWith(u8, name, ".bin")) try c.list.append(c.gpa, name);
+            }
+        };
+        try vfs.forEach(Collect{ .list = &names, .gpa = gpa, .prefix = prefix }, Collect.add);
+        var failed: usize = 0;
+        for (names.items) |n| {
+            // A fresh VM per script so one failure does not hide the next.
+            const eng = try zootycon2.script.Engine.create(gpa, &vfs);
+            defer eng.destroy();
+            eng.load(n) catch |err| {
+                failed += 1;
+                if (failed <= 25) try out.print("{s}: {s} {s}\n", .{ n, @errorName(err), eng.errorText() });
+            };
+        }
+        try out.print("{d} scripts, {d} failed\n", .{ names.items.len, failed });
     } else if (std.mem.eql(u8, cmd, "xmlcheck")) {
         const prefix = if (rest.len > 0) rest[0] else "";
         var names: std.ArrayList([]const u8) = .empty;

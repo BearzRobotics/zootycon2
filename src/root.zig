@@ -24,6 +24,7 @@ pub const audio = @import("audio.zig");
 pub const uilayout = @import("uilayout.zig");
 pub const environment = @import("environment.zig");
 pub const ai = @import("ai.zig");
+pub const script = @import("script.zig");
 
 test {
     _ = archive;
@@ -49,4 +50,5 @@ test {
     _ = uilayout;
     _ = environment;
     _ = ai;
+    _ = script;
 }
