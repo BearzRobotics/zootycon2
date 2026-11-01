@@ -242,7 +242,7 @@ fn drawNode(d: *Draw, n: *const Node, box: [4]f32) void {
     const ui = d.ui;
     const s = d.canvas.scale;
 
-    if (n.template.len > 0) ui.template(n.template, box[0], box[1], box[2], box[3], s, 1);
+    if (n.template.len > 0) ui.template(n.template, box[0], box[1], box[2], box[3], s, 1.5);
 
     if (n.kind == .text) {
         if (info.text.len > 0) {

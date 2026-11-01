@@ -90,7 +90,7 @@ const Hit = struct {
     y: f32,
     w: f32,
     h: f32,
-    action: union(enum) { tool: Tool, pick: usize, none, menu: MenuAction, entry: usize, buy_cat: u8, buy_tab: BuyTab, buy_item: usize },
+    action: union(enum) { tool: Tool, pick: usize, none, menu: MenuAction, entry: usize, buy_cat: u8, buy_tab: BuyTab, buy_item: usize, info_tab: u8 },
 };
 
 /// Tabs of the buy panel, as in the game's own panel.
@@ -114,6 +114,8 @@ const MenuAction = enum {
     rot_left,
     rot_right,
     toggle_hud,
+    close_selection,
+    track_camera,
     back,
     quit,
     toggle_help,
@@ -286,7 +288,7 @@ pub const App = struct {
     audio: ?audio_mod.Engine = null,
     audio_biome_dirty: bool = true,
     /// The game's own HUD, drawn from its layout files.
-    hud: ?struct { shell: uilayout.Layout, bucks: ?uilayout.Layout } = null,
+    hud: ?struct { shell: uilayout.Layout, bucks: ?uilayout.Layout, info: ?uilayout.Layout = null } = null,
     hud_on: bool = true,
     hud_text: [64]u8 = undefined,
     /// The buy panel: which main category is open (0 construction, 1 animals,
@@ -298,6 +300,11 @@ pub const App = struct {
     buy_lists: [8]std.ArrayList(u32) = @splat(.empty),
     /// Item icon files by name (`lion_adult_f` -> .../lion_adult_f_icon.dds).
     icons: std.StringHashMapUnmanaged([]const u8) = .empty,
+    /// The game's entity info panel: which tab, whether it drew this frame,
+    /// and an entity the camera follows.
+    info_tab: u8 = 0,
+    info_drawn: bool = false,
+    track_id: ?u32 = null,
     buy_hover: ?struct { tab: BuyTab, pos: usize } = null,
 
     pub fn deinit(self: *App) void {
@@ -307,6 +314,7 @@ pub const App = struct {
         if (self.hud) |*h| {
             h.shell.deinit();
             if (h.bucks) |*b| b.deinit();
+            if (h.info) |*b| b.deinit();
         }
         for (self.undo.items) |op| if (op == .added) self.gpa.free(op.added.ids);
         self.undo.deinit(self.gpa);
@@ -1782,6 +1790,13 @@ pub const App = struct {
                 ctx.cam.yaw += 0.35;
                 ctx.snap_camera = true;
             },
+            .close_selection => {
+                self.selected = null;
+                self.track_id = null;
+            },
+            .track_camera => {
+                if (self.selected) |sel| self.track_id = if (self.track_id != null) null else sel.id;
+            },
             .toggle_hud => {
                 self.hud_on = !self.hud_on;
                 self.show_help = !self.hud_on;
@@ -2173,6 +2188,160 @@ pub const App = struct {
         }
     }
 
+
+    /// The game's entity info panel for a selected animal, guest or keeper:
+    /// its frame, tabs, icon and name from `ui/layout/shell.xml`'s entity
+    /// info layout, with our needs and status in the content area.
+    fn drawEntityInfo(self: *App, ui: *viewer.Ui, d: *uilayout.Draw, shell: *const uilayout.Layout) void {
+        self.info_drawn = false;
+        const sel = self.selected orelse return;
+        if (sel.kind != .actor) return;
+        const ag = self.sim.agentFor(sel.id) orelse return;
+        const c = d.canvas;
+        const s = c.scale;
+        const ox = c.off_x + 714 * s;
+        const oy = c.off_y + 513 * s;
+        const animal = ag.kind == .animal;
+        self.info_drawn = true;
+        const white = [4]f32{ 1, 1, 1, 1 };
+        const gold = [4]f32{ 1, 0.92, 0.5, 1 };
+        const grey = [4]f32{ 0.85, 0.9, 0.95, 1 };
+        const ts: f32 = @max(1, @round(s));
+
+        if (shell.find("Backgrounds")) |n| uilayout.drawAt(d, n, .{ ox, oy, 309 * s, 300 * s });
+        if (animal) {
+            if (shell.find("animal buttonbar")) |n| uilayout.drawAt(d, n, .{ ox + 103 * s, oy + 79 * s, 202 * s, 64 * s });
+        }
+        if (shell.find(if (animal) "Animal Info ToggleSet" else "Guest Info ToggleSet")) |n| uilayout.drawAt(d, n, .{ ox, oy, 309 * s, 256 * s });
+        if (shell.find("track camera button")) |n| uilayout.drawAt(d, n, .{ ox + 5 * s, oy + 50 * s, 96 * s, 92 * s });
+
+        // Portrait and name.
+        const ibox = [4]f32{ ox + 10 * s, oy + 55 * s, 93 * s, 84 * s };
+        if (self.iconForName(ag.binder)) |ip| if (ui.sprite(ip)) |spr| {
+            const side = @min(ibox[2], ibox[3]);
+            ui.image(spr, ibox[0] + (ibox[2] - side) / 2, ibox[1], side, side, .{ 0, 0, spr.w / 2, spr.h / 2 }, white) catch {};
+        };
+        const name = ag.binder;
+        _ = ui.text(ox + 108 * s, oy + 58 * s, ts, name[0..@min(name.len, 24)], gold) catch {};
+
+        // Remove button inside the button bar.
+        const rb = [4]f32{ ox + 110 * s, oy + 100 * s, 70 * s, 18 * s };
+        ui.template("buttonbar", rb[0], rb[1], rb[2], rb[3], s / 2, 1);
+        _ = ui.text(rb[0] + (rb[2] - viewer.Ui.textWidth("REMOVE", ts)) / 2, rb[1] + (rb[3] - 7 * ts) / 2, ts, "REMOVE", .{ 1, 0.6, 0.6, 1 }) catch {};
+        self.hits.append(self.gpa, .{ .x = rb[0], .y = rb[1], .w = rb[2], .h = rb[3], .action = .{ .menu = .delete_selected } }) catch {};
+
+        // Content: rows of icon, label and bar.
+        const rx = ox + 16 * s;
+        var ry = oy + 150 * s;
+        const rh = 11 * s;
+        const bar_x = rx + 14 * s + 12 * 6 * ts;
+        const bar_w = ox + 296 * s - bar_x;
+        const Row = struct { label: []const u8, frac: f32, color: [4]f32 };
+        var rows: [10]Row = undefined;
+        var n: usize = 0;
+        var lines: [6][48]u8 = undefined;
+        var line_len: [6]usize = @splat(0);
+        var ln: usize = 0;
+        const addLine = struct {
+            fn f(buf: *[6][48]u8, lens: *[6]usize, cnt: *usize, comptime fmt: []const u8, args: anytype) void {
+                if (cnt.* >= 6) return;
+                const t = std.fmt.bufPrint(&buf[cnt.*], fmt, args) catch return;
+                lens[cnt.*] = t.len;
+                cnt.* += 1;
+            }
+        }.f;
+        if (animal) {
+            if (ag.brain) |b| {
+                const order = [_]usize{ 5, 6, 0, 1, 2, 3, 4 };
+                if (self.info_tab == 0) {
+                    for (order) |i| {
+                        rows[n] = .{ .label = ai.need_names[i], .frac = b.needs[i] / 100.0, .color = needColor(b.needs[i]) };
+                        n += 1;
+                    }
+                }
+            }
+            if (self.info_tab == 0 and ag.habitat != null) {
+                rows[n] = .{ .label = "HABITAT", .frac = ag.hab_score / 100.0, .color = .{ 0.45, 0.8, 0.5, 1 } };
+                n += 1;
+            }
+            if (self.info_tab == 1) {
+                addLine(&lines, &line_len, &ln, "DOING {s}", .{ag.anim_name});
+                if (ag.brain) |b| addLine(&lines, &line_len, &ln, "WELFARE {d:.0}", .{(100 - @max(b.needs[5], b.needs[6])) * (0.5 + 0.5 * ag.hab_score / 100.0)});
+                if (ag.habitat != null) {
+                    addLine(&lines, &line_len, &ln, "HABITAT {d:.0}  BIOME FIT {d:.0}", .{ ag.hab_score, ag.hab_biome });
+                    if (ag.hab_open) addLine(&lines, &line_len, &ln, "SPACE: OPEN GROUND", .{}) else addLine(&lines, &line_len, &ln, "SPACE {d:.0} OF {d:.0} TILES", .{ ag.hab_area, ag.hab_need });
+                }
+            }
+            if (self.info_tab == 2) {
+                if (ag.habitat) |h| {
+                    addLine(&lines, &line_len, &ln, "SPECIES {s}", .{h.species});
+                    var best: usize = 0;
+                    for (h.sens, 0..) |v, i| if (v > h.sens[best]) {
+                        best = i;
+                    };
+                    addLine(&lines, &line_len, &ln, "HOME BIOME {s}", .{sim_mod.habitat_biomes[best]});
+                    addLine(&lines, &line_len, &ln, "NEEDS {d:.0} TILES, +{d:.0} EACH", .{ h.space_first, h.space_more });
+                }
+            }
+        } else if (ag.is_guest) {
+            if (self.info_tab == 0) {
+                rows[n] = .{ .label = "HAPPY", .frac = ag.happiness / 100.0, .color = .{ 0.4, 0.85, 0.4, 1 } };
+                n += 1;
+                const names = [_][]const u8{ "HUNGER", "THIRST", "BATHROOM" };
+                for (ag.needs[0..3], names) |v, nm| {
+                    rows[n] = .{ .label = nm, .frac = v / 100.0, .color = needColor(v) };
+                    n += 1;
+                }
+            } else if (self.info_tab == 1) {
+                const goal: []const u8 = switch (ag.goal) {
+                    .view => "WATCHING ANIMALS",
+                    .leave => "HEADING HOME",
+                    .wander => "STROLLING",
+                    .shop => "GOING SHOPPING",
+                    .none => "LOOKING AROUND",
+                };
+                addLine(&lines, &line_len, &ln, "{s}", .{goal});
+                if (std.math.isFinite(ag.tour_left)) addLine(&lines, &line_len, &ln, "LEAVES IN {d:.0}S", .{@max(ag.tour_left, 0)});
+            }
+        } else {
+            if (self.info_tab == 0) {
+                addLine(&lines, &line_len, &ln, "STAFF", .{});
+                addLine(&lines, &line_len, &ln, "WAGE ${d:.0} A MONTH", .{ag.wage});
+            } else if (self.info_tab == 1) {
+                addLine(&lines, &line_len, &ln, "{s}", .{switch (ag.job) {
+                    .none => "LOOKING FOR WORK",
+                    .go => "HEADING TO A FEEDER",
+                    .work => "REFILLING A FEEDER",
+                }});
+            }
+        }
+        for (rows[0..n]) |r| {
+            if (needIcon(r.label)) |ip| if (ui.sprite(ip)) |spr| {
+                ui.image(spr, rx, ry - 1 * s, 10 * s, 10 * s, .{ 0, 0, spr.w, spr.h }, white) catch {};
+            };
+            _ = ui.text(rx + 13 * s, ry, ts, r.label[0..@min(r.label.len, 11)], white) catch {};
+            bar(ui, bar_x, ry, bar_w, 7 * ts, r.frac, r.color) catch {};
+            ry += rh;
+        }
+        for (0..ln) |i| {
+            _ = ui.text(rx, ry, ts, lines[i][0..line_len[i]], grey) catch {};
+            ry += rh;
+        }
+    }
+
+    fn iconForName(self: *App, name: []const u8) ?[]const u8 {
+        var buf: [128]u8 = undefined;
+        var nm = name;
+        var tries: usize = 0;
+        while (tries < 3 and nm.len > 0) : (tries += 1) {
+            if (nm.len > buf.len) return null;
+            if (self.icons.get(std.ascii.lowerString(&buf, nm))) |p| return p;
+            const cut = std.mem.lastIndexOfScalar(u8, nm, '_') orelse return null;
+            nm = nm[0..cut];
+        }
+        return null;
+    }
+
     fn itemCountForTab(self: *const App, tab: BuyTab) usize {
         return switch (tab) {
             .fence => self.fence_kinds.items.len,
@@ -2197,7 +2366,12 @@ pub const App = struct {
             defer self.gpa.free(bb);
             bucks = uilayout.parse(self.gpa, bb) catch null;
         } else |_| {}
-        self.hud = .{ .shell = shell, .bucks = bucks };
+        var info: ?uilayout.Layout = null;
+        if (self.vfs.read(self.gpa, "ui/layout/entityinfo.xml")) |ib| {
+            defer self.gpa.free(ib);
+            info = uilayout.parse(self.gpa, ib) catch null;
+        } else |_| {}
+        self.hud = .{ .shell = shell, .bucks = bucks, .info = info };
         _ = &shell;
         self.show_help = false;
     }
@@ -2213,6 +2387,11 @@ pub const App = struct {
         if (eq(name, "terraform")) return .{ .buy_cat = 2 };
         if (eq(name, "staff")) return .{ .buy_cat = 3 };
         if (buyTabFor(name)) |t| return .{ .buy_tab = t };
+        if (eq(name, "close")) return .{ .menu = .close_selection };
+        if (eq(name, "track camera button")) return .{ .menu = .track_camera };
+        if (eq(name, "Animal Info Status Tab") or eq(name, "Guest Info Button")) return .{ .info_tab = 0 };
+        if (eq(name, "Animal Info Tab Button") or eq(name, "Guest Info Status Tab")) return .{ .info_tab = 1 };
+        if (eq(name, "Animal Info Conservation Tab")) return .{ .info_tab = 2 };
         if (eq(name, "hill")) return .{ .tool = .raise };
         if (eq(name, "valley")) return .{ .tool = .lower };
         if (eq(name, "flatten")) return .{ .tool = .flatten };
@@ -2250,6 +2429,10 @@ pub const App = struct {
             if (eq(n.name, "terraform")) info.on = self.buy_cat != null and self.buy_cat.? == 2;
             if (eq(n.name, "staff")) info.on = self.buy_cat != null and self.buy_cat.? == 3;
             if (buyTabFor(n.name)) |t| info.on = self.buy_open_tab(t);
+            if (eq(n.name, "Animal Info Status Tab") or eq(n.name, "Guest Info Button")) info.on = self.info_tab == 0;
+            if (eq(n.name, "Animal Info Tab Button") or eq(n.name, "Guest Info Status Tab")) info.on = self.info_tab == 1;
+            if (eq(n.name, "Animal Info Conservation Tab")) info.on = self.info_tab == 2;
+            if (eq(n.name, "track camera button")) info.on = self.track_id != null;
             if (eq(n.name, "hill")) info.on = self.tool == .raise;
             if (eq(n.name, "valley")) info.on = self.tool == .lower;
             if (eq(n.name, "flatten")) info.on = self.tool == .flatten;
@@ -2278,6 +2461,7 @@ pub const App = struct {
         for (tops) |name| if (h.shell.find(name)) |n| uilayout.drawTop(&d, n);
         if (h.bucks) |*b| if (b.find("zoo_bucks")) |n| uilayout.drawTop(&d, n);
         self.drawBuyPanel(ui, &d, &h.shell);
+        if (h.info) |*il| self.drawEntityInfo(ui, &d, il) else self.info_drawn = false;
     }
 
     fn money(buf: []u8, v: f64) []const u8 {
@@ -2397,6 +2581,7 @@ pub const App = struct {
                 self.setBuyTab(t);
             },
             .buy_item => |pos| self.selectBuyItem(pos),
+            .info_tab => |t| self.info_tab = t,
             .menu => |a| self.menuAction(a, ctx),
             .entry, .none => {},
         }
@@ -2693,7 +2878,8 @@ pub const App = struct {
         try ui.label(ui.width - stw - pad, ry + line + 2 * scale, scale, stats, white);
 
         // Details panel (the item list uses the same corner).
-        if (self.opts.tools and self.itemCount() == 0) try self.drawInfoPanel(ui, scale, pad, line, pad + 3.2 * (line + 2 * scale) + self.hudRightShift(ui));
+        self.info_drawn = if (self.hudActive()) self.info_drawn else false;
+        if (self.opts.tools and self.itemCount() == 0 and !self.info_drawn) try self.drawInfoPanel(ui, scale, pad, line, pad + 3.2 * (line + 2 * scale) + self.hudRightShift(ui));
 
         // Selection.
         if (self.selected) |sel| {
@@ -2704,7 +2890,7 @@ pub const App = struct {
             };
             const t = std.fmt.bufPrint(&buf, "SELECTED {s} #{d}{s}", .{ @tagName(sel.kind), sel.id, food }) catch "";
             const w2 = viewer.Ui.textWidth(t, scale);
-            try ui.label(ui.width - w2 - pad, pad + 2 * (line + 2 * scale), scale, t, yellow);
+            if (!self.info_drawn) try ui.label(ui.width - w2 - pad, ry + 2 * (line + 2 * scale), scale, t, yellow);
         }
 
         // Key reference.
@@ -3031,6 +3217,12 @@ pub const App = struct {
             }
         }
 
+        if (self.track_id) |tid| {
+            if (self.sim.agentFor(tid)) |tag| {
+                ctx.cam.center = .{ tag.pos[0], tag.pos[1], tag.pos[2] };
+                ctx.snap_camera = true;
+            } else self.track_id = null;
+        }
         if (self.audio) |*a| {
             if (self.audio_biome_dirty) {
                 self.audio_biome_dirty = false;
