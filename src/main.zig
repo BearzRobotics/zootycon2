@@ -18,6 +18,7 @@ const usage =
     \\  entities                    load entity definitions and show statistics
     \\  entity <name>                show an entity's inheritance chain and data
     \\  window [seconds]             open a test window (Esc or close to quit)
+    \\  modelcheck [prefix]         parse every .bfm manifest and .bfmat material
     \\  ddscheck [prefix]           parse every .dds texture and report formats
     \\  nifcheck [prefix]           parse every .nif/.kf and report coverage
     \\  xmlcheck [prefix]            parse every .xml and report failures
@@ -177,6 +178,52 @@ pub fn main(init: std.process.Init) !void {
                 }
             }
         }
+    } else if (std.mem.eql(u8, cmd, "modelcheck")) {
+        const prefix = if (rest.len > 0) rest[0] else "";
+        var names: std.ArrayList([]const u8) = .empty;
+        defer names.deinit(gpa);
+        const Collect = struct {
+            list: *std.ArrayList([]const u8),
+            gpa: std.mem.Allocator,
+            prefix: []const u8,
+            fn add(c: @This(), name: []const u8) anyerror!void {
+                if (std.mem.startsWith(u8, name, c.prefix) and (std.mem.endsWith(u8, name, ".bfm") or std.mem.endsWith(u8, name, ".bfmat")))
+                    try c.list.append(c.gpa, name);
+            }
+        };
+        try vfs.forEach(Collect{ .list = &names, .gpa = gpa, .prefix = prefix }, Collect.add);
+        var n_bfm: usize = 0;
+        var n_mat: usize = 0;
+        var n_anim: usize = 0;
+        var missing_model: usize = 0;
+        var failed: usize = 0;
+        for (names.items) |n| {
+            const data = try vfs.read(gpa, n);
+            defer gpa.free(data);
+            if (std.mem.endsWith(u8, n, ".bfm")) {
+                var m = zootycon2.model.parseManifest(gpa, data) catch |err| {
+                    failed += 1;
+                    if (failed <= 15) try out.print("{s}: {s}\n", .{ n, @errorName(err) });
+                    continue;
+                };
+                defer m.deinit();
+                n_bfm += 1;
+                n_anim += m.animations.len;
+                if (!vfs.exists(m.model_name)) {
+                    missing_model += 1;
+                    if (missing_model <= 5) try out.print("{s}: model not found: {s}\n", .{ n, m.model_name });
+                }
+            } else {
+                var m = zootycon2.model.parseMaterial(gpa, data) catch |err| {
+                    failed += 1;
+                    if (failed <= 15) try out.print("{s}: {s}\n", .{ n, @errorName(err) });
+                    continue;
+                };
+                m.deinit();
+                n_mat += 1;
+            }
+        }
+        try out.print("{d} manifests ({d} animations, {d} with a missing model), {d} materials, {d} failed\n", .{ n_bfm, n_anim, missing_model, n_mat, failed });
     } else if (std.mem.eql(u8, cmd, "ddscheck")) {
         const prefix = if (rest.len > 0) rest[0] else "";
         var names: std.ArrayList([]const u8) = .empty;
@@ -271,7 +318,7 @@ pub fn main(init: std.process.Init) !void {
             gpa: std.mem.Allocator,
             prefix: []const u8,
             fn add(c: @This(), name: []const u8) anyerror!void {
-                if (std.mem.startsWith(u8, name, c.prefix) and std.mem.endsWith(u8, name, ".xml")) try c.list.append(c.gpa, name);
+                if (std.mem.startsWith(u8, name, c.prefix) and (std.mem.endsWith(u8, name, ".xml") or std.mem.endsWith(u8, name, ".bfm") or std.mem.endsWith(u8, name, ".bfmat"))) try c.list.append(c.gpa, name);
             }
         };
         try vfs.forEach(Collect{ .list = &names, .gpa = gpa, .prefix = prefix }, Collect.add);
