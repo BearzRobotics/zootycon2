@@ -17,6 +17,7 @@ pub const terrain = @import("terrain.zig");
 pub const map = @import("map.zig");
 pub const world = @import("world.zig");
 pub const sim = @import("sim.zig");
+pub const app = @import("app.zig");
 
 test {
     _ = archive;
@@ -35,4 +36,5 @@ test {
     _ = map;
     _ = world;
     _ = sim;
+    _ = app;
 }

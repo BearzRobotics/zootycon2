@@ -19,9 +19,9 @@ const platform = @import("platform.zig");
 
 pub const Mat4 = [16]f32; // column-major
 
-const identity: Mat4 = .{ 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+pub const identity: Mat4 = .{ 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
 
-fn mul(a: Mat4, b: Mat4) Mat4 {
+pub fn mul(a: Mat4, b: Mat4) Mat4 {
     var r: Mat4 = undefined;
     for (0..4) |col| for (0..4) |row| {
         var s: f32 = 0;
@@ -32,7 +32,7 @@ fn mul(a: Mat4, b: Mat4) Mat4 {
 }
 
 /// The NIF stores a row-major rotation R; a point maps to `scale * R * p + t`.
-fn fromTransform(t: nif.Transform) Mat4 {
+pub fn fromTransform(t: nif.Transform) Mat4 {
     var m = identity;
     for (0..3) |col| for (0..3) |row| {
         m[col * 4 + row] = t.rotation[row * 3 + col] * t.scale;
@@ -268,7 +268,7 @@ const max_bones = 96;
 /// Floats per vertex: position 3, normal 3, uv 2, bone indices 4, bone weights 4, second uv 2.
 const vf = 18;
 
-const FencePieces = struct {
+pub const FencePieces = struct {
     post: ?[]const Draw = null,
     segment: ?[]const Draw = null,
 };
@@ -321,6 +321,11 @@ pub const Instance = struct {
     anim: ?*const bf.Animation,
     /// Seconds added to the clock so figures are not in lockstep.
     phase: f32,
+    /// When driven by the simulation, `time` is the animation clock.
+    driven: bool = false,
+    time: f32 = 0,
+    /// The template's manifest, for looking animations up by name.
+    manifest: ?*const model.Manifest = null,
 };
 
 const ActorTemplate = struct {
@@ -522,7 +527,7 @@ pub const Scene = struct {
         for (self.instances.items) |inst| {
             var t: f32 = 0;
             if (inst.anim) |an| if (an.duration > 0) {
-                t = @mod(secs + inst.phase, an.duration);
+                t = @mod((if (inst.driven) inst.time else secs + inst.phase), an.duration);
             };
             poseWorld(inst.world, inst.nf, inst.root, inst.anim, t);
         }
@@ -1053,7 +1058,14 @@ pub const Scene = struct {
             if (chosen) |c| anim = self.loadAnim(c.path);
         }
         const idx: u32 = @intCast(self.instances.items.len);
-        try self.instances.append(self.gpa, .{ .nf = tmpl.nf, .world = world, .root = root, .anim = anim, .phase = phase });
+        try self.instances.append(self.gpa, .{
+            .nf = tmpl.nf,
+            .world = world,
+            .root = root,
+            .anim = anim,
+            .phase = phase,
+            .manifest = if (tmpl.manifest) |*m| m else null,
+        });
         poseWorld(world, tmpl.nf, root, anim, 0);
         for (tmpl.draws) |d| {
             var c = d;
@@ -1062,6 +1074,23 @@ pub const Scene = struct {
             try self.actor_draws.append(self.gpa, c);
         }
         return true;
+    }
+
+    /// Drives an animated figure from the simulation: where it stands and
+    /// which animation (by manifest name, trying `names` in order) at what time.
+    pub fn driveInstance(self: *Scene, idx: usize, root: Mat4, names: []const []const u8, time: f32) void {
+        const inst = &self.instances.items[idx];
+        inst.root = root;
+        inst.driven = true;
+        inst.time = time;
+        const mf = inst.manifest orelse return;
+        for (names) |n| {
+            const a = mf.animation(n) orelse continue;
+            if (self.loadAnim(a.path)) |loaded| {
+                inst.anim = loaded;
+                return;
+            }
+        }
     }
 
     /// Model pieces for a fence type: its post and its straight segment.
@@ -1196,7 +1225,7 @@ const key_w: u32 = 26;
 
 /// Window, GL context and loaded entry points. Lives in place because the
 /// scene keeps a pointer to `g`.
-const Gfx = struct {
+pub const Gfx = struct {
     plat: platform.Platform,
     win: platform.Window,
     ctx: platform.GlContext,
@@ -1215,7 +1244,7 @@ const Gfx = struct {
     u_decal_mode: gl.Int,
     u_flat: [3]gl.Int,
 
-    fn open(self: *Gfx, opts: Options) !void {
+    pub fn open(self: *Gfx, opts: Options) !void {
         self.plat = platform.Platform.init() catch {
             std.debug.print("SDL init failed: {s}\n", .{platform.lastError()});
             return error.PlatformInit;
@@ -1259,7 +1288,7 @@ const Gfx = struct {
         };
     }
 
-    fn close(self: *Gfx) void {
+    pub fn close(self: *Gfx) void {
         self.ctx.destroy();
         self.win.destroy();
         self.plat.deinit();
@@ -1563,11 +1592,11 @@ pub fn run(gpa: std.mem.Allocator, vfs: *vfs_mod.Vfs, path: []const u8, opts: Op
     try loop(gpa, &gfx, &scene, cam, play, opts);
 }
 
-const ActorModel = struct { file: []const u8, scale: f32 };
+pub const ActorModel = struct { file: []const u8, scale: f32 };
 
 /// Finds the `BFActorComponent` for an entity: the most specific binder on
 /// its type path that defines one wins.
-fn actorModel(gpa: std.mem.Allocator, reg: *const entity.Registry, name: []const u8) ?ActorModel {
+pub fn actorModel(gpa: std.mem.Allocator, reg: *const entity.Registry, name: []const u8) ?ActorModel {
     const b = reg.get(name) orelse return null;
     const chain = reg.chain(gpa, b) catch return null;
     defer gpa.free(chain);
@@ -1588,6 +1617,64 @@ fn findActor(e: *const @import("xml.zig").Element) ?ActorModel {
     }
     for (e.children) |c| if (findActor(c)) |m| return m;
     return null;
+}
+
+/// Ground textures for a terrain, from the biome definitions: the (up to
+/// four) most painted biomes each get a slot, and every vertex blends
+/// towards its own.
+pub const TerrainLook = struct {
+    flat: [4]gl.Uint,
+    steep: gl.Uint,
+    slot_of: []u8,
+
+    pub fn deinit(self: *TerrainLook, gpa: std.mem.Allocator) void {
+        gpa.free(self.slot_of);
+    }
+};
+
+pub fn terrainLook(gpa: std.mem.Allocator, vfs: *vfs_mod.Vfs, scene: *Scene, terr: *const terrain_mod.Terrain) !TerrainLook {
+    var flat_tex = [4]gl.Uint{ scene.white, scene.white, scene.white, scene.white };
+    var steep_tex = scene.white;
+    const slot_of = try gpa.alloc(u8, terr.paint.len);
+    errdefer gpa.free(slot_of);
+    var counts: [256]usize = @splat(0);
+    for (terr.paint) |b| counts[b] += 1;
+    var slots: [4]?u8 = .{ null, null, null, null };
+    for (&slots) |*sl| {
+        var best: ?u8 = null;
+        for (terr.biomes, 0..) |_, bi| {
+            if (counts[bi] == 0) continue;
+            if (std.mem.indexOfScalar(?u8, &slots, @as(u8, @intCast(bi))) != null) continue;
+            if (best == null or counts[bi] > counts[best.?]) best = @intCast(bi);
+        }
+        sl.* = best;
+    }
+    for (slots, 0..) |sl, si| {
+        const bi = sl orelse continue;
+        if (bi >= terr.biomes.len) continue;
+        var path_buf: [128]u8 = undefined;
+        const bpath = std.fmt.bufPrint(&path_buf, "biomes/{s}.xml", .{terr.biomes[bi]}) catch continue;
+        const bytes = vfs.read(gpa, bpath) catch continue;
+        defer gpa.free(bytes);
+        var arena: std.heap.ArenaAllocator = .init(gpa);
+        defer arena.deinit();
+        const root = @import("xml.zig").parse(arena.allocator(), bytes, null) catch continue;
+        if (root.attr("groundCoverTexture")) |t| flat_tex[si] = scene.loadTexturePath(t);
+        if (si == 0) if (root.attr("cliffHoriz")) |t| {
+            steep_tex = scene.loadTexturePath(t);
+        };
+    }
+    // Slots with no texture fall back to the main biome's.
+    for (&flat_tex) |*t| if (t.* == scene.white) {
+        t.* = flat_tex[0];
+    };
+    for (terr.paint, slot_of) |b, *out| {
+        out.* = 0;
+        for (slots, 0..) |sl, si| if (sl != null and sl.? == b) {
+            out.* = @intCast(si);
+        };
+    }
+    return .{ .flat = flat_tex, .steep = steep_tex, .slot_of = slot_of };
 }
 
 /// Views a whole map: terrain plus every placed object that has a model.
@@ -1614,52 +1701,9 @@ pub fn runMap(gpa: std.mem.Allocator, vfs: *vfs_mod.Vfs, path: []const u8, opts:
     scene.interactive = false;
     scene.want_skin = false;
     scene.dynamic_draws = false;
-    // Ground textures come from the biome definitions: the (up to four) most
-    // painted biomes each get a slot, and every vertex blends towards its own.
-    var flat_tex = [4]gl.Uint{ scene.white, scene.white, scene.white, scene.white };
-    var steep_tex = scene.white;
-    const slot_of = try gpa.alloc(u8, terr.paint.len);
-    defer gpa.free(slot_of);
-    {
-        var counts: [256]usize = @splat(0);
-        for (terr.paint) |b| counts[b] += 1;
-        var slots: [4]?u8 = .{ null, null, null, null };
-        for (&slots) |*sl| {
-            var best: ?u8 = null;
-            for (terr.biomes, 0..) |_, bi| {
-                if (counts[bi] == 0) continue;
-                if (std.mem.indexOfScalar(?u8, &slots, @as(u8, @intCast(bi))) != null) continue;
-                if (best == null or counts[bi] > counts[best.?]) best = @intCast(bi);
-            }
-            sl.* = best;
-        }
-        for (slots, 0..) |sl, si| {
-            const bi = sl orelse continue;
-            if (bi >= terr.biomes.len) continue;
-            var path_buf: [128]u8 = undefined;
-            const bpath = std.fmt.bufPrint(&path_buf, "biomes/{s}.xml", .{terr.biomes[bi]}) catch continue;
-            const bytes = vfs.read(gpa, bpath) catch continue;
-            defer gpa.free(bytes);
-            var arena: std.heap.ArenaAllocator = .init(gpa);
-            defer arena.deinit();
-            const root = @import("xml.zig").parse(arena.allocator(), bytes, null) catch continue;
-            if (root.attr("groundCoverTexture")) |t| flat_tex[si] = scene.loadTexturePath(t);
-            if (si == 0) if (root.attr("cliffHoriz")) |t| {
-                steep_tex = scene.loadTexturePath(t);
-            };
-        }
-        // Slots with no texture fall back to the main biome's.
-        for (&flat_tex) |*t| if (t.* == scene.white) {
-            t.* = flat_tex[0];
-        };
-        for (terr.paint, slot_of) |b, *out| {
-            out.* = 0;
-            for (slots, 0..) |sl, si| if (sl != null and sl.? == b) {
-                out.* = @intCast(si);
-            };
-        }
-    }
-    try scene.addTerrain(&terr, .{ 1, 1, 1, 1 }, flat_tex, steep_tex, slot_of);
+    var look = try terrainLook(gpa, vfs, &scene, &terr);
+    defer look.deinit(gpa);
+    try scene.addTerrain(&terr, .{ 1, 1, 1, 1 }, look.flat, look.steep, look.slot_of);
 
     var placed: usize = 0;
     var missing: usize = 0;

@@ -22,6 +22,7 @@ const usage =
     \\  ddscheck [prefix]           parse every .dds texture and report formats
     \\  nifinfo <path>               print a NIF's scene graph
     \\  view <model> [--anim A] [--time S] [--shot]  view a .nif/.bfm model
+    \\  play <map|save> [--save-dir D] [--seed N] [--no-sim] [--view]  interactive zoo with build tools
     \\  map <file.zt2> [--shot] [--at X Y] [--yaw R] [--pitch R] [--zoom F]  view a map
     \\  elements <prefix> <suffix> [name-prefix]  count XML element names in matching files
     \\  mapcheck [prefix]           parse every map and its terrain
@@ -289,6 +290,51 @@ pub fn main(init: std.process.Init) !void {
             gpa.free(px);
         }
         try out.print("{d} textures: dxt1 {d}, dxt3 {d}, dxt5 {d}, rgba8 {d}; {d} cube maps; {d} with partial mip chains; {d} failed\n", .{ names.items.len, counts[0], counts[1], counts[2], counts[3], cubes, short_mips, failed });
+    } else if (std.mem.eql(u8, cmd, "play") and rest.len > 0) {
+        var aopts: zootycon2.app.Options = .{ .save_dir = "" };
+        var save_dir_owned: ?[]u8 = null;
+        defer if (save_dir_owned) |d| gpa.free(d);
+        var k: usize = 1;
+        while (k < rest.len) : (k += 1) {
+            const arg = rest[k];
+            if (std.mem.eql(u8, arg, "--save-dir") and k + 1 < rest.len) {
+                k += 1;
+                aopts.save_dir = rest[k];
+            } else if (std.mem.eql(u8, arg, "--seed") and k + 1 < rest.len) {
+                k += 1;
+                aopts.seed = try std.fmt.parseInt(u64, rest[k], 10);
+            } else if (std.mem.eql(u8, arg, "--script") and k + 1 < rest.len) {
+                k += 1;
+                aopts.script = rest[k];
+            } else if (std.mem.eql(u8, arg, "--no-sim")) {
+                aopts.sim = false;
+            } else if (std.mem.eql(u8, arg, "--view")) {
+                aopts.tools = false;
+            } else if (std.mem.eql(u8, arg, "--shot")) {
+                aopts.viewer.screenshot = out;
+            } else if (std.mem.eql(u8, arg, "--at") and k + 2 < rest.len) {
+                aopts.viewer.focus = .{ try std.fmt.parseFloat(f32, rest[k + 1]), try std.fmt.parseFloat(f32, rest[k + 2]) };
+                k += 2;
+            } else if (std.mem.eql(u8, arg, "--yaw") and k + 1 < rest.len) {
+                k += 1;
+                aopts.viewer.yaw = try std.fmt.parseFloat(f32, rest[k]);
+            } else if (std.mem.eql(u8, arg, "--pitch") and k + 1 < rest.len) {
+                k += 1;
+                aopts.viewer.pitch = try std.fmt.parseFloat(f32, rest[k]);
+            } else if (std.mem.eql(u8, arg, "--zoom") and k + 1 < rest.len) {
+                k += 1;
+                aopts.viewer.zoom = try std.fmt.parseFloat(f32, rest[k]);
+            } else return fail("play <map|save> [--save-dir D] [--seed N] [--no-sim] [--view] [--shot] [--at X Y] [--yaw R] [--pitch R] [--zoom F]\n");
+        }
+        if (aopts.save_dir.len == 0) {
+            const base = if (env.get("XDG_DATA_HOME")) |x| try std.fs.path.join(gpa, &.{ x, "zootycon2", "saves" }) else blk: {
+                const home = env.get("HOME") orelse return fail("HOME is not set; pass --save-dir\n");
+                break :blk try std.fs.path.join(gpa, &.{ home, ".local", "share", "zootycon2", "saves" });
+            };
+            save_dir_owned = base;
+            aopts.save_dir = base;
+        }
+        try zootycon2.app.run(gpa, io, &vfs, rest[0], aopts);
     } else if ((std.mem.eql(u8, cmd, "view") or std.mem.eql(u8, cmd, "map")) and rest.len > 0) {
         var shot = false;
         var vopts: zootycon2.viewer.Options = .{};
