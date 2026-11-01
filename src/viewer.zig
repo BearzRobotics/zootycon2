@@ -373,6 +373,10 @@ const Skin = struct {
 };
 
 pub const Draw = struct {
+    /// Bounding sphere (x, y, z, radius). In a cached model's draws it is in
+    /// model space; `place` turns it into world space. A negative radius
+    /// means "never cull".
+    bound: [4]f32 = .{ 0, 0, 0, -1 },
     /// When set, the draw is carried by this node of its instance's skeleton:
     /// its model matrix is that node's world matrix times `world`.
     attach_node: ?u32 = null,
@@ -719,8 +723,14 @@ pub const Scene = struct {
         const have_n = md.normals.len == n;
         const have_uv = md.uv_sets.len > 0 and md.uv_sets[0].len == n;
         const have_uv2 = md.uv_sets.len > 1 and md.uv_sets[1].len == n;
+        var gmin = [3]f32{ 1e30, 1e30, 1e30 };
+        var gmax = [3]f32{ -1e30, -1e30, -1e30 };
         for (0..n) |i| {
             const v = md.vertices[i];
+            for (0..3) |k| {
+                gmin[k] = @min(gmin[k], v[k]);
+                gmax[k] = @max(gmax[k], v[k]);
+            }
             buf[i * vf + 0] = v[0];
             buf[i * vf + 1] = v[1];
             buf[i * vf + 2] = v[2];
@@ -757,6 +767,16 @@ pub const Scene = struct {
             .vao = vao,
             .index_count = @intCast(md.indices.len),
             .world = world,
+            .bound = blk: {
+                // Sphere around the box, in the draw's own (world) space.
+                const c = [3]f32{ (gmin[0] + gmax[0]) / 2, (gmin[1] + gmax[1]) / 2, (gmin[2] + gmax[2]) / 2 };
+                const half = [3]f32{ (gmax[0] - gmin[0]) / 2, (gmax[1] - gmin[1]) / 2, (gmax[2] - gmin[2]) / 2 };
+                const wc = transformPoint(world, c);
+                const sc = @sqrt(world[0] * world[0] + world[1] * world[1] + world[2] * world[2]);
+                // Skinned meshes move with their bones; never cull them.
+                const r: f32 = if (skin != null) -1 else @sqrt(half[0] * half[0] + half[1] * half[1] + half[2] * half[2]) * sc;
+                break :blk .{ wc[0], wc[1], wc[2], r };
+            },
             .texture = tex,
             .decal = decal,
             .decal_mode = decal_mode,
@@ -858,6 +878,7 @@ pub const Scene = struct {
             c.tint = .{ d.tint[0] * tint[0], d.tint[1] * tint[1], d.tint[2] * tint[2], tint[3] };
             c.blend = true;
             c.depth_write = false;
+            c.bound[3] = -1;
             try self.overlay.append(self.gpa, c);
         }
     }
@@ -1185,6 +1206,7 @@ pub const Scene = struct {
         for (tmpl.draws) |d| {
             var c = d;
             c.inst = idx;
+            c.bound[3] = -1;
             self.applySwaps(&c, swaps);
             try self.actor_draws.append(self.gpa, c);
         }
@@ -1195,6 +1217,7 @@ pub const Scene = struct {
                 c.attach_node = node;
                 c.dynamic = false;
                 c.skin = null;
+                c.bound[3] = -1;
                 c.world = mul(rotationZ(h.yaw), d.world);
                 self.applySwaps(&c, h.swaps);
                 try self.actor_draws.append(self.gpa, c);
@@ -1266,6 +1289,12 @@ pub const Scene = struct {
             var c = d;
             c.world = mul(m, d.world);
             c.dynamic = false;
+            if (d.bound[3] >= 0 and d.skin == null) {
+                // `d.bound` is relative to the model root, so only `m` applies.
+                const wc = transformPoint(m, .{ d.bound[0], d.bound[1], d.bound[2] });
+                const sc = @sqrt(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]);
+                c.bound = .{ wc[0], wc[1], wc[2], d.bound[3] * sc };
+            } else c.bound[3] = -1;
             self.applySwaps(&c, swaps);
             try self.draws.append(self.gpa, c);
         }
@@ -1569,7 +1598,43 @@ const NoHooks = struct {
     pub fn frame(_: *NoHooks, _: *FrameCtx) !void {}
 };
 
-fn drawItem(gfx: *Gfx, scene: *Scene, d: Draw) void {
+/// View frustum for culling bounding spheres.
+const Frustum = struct {
+    planes: [6][4]f32,
+    eye: [3]f32,
+
+    fn init(m: Mat4, eye: [3]f32) Frustum {
+        // Gribb-Hartmann: planes are sums and differences of matrix rows.
+        var rows: [4][4]f32 = undefined;
+        for (0..4) |i| rows[i] = .{ m[i], m[4 + i], m[8 + i], m[12 + i] };
+        var planes: [6][4]f32 = undefined;
+        const combos = [6]struct { s: f32, i: usize }{ .{ .s = 1, .i = 0 }, .{ .s = -1, .i = 0 }, .{ .s = 1, .i = 1 }, .{ .s = -1, .i = 1 }, .{ .s = 1, .i = 2 }, .{ .s = -1, .i = 2 } };
+        for (combos, 0..) |c, k| {
+            var p: [4]f32 = undefined;
+            for (0..4) |j| p[j] = rows[3][j] + c.s * rows[c.i][j];
+            const len = @sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]);
+            for (&p) |*x| x.* /= len;
+            planes[k] = p;
+        }
+        return .{ .planes = planes, .eye = eye };
+    }
+
+    /// False if the sphere is outside the frustum or too small to see.
+    fn sees(self: Frustum, b: [4]f32) bool {
+        if (b[3] < 0) return true;
+        for (self.planes) |p| {
+            if (p[0] * b[0] + p[1] * b[1] + p[2] * b[2] + p[3] < -b[3]) return false;
+        }
+        const dx = b[0] - self.eye[0];
+        const dy = b[1] - self.eye[1];
+        const dz = b[2] - self.eye[2];
+        const dist = @sqrt(dx * dx + dy * dy + dz * dz);
+        return b[3] > dist * 0.0015; // under about a pixel at 720p
+    }
+};
+
+fn drawItem(gfx: *Gfx, scene: *Scene, d: Draw, fr: *const Frustum) void {
+    if (!fr.sees(d.bound)) return;
     const g = &gfx.g;
     g.activeTexture(gl.TEXTURE0 + 1);
     g.bindTexture(gl.TEXTURE_2D, d.texture2);
@@ -1728,10 +1793,11 @@ pub fn loopWith(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Came
         g.uniform1i(gfx.u_tex2, 1);
         g.uniform1i(gfx.u_decal, 2);
         for (gfx.u_flat, 0..) |loc, i| g.uniform1i(loc, @intCast(3 + i));
-        if (scene.terrain) |t| drawItem(gfx, scene, t);
-        for (scene.draws.items) |d| drawItem(gfx, scene, d);
-        for (scene.actor_draws.items) |d| drawItem(gfx, scene, d);
-        for (scene.overlay.items) |d| drawItem(gfx, scene, d);
+        const frustum = Frustum.init(vp, eye);
+        if (scene.terrain) |t| drawItem(gfx, scene, t, &frustum);
+        for (scene.draws.items) |d| drawItem(gfx, scene, d, &frustum);
+        for (scene.actor_draws.items) |d| drawItem(gfx, scene, d, &frustum);
+        for (scene.overlay.items) |d| drawItem(gfx, scene, d, &frustum);
         const Hk = @typeInfo(@TypeOf(hooks)).pointer.child;
         if (comptime @hasDecl(Hk, "overlay")) {
             ui.verts.clearRetainingCapacity();
