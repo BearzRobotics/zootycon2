@@ -10,7 +10,10 @@
 //!       type 0x0E  rotation, 10 bytes/key: u16 ms, i16 x,y,z,w (/10000)
 //!       type 0x0C  rotation, 16 bytes/key: same 10 bytes + 6 unknown
 //!       type 0x02  translation, 8 bytes/key: u16 ms, i16 x,y,z (/1000)
-//!   Other track types (1, 3, 4, 6-8, 0x10, 0x11) are skipped by size.
+//!       type 0x01  translation, 20 bytes/key: as 0x02 + 12 unknown bytes
+//!   Types 6, 7, 8 look like Euler angles X, Y, Z in radians * 1000 (a
+//!   `Floor` node holds 1.570 and 3.141) but are not applied yet. Other
+//!   track types (3, 4, 0x10, 0x11) are skipped by size.
 //!   After the bones come text-key markers, which are ignored here.
 
 const std = @import("std");
@@ -106,10 +109,11 @@ pub fn parse(gpa: std.mem.Allocator, data: []const u8) Error!Animation {
                         });
                     }
                 },
-                0x02 => {
-                    if (keys.len != 8 * count) return error.BadAnimation;
+                0x02, 0x01 => {
+                    const stride: usize = if (typ == 0x02) 8 else 20;
+                    if (keys.len != stride * count) return error.BadAnimation;
                     for (0..count) |k| {
-                        const o = k * 8;
+                        const o = k * stride;
                         try tr.append(a, .{
                             .time = @as(f32, @floatFromInt(u16le(keys, o))) / 1000.0,
                             .p = .{
