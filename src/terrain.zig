@@ -171,6 +171,67 @@ pub fn parse(gpa: std.mem.Allocator, data: []const u8) Error!Terrain {
     };
 }
 
+/// Biomes a blank map can be painted with (the order of the stock maps).
+pub const blank_biomes = [_][]const u8{
+    "temperateforest", "borealforest", "alpine", "desert", "grassland", "gridland",
+    "tropicalrainforest", "savannah", "scrub", "tundra", "wetlands", "zoodecoration",
+};
+
+/// A flat map of `tiles_x` by `tiles_y` tiles (3 world units each, 4 grid
+/// vertices per tile) painted with one biome, built by writing a terrain file
+/// and parsing it so it behaves like any other map.
+pub fn blank(gpa: std.mem.Allocator, tiles_x: u32, tiles_y: u32, biome: u8) Error!Terrain {
+    const gw = tiles_x * 4 + 1;
+    const gh = tiles_y * 4 + 1;
+    const rs = 28;
+    var names_len: usize = 0;
+    for (blank_biomes) |n| names_len += 4 + n.len + 1;
+    const total = 48 + names_len + @as(usize, gw) * gh * rs;
+    const buf = try gpa.alloc(u8, total);
+    defer gpa.free(buf);
+    @memset(buf, 0);
+    const w = std.mem.writeInt;
+    w(u32, buf[0..4], 11, .little);
+    w(u32, buf[4..8], @bitCast(@as(f32, @floatFromInt(tiles_x)) * 3.0), .little);
+    w(u32, buf[8..12], @bitCast(@as(f32, @floatFromInt(tiles_y)) * 3.0), .little);
+    w(u32, buf[12..16], @bitCast(@as(f32, 3.0)), .little);
+    w(u32, buf[16..20], @bitCast(@as(f32, 3.0)), .little);
+    w(u32, buf[20..24], 5, .little);
+    w(u32, buf[24..28], 5, .little);
+    w(u32, buf[28..32], gw, .little);
+    w(u32, buf[32..36], gh, .little);
+    w(u32, buf[36..40], 9, .little);
+    w(u32, buf[40..44], 9, .little);
+    w(u32, buf[44..48], blank_biomes.len, .little);
+    var pos: usize = 48;
+    for (blank_biomes) |n| {
+        w(u32, buf[pos..][0..4], @intCast(n.len + 1), .little);
+        pos += 4;
+        @memcpy(buf[pos..][0..n.len], n);
+        pos += n.len + 1;
+    }
+    const count = @as(usize, gw) * gh;
+    for (0..count) |i| {
+        const rec = pos + i * rs;
+        w(u32, buf[rec + 8 ..][0..4], biome, .little);
+        w(u32, buf[rec + 18 ..][0..4], @bitCast(@as(f32, 6.0)), .little);
+        w(u32, buf[rec + 22 ..][0..4], @bitCast(@as(f32, 26.0)), .little);
+    }
+    return parse(gpa, buf);
+}
+
+test "blank terrain parses back flat with the chosen biome" {
+    var t = try blank(std.testing.allocator, 4, 3, 7);
+    defer t.deinit();
+    try std.testing.expectEqual(@as(u32, 17), t.width);
+    try std.testing.expectEqual(@as(u32, 13), t.height);
+    try std.testing.expectEqual(@as(f32, 12.0), t.world_width);
+    try std.testing.expectEqual(@as(f32, 9.0), t.world_height);
+    try std.testing.expectApproxEqAbs(@as(f32, 6.0), t.z[100], 1e-6);
+    try std.testing.expectEqual(@as(u8, 7), t.paint[50]);
+    try std.testing.expectEqualStrings("savannah", t.biomes[t.paint[50]]);
+}
+
 test "synthetic 3x2 terrain" {
     const rs = 28;
     var buf: [48 + 4 + 4 + 6 * rs]u8 = undefined;

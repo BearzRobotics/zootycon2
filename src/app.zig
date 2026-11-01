@@ -97,7 +97,7 @@ const Hit = struct {
 pub const BuyTab = enum { fence, path, building, scenery, animal, food, staff, deform };
 
 /// Which full-screen menu is open (if any).
-const Menu = enum { none, pause, maps, saves, settings, finances };
+const Menu = enum { none, pause, maps, saves, settings, finances, new_zoo };
 
 const MenuAction = enum {
     close_menu,
@@ -114,6 +114,10 @@ const MenuAction = enum {
     rot_left,
     rot_right,
     toggle_hud,
+    open_new_zoo,
+    new_zoo_size,
+    new_zoo_biome,
+    new_zoo_start,
     ui_size,
     toggle_delete,
     close_selection,
@@ -292,6 +296,8 @@ pub const App = struct {
     /// The game's own HUD, drawn from its layout files.
     hud: ?struct { shell: uilayout.Layout, bucks: ?uilayout.Layout, info: ?uilayout.Layout = null } = null,
     hud_on: bool = true,
+    nz_size: u8 = 1,
+    nz_biome: u8 = 6,
     /// Interface size multiplier (settings: UI SIZE).
     ui_zoom: f32 = 1.0,
     delete_mode: bool = false,
@@ -992,6 +998,35 @@ pub const App = struct {
             self.say("could not load ({s})", .{@errorName(e)});
             return;
         };
+        try self.installWorld(fresh);
+        self.say("loaded {s}", .{std.fs.path.basename(zt2_path)});
+    }
+
+    const zoo_sizes = [_]struct { tiles: u32, name: []const u8 }{
+        .{ .tiles = 96, .name = "SMALL 96 (STOCK MAX)" },
+        .{ .tiles = 144, .name = "LARGE 144" },
+        .{ .tiles = 192, .name = "HUGE 192" },
+        .{ .tiles = 256, .name = "ENORMOUS 256" },
+    };
+    /// Biomes offered for a blank zoo (indices into `terrain.blank_biomes`).
+    const zoo_biomes = [_]u8{ 0, 1, 2, 3, 4, 6, 7, 8, 9, 10 };
+
+    /// Starts a flat, empty zoo of the chosen size and biome.
+    fn startBlankZoo(self: *App) void {
+        const tiles = zoo_sizes[self.nz_size].tiles;
+        const biome = zoo_biomes[self.nz_biome];
+        const fresh = loadBlankWorld(self.gpa, self.io, self.vfs, tiles, biome) catch |e| {
+            self.say("could not create the zoo ({s})", .{@errorName(e)});
+            return;
+        };
+        self.installWorld(fresh) catch |e| {
+            self.say("could not start the zoo ({s})", .{@errorName(e)});
+            return;
+        };
+        self.say("new {d}x{d} tile zoo", .{ tiles, tiles });
+    }
+
+    fn installWorld(self: *App, fresh: world_mod.World) !void {
         self.world.deinit();
         self.world = fresh;
         self.look.deinit(self.gpa);
@@ -1014,7 +1049,6 @@ pub const App = struct {
         if (self.env) |*e| e.deinit();
         self.env = loadEnvironment(self.gpa, self.vfs, self.world.environment);
         self.reset_camera = true;
-        self.say("loaded {s}", .{std.fs.path.basename(zt2_path)});
     }
 
     // ------------------------------------------------------------ scripting
@@ -1087,6 +1121,10 @@ pub const App = struct {
         } else if (std.mem.eql(u8, verb, "drain")) {
             try self.sim.sync(&self.world);
             for (self.sim.feeders.items) |*f| f.food = 20;
+        } else if (std.mem.eql(u8, verb, "newzoo")) {
+            self.nz_size = @intFromFloat(try num(it.next()));
+            self.nz_biome = @intFromFloat(try num(it.next()));
+            self.startBlankZoo();
         } else if (std.mem.eql(u8, verb, "needy")) {
             try self.sim.sync(&self.world);
             for (self.sim.agents.items) |*ag| if (ag.is_guest) {
@@ -1800,6 +1838,13 @@ pub const App = struct {
                 ctx.cam.yaw += 0.35;
                 ctx.snap_camera = true;
             },
+            .open_new_zoo => self.openMenu(.new_zoo),
+            .new_zoo_size => self.nz_size = @intCast((self.nz_size + 1) % zoo_sizes.len),
+            .new_zoo_biome => self.nz_biome = @intCast((self.nz_biome + 1) % zoo_biomes.len),
+            .new_zoo_start => {
+                self.startBlankZoo();
+                self.openMenu(.none);
+            },
             .ui_size => {
                 self.ui_zoom = if (self.ui_zoom < 1.2) 1.25 else if (self.ui_zoom < 1.4) 1.5 else if (self.ui_zoom < 1.8) 2.0 else 1.0;
             },
@@ -1909,6 +1954,7 @@ pub const App = struct {
             .saves => "LOAD A SAVED ZOO",
             .settings => "SETTINGS",
             .finances => "FINANCES",
+            .new_zoo => "NEW BLANK ZOO",
             .none => "",
         };
         if (self.menu == .finances) return self.drawFinances(ui, scale);
@@ -1934,6 +1980,7 @@ pub const App = struct {
                     _ = try ui.text((ui.width - mw) / 2, y, scale, msg, .{ 0.8, 0.85, 0.9, 1 });
                     y += 14 * scale;
                 }
+                if (self.menu == .maps) y += try self.menuButton(ui, y, scale, "NEW BLANK ZOO (CHOOSE SIZE)...", .{ .menu = .open_new_zoo }, true);
                 // As many rows as fit between the title and the Back button.
                 const row_h = 18 * scale * 0.8;
                 const room = ui.height - y - 40 * scale;
@@ -1970,6 +2017,14 @@ pub const App = struct {
                 y += try self.menuButton(ui, y, scale, "SIM SPEED: SLOWER", .{ .menu = .speed_down }, false);
                 y += 6 * scale;
                 y += try self.menuButton(ui, y, scale, "BACK", .{ .menu = .back }, false);
+            },
+            .new_zoo => {
+                var b: [96]u8 = undefined;
+                y += try self.menuButton(ui, y, scale, std.fmt.bufPrint(&b, "SIZE: {s}", .{zoo_sizes[self.nz_size].name}) catch "", .{ .menu = .new_zoo_size }, false);
+                y += try self.menuButton(ui, y, scale, std.fmt.bufPrint(&b, "BIOME: {s}", .{terrain_mod.blank_biomes[zoo_biomes[self.nz_biome]]}) catch "", .{ .menu = .new_zoo_biome }, false);
+                y += 6 * scale;
+                y += try self.menuButton(ui, y, scale, "START", .{ .menu = .new_zoo_start }, true);
+                y += try self.menuButton(ui, y, scale, "BACK", .{ .menu = .open_maps }, false);
             },
             .finances, .none => {},
         }
@@ -3333,6 +3388,19 @@ pub fn loadWorld(gpa: std.mem.Allocator, io: Io, vfs: *vfs_mod.Vfs, path: []cons
     const terr_bytes = try readAny(gpa, io, vfs, terr_path);
     defer gpa.free(terr_bytes);
     var terr = try terrain_mod.parse(gpa, terr_bytes);
+    errdefer terr.deinit();
+    return world_mod.World.fromMap(gpa, &mp, terr);
+}
+
+/// An empty flat map: no objects, a generated terrain and the game's plain environment.
+pub fn loadBlankWorld(gpa: std.mem.Allocator, io: Io, vfs: *vfs_mod.Vfs, tiles: u32, biome: u8) !world_mod.World {
+    _ = io;
+    _ = vfs;
+    var mp = try map_mod.parse(gpa,
+        \\<BFContext><ZTWorldMgr terrFile="blank.dat" environment="world/environments/env1noskirt.xml"/></BFContext>
+    );
+    defer mp.deinit();
+    var terr = try terrain_mod.blank(gpa, tiles, tiles, biome);
     errdefer terr.deinit();
     return world_mod.World.fromMap(gpa, &mp, terr);
 }

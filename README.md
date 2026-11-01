@@ -78,6 +78,7 @@ shows the current tool, the selected item, and the last message.
 | `Tab`, `,`, `.` | pause, slower, faster simulation |
 | `T`, `F2`, `F3` | run or stop the clock, previous or next time of day |
 | `G` | turn guest arrivals on or off |
+| pause menu > NEW MAP > NEW BLANK ZOO | a flat empty zoo, 96 to 256 tiles a side (the biggest stock map is 96), in a biome of your choice |
 | `M` | sound on or off (`--no-sound` disables it entirely) |
 | `F5`, `F9` | save, load the last save |
 
