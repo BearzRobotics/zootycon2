@@ -8,6 +8,7 @@ pub const xml = @import("xml.zig");
 pub const entity = @import("entity.zig");
 pub const platform = @import("platform.zig");
 pub const nif = @import("nif.zig");
+pub const dds = @import("dds.zig");
 
 test {
     _ = archive;
@@ -17,4 +18,5 @@ test {
     _ = entity;
     _ = platform;
     _ = nif;
+    _ = dds;
 }

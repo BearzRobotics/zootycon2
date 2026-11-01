@@ -18,6 +18,7 @@ const usage =
     \\  entities                    load entity definitions and show statistics
     \\  entity <name>                show an entity's inheritance chain and data
     \\  window [seconds]             open a test window (Esc or close to quit)
+    \\  ddscheck [prefix]           parse every .dds texture and report formats
     \\  nifcheck [prefix]           parse every .nif/.kf and report coverage
     \\  xmlcheck [prefix]            parse every .xml and report failures
     \\
@@ -176,6 +177,41 @@ pub fn main(init: std.process.Init) !void {
                 }
             }
         }
+    } else if (std.mem.eql(u8, cmd, "ddscheck")) {
+        const prefix = if (rest.len > 0) rest[0] else "";
+        var names: std.ArrayList([]const u8) = .empty;
+        defer names.deinit(gpa);
+        const Collect = struct {
+            list: *std.ArrayList([]const u8),
+            gpa: std.mem.Allocator,
+            prefix: []const u8,
+            fn add(c: @This(), name: []const u8) anyerror!void {
+                if (std.mem.startsWith(u8, name, c.prefix) and std.mem.endsWith(u8, name, ".dds")) try c.list.append(c.gpa, name);
+            }
+        };
+        try vfs.forEach(Collect{ .list = &names, .gpa = gpa, .prefix = prefix }, Collect.add);
+        var counts: [4]usize = .{ 0, 0, 0, 0 };
+        var cubes: usize = 0;
+        var failed: usize = 0;
+        var short_mips: usize = 0;
+        for (names.items) |n| {
+            const data = try vfs.read(gpa, n);
+            defer gpa.free(data);
+            var img = zootycon2.dds.parse(gpa, data) catch |err| {
+                failed += 1;
+                if (failed <= 15) try out.print("{s}: {s}\n", .{ n, @errorName(err) });
+                continue;
+            };
+            defer img.deinit();
+            counts[@intFromEnum(img.format)] += 1;
+            if (img.faces > 1) cubes += 1;
+            const full = std.math.log2_int(u32, @max(img.width, img.height)) + 1;
+            if (img.mip_count != 1 and img.mip_count != full) short_mips += 1;
+            // Exercise the software decoder on the top level.
+            const px = try zootycon2.dds.decodeLevel(gpa, &img, 0, 0);
+            gpa.free(px);
+        }
+        try out.print("{d} textures: dxt1 {d}, dxt3 {d}, dxt5 {d}, rgba8 {d}; {d} cube maps; {d} with partial mip chains; {d} failed\n", .{ names.items.len, counts[0], counts[1], counts[2], counts[3], cubes, short_mips, failed });
     } else if (std.mem.eql(u8, cmd, "nifcheck")) {
         const prefix = if (rest.len > 0) rest[0] else "";
         var names: std.ArrayList([]const u8) = .empty;
