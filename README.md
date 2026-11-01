@@ -15,9 +15,13 @@ animals, watch them, and leave; the top right shows guests, takings, views,
 happiness and the star rating (which raises the guest cap). The numbers come
 from the game's own `ai/guestmgr.xml`.
 
+Licensed under MIT (see `LICENSE`; vendored SDL3 keeps its own zlib license
+in `vendor/`). Not affiliated with or endorsed by Microsoft or Blue Fang
+Games; you need your own copy of Zoo Tycoon 2.
+
 Status: an asset pipeline (every model, texture, animation and map in the
 game loads), a renderer, a small simulation, and build tools. It is not yet
-a playable game. There is no UI, economy, or real AI.
+a playable game. It has a basic UI, a budget (purchases cost money, keepers draw salaries) and data-driven animal AI.
 
 ## Build and run
 
