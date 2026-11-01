@@ -178,6 +178,7 @@ const fs_src: [:0]const u8 =
     \\uniform vec3 uFogColor;
     \\uniform int uModern;
     \\uniform float uExposure;
+    \\uniform int uHdrOut;
     \\uniform int uShadowOn;
     \\uniform sampler2DShadow uShadow;
     \\uniform mat4 uLightVP;
@@ -245,7 +246,8 @@ const fs_src: [:0]const u8 =
     \\      litL += toLinear(uLcol[uLightSet * 3 + i]) * max(dot(n, -uLdir[uLightSet * 3 + i]), 0.0) * f;
     \\    }
     \\    vec3 colL = mix(toLinear(c.rgb) * litL * uExposure, toLinear(uFogColor) * uExposure, fogF);
-    \\    outColor = vec4(filmic(colL), c.a);
+    \\    // With post-processing the tone mapping happens at the end.
+    \\    outColor = uHdrOut == 1 ? vec4(colL, c.a) : vec4(filmic(colL), c.a);
     \\  } else {
     \\    outColor = vec4(mix(c.rgb * lit, uFogColor, fogF), c.a);
     \\  }
@@ -367,6 +369,7 @@ const sky_fs: [:0]const u8 =
     \\uniform vec3 uSunCol;
     \\uniform int uModern;
     \\uniform float uExposure;
+    \\uniform int uHdrOut;
     \\vec3 toLinear(vec3 c) { return pow(max(c, vec3(0.0)), vec3(2.2)); }
     \\vec3 filmic(vec3 x) {
     \\  vec3 m = clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
@@ -379,7 +382,10 @@ const sky_fs: [:0]const u8 =
     \\  float disc = smoothstep(0.9988, 0.9994, s);
     \\  float glow = pow(max(s, 0.0), 48.0) * 0.45;
     \\  vec3 col = vColor + uSunCol * (disc + glow);
-    \\  if (uModern == 1) col = filmic(toLinear(col) * uExposure * 0.7);
+    \\  if (uModern == 1) {
+    \\    vec3 l = toLinear(col) * uExposure * 0.7;
+    \\    col = uHdrOut == 1 ? l : filmic(l);
+    \\  }
     \\  outColor = vec4(col, 1.0);
     \\}
 ;
@@ -414,6 +420,167 @@ const shadow_fs: [:0]const u8 =
     \\void main() {
     \\  // Leaves and fences cast shadows only where they are solid.
     \\  if (texture(uTex, vUv).a < max(uAlphaCut, 0.4)) discard;
+    \\}
+;
+
+const post_vs: [:0]const u8 =
+    \\#version 330 core
+    \\out vec2 vUv;
+    \\void main() {
+    \\  // One triangle covering the screen.
+    \\  vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+    \\  vUv = p;
+    \\  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+    \\}
+;
+
+const ssao_fs: [:0]const u8 =
+    \\#version 330 core
+    \\in vec2 vUv;
+    \\uniform sampler2D uDepth;
+    \\uniform vec4 uProj;      // tan(fov/2) * aspect, tan(fov/2), near, far
+    \\uniform float uRadius;   // world units
+    \\out float ao;
+    \\float linearZ(float d) {
+    \\  float n = uProj.z, f = uProj.w;
+    \\  return 2.0 * n * f / (f + n - (d * 2.0 - 1.0) * (f - n));
+    \\}
+    \\vec3 viewPos(vec2 uv, float z) {
+    \\  vec2 ndc = uv * 2.0 - 1.0;
+    \\  return vec3(ndc.x * uProj.x * z, ndc.y * uProj.y * z, -z);
+    \\}
+    \\float hash(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
+    \\void main() {
+    \\  float d = texture(uDepth, vUv).r;
+    \\  if (d >= 0.99999) { ao = 1.0; return; }
+    \\  float z = linearZ(d);
+    \\  vec3 P = viewPos(vUv, z);
+    \\  vec3 N = normalize(cross(dFdx(P), dFdy(P)));
+    \\  if (dot(N, P) > 0.0) N = -N;
+    \\  float ang = hash(gl_FragCoord.xy) * 6.2831853;
+    \\  float reach = uRadius / (2.0 * uProj.y * z);   // radius as a fraction of screen height
+    \\  float occ = 0.0;
+    \\  const int taps = 12;
+    \\  for (int i = 0; i < taps; i++) {
+    \\    float a = ang + float(i) * 2.39996;
+    \\    float r = (float(i) + 0.5) / float(taps);
+    \\    vec2 off = vec2(cos(a) / (uProj.x / uProj.y), sin(a)) * r * reach;
+    \\    vec2 suv = vUv + off;
+    \\    float sz = linearZ(texture(uDepth, suv).r);
+    \\    vec3 Q = viewPos(suv, sz);
+    \\    vec3 V = Q - P;
+    \\    float len = length(V);
+    \\    float facing = max(dot(N, V) / max(len, 1e-4) - 0.12, 0.0);
+    \\    occ += facing * (1.0 - smoothstep(0.0, uRadius * 1.5, len));
+    \\  }
+    \\  ao = clamp(1.0 - occ / float(taps) * 2.2, 0.0, 1.0);
+    \\}
+;
+
+const aoblur_fs: [:0]const u8 =
+    \\#version 330 core
+    \\in vec2 vUv;
+    \\uniform sampler2D uAo;
+    \\uniform sampler2D uDepth;
+    \\uniform vec2 uTexel;
+    \\out float ao;
+    \\void main() {
+    \\  float center = texture(uDepth, vUv).r;
+    \\  float sum = 0.0, w = 0.0;
+    \\  for (int x = -2; x <= 1; x++) for (int y = -2; y <= 1; y++) {
+    \\    vec2 uv = vUv + (vec2(x, y) + 0.5) * uTexel;
+    \\    // Do not blur across depth edges (it would leave halos).
+    \\    float wt = abs(texture(uDepth, uv).r - center) < 0.0006 ? 1.0 : 0.0;
+    \\    sum += texture(uAo, uv).r * wt;
+    \\    w += wt;
+    \\  }
+    \\  ao = w > 0.0 ? sum / w : texture(uAo, vUv).r;
+    \\}
+;
+
+const bright_fs: [:0]const u8 =
+    \\#version 330 core
+    \\in vec2 vUv;
+    \\uniform sampler2D uHdr;
+    \\uniform vec2 uTexel;     // of the source
+    \\uniform float uThreshold;
+    \\out vec4 outColor;
+    \\void main() {
+    \\  vec3 c = vec3(0.0);
+    \\  for (int x = 0; x < 2; x++) for (int y = 0; y < 2; y++) {
+    \\    c += texture(uHdr, vUv + (vec2(x, y) * 2.0 - 1.0) * uTexel).rgb;
+    \\  }
+    \\  c *= 0.25;
+    \\  float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    \\  float k = max(l - uThreshold, 0.0) / max(l, 1e-3);
+    \\  outColor = vec4(c * k, 1.0);
+    \\}
+;
+
+const blur_fs: [:0]const u8 =
+    \\#version 330 core
+    \\in vec2 vUv;
+    \\uniform sampler2D uTex;
+    \\uniform vec2 uDir;       // one texel step along the blur direction
+    \\out vec4 outColor;
+    \\void main() {
+    \\  float w[5] = float[5](0.227027, 0.1945946, 0.1216216, 0.054054, 0.016216);
+    \\  vec3 c = texture(uTex, vUv).rgb * w[0];
+    \\  for (int i = 1; i < 5; i++) {
+    \\    c += texture(uTex, vUv + uDir * float(i)).rgb * w[i];
+    \\    c += texture(uTex, vUv - uDir * float(i)).rgb * w[i];
+    \\  }
+    \\  outColor = vec4(c, 1.0);
+    \\}
+;
+
+const composite_fs: [:0]const u8 =
+    \\#version 330 core
+    \\in vec2 vUv;
+    \\uniform sampler2D uHdr;
+    \\uniform sampler2D uAo;
+    \\uniform sampler2D uBloom;
+    \\uniform int uUseAo;
+    \\uniform int uUseBloom;
+    \\uniform float uBloomStrength;
+    \\out vec4 outColor;
+    \\vec3 filmic(vec3 x) {
+    \\  vec3 m = clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+    \\  return pow(m, vec3(1.0 / 2.2));
+    \\}
+    \\void main() {
+    \\  vec3 c = texture(uHdr, vUv).rgb;
+    \\  if (uUseAo == 1) c *= mix(1.0, texture(uAo, vUv).r, 0.9);
+    \\  if (uUseBloom == 1) c += texture(uBloom, vUv).rgb * uBloomStrength;
+    \\  outColor = vec4(filmic(c), 1.0);
+    \\}
+;
+
+const fxaa_fs: [:0]const u8 =
+    \\#version 330 core
+    \\in vec2 vUv;
+    \\uniform sampler2D uTex;
+    \\uniform vec2 uTexel;
+    \\out vec4 outColor;
+    \\float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+    \\void main() {
+    \\  vec3 rgbM = texture(uTex, vUv).rgb;
+    \\  vec3 rgbNW = texture(uTex, vUv + vec2(-1.0, -1.0) * uTexel).rgb;
+    \\  vec3 rgbNE = texture(uTex, vUv + vec2(1.0, -1.0) * uTexel).rgb;
+    \\  vec3 rgbSW = texture(uTex, vUv + vec2(-1.0, 1.0) * uTexel).rgb;
+    \\  vec3 rgbSE = texture(uTex, vUv + vec2(1.0, 1.0) * uTexel).rgb;
+    \\  float lM = luma(rgbM), lNW = luma(rgbNW), lNE = luma(rgbNE), lSW = luma(rgbSW), lSE = luma(rgbSE);
+    \\  float lMin = min(lM, min(min(lNW, lNE), min(lSW, lSE)));
+    \\  float lMax = max(lM, max(max(lNW, lNE), max(lSW, lSE)));
+    \\  if (lMax - lMin < max(0.03, lMax * 0.125)) { outColor = vec4(rgbM, 1.0); return; }
+    \\  vec2 dir = vec2(-((lNW + lNE) - (lSW + lSE)), (lNW + lSW) - (lNE + lSE));
+    \\  float reduce = max((lNW + lNE + lSW + lSE) * 0.25 * 0.125, 1.0 / 128.0);
+    \\  float rcp = 1.0 / (min(abs(dir.x), abs(dir.y)) + reduce);
+    \\  dir = clamp(dir * rcp, vec2(-8.0), vec2(8.0)) * uTexel;
+    \\  vec3 a = 0.5 * (texture(uTex, vUv + dir * (1.0 / 3.0 - 0.5)).rgb + texture(uTex, vUv + dir * (2.0 / 3.0 - 0.5)).rgb);
+    \\  vec3 b = a * 0.5 + 0.25 * (texture(uTex, vUv + dir * -0.5).rgb + texture(uTex, vUv + dir * 0.5).rgb);
+    \\  float lB = luma(b);
+    \\  outColor = vec4((lB < lMin || lB > lMax) ? a : b, 1.0);
     \\}
 ;
 
@@ -658,6 +825,15 @@ pub const Fx = struct {
     exposure: f32 = 1.7,
     /// Sun shadows from a depth map fitted around the camera.
     shadows: bool = false,
+    /// Post-processing (needs `modern`): screen-space ambient occlusion,
+    /// bloom on bright areas, and edge anti-aliasing.
+    ssao: bool = false,
+    bloom: bool = false,
+    fxaa: bool = false,
+
+    pub fn post(self: Fx) bool {
+        return self.modern and (self.ssao or self.bloom or self.fxaa);
+    }
 };
 
 pub const Scene = struct {
@@ -1792,6 +1968,9 @@ pub const Gfx = struct {
     sky_suncol: gl.Int,
     sky_modern: gl.Int,
     sky_exposure: gl.Int,
+    post: PostState,
+    u_hdr_out: gl.Int,
+    sky_hdr_out: gl.Int,
     // shadows (created the first time they are switched on)
     shadow_prog: gl.Uint = 0,
     shadow_fbo: gl.Uint = 0,
@@ -1857,6 +2036,7 @@ pub const Gfx = struct {
             if (self.g.getString(gl.RENDERER)) |r| std.debug.print("renderer: {s}\n", .{r});
         }
         // `Gfx` is created undefined, so its defaults do not apply: set these here.
+        self.post = .{};
         self.shadow_prog = 0;
         self.shadow_fbo = 0;
         self.shadow_tex = 0;
@@ -1898,6 +2078,8 @@ pub const Gfx = struct {
         self.u_shadow = g.getUniformLocation(self.prog, "uShadow");
         self.u_light_vp = g.getUniformLocation(self.prog, "uLightVP");
         self.u_shadow_texel = g.getUniformLocation(self.prog, "uShadowTexel");
+        self.u_hdr_out = g.getUniformLocation(self.prog, "uHdrOut");
+        self.sky_hdr_out = g.getUniformLocation(self.sky_prog, "uHdrOut");
         self.u_modern = g.getUniformLocation(self.prog, "uModern");
         self.u_exposure = g.getUniformLocation(self.prog, "uExposure");
         try self.initUi();
@@ -2123,6 +2305,194 @@ const Frustum = struct {
         return b[3] > dist * 0.0015; // under about a pixel at 720p
     }
 };
+
+/// Offscreen targets and programs for post-processing; created on first use.
+const PostState = struct {
+    ready: bool = false,
+    w: gl.Sizei = 0,
+    h: gl.Sizei = 0,
+    vao: gl.Uint = 0,
+    scene_fbo: gl.Uint = 0,
+    color: gl.Uint = 0,
+    depth: gl.Uint = 0,
+    ao_fbo: [2]gl.Uint = .{ 0, 0 },
+    ao_tex: [2]gl.Uint = .{ 0, 0 },
+    bloom_fbo: [2]gl.Uint = .{ 0, 0 },
+    bloom_tex: [2]gl.Uint = .{ 0, 0 },
+    bw: gl.Sizei = 0,
+    bh: gl.Sizei = 0,
+    ldr_fbo: gl.Uint = 0,
+    ldr: gl.Uint = 0,
+    ssao: gl.Uint = 0,
+    aoblur: gl.Uint = 0,
+    bright: gl.Uint = 0,
+    blur: gl.Uint = 0,
+    composite: gl.Uint = 0,
+    fxaa: gl.Uint = 0,
+    programs_ok: bool = false,
+};
+
+fn makeTarget(g: *const Gl, w: gl.Sizei, h: gl.Sizei, internal: gl.Enum, format: gl.Enum, typ: gl.Enum) gl.Uint {
+    var t: gl.Uint = 0;
+    g.genTextures(1, @ptrCast(&t));
+    g.bindTexture(gl.TEXTURE_2D, t);
+    g.texImage2D(gl.TEXTURE_2D, 0, @intCast(internal), w, h, 0, format, typ, null);
+    g.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, @intCast(gl.LINEAR));
+    g.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, @intCast(gl.LINEAR));
+    g.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, @intCast(gl.CLAMP_TO_EDGE));
+    g.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, @intCast(gl.CLAMP_TO_EDGE));
+    return t;
+}
+
+fn makeFbo(g: *const Gl, color: gl.Uint, depth: gl.Uint) gl.Uint {
+    var f: gl.Uint = 0;
+    g.genFramebuffers(1, @ptrCast(&f));
+    g.bindFramebuffer(gl.FRAMEBUFFER, f);
+    if (color != 0) g.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, color, 0);
+    if (depth != 0) g.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, depth, 0);
+    const ok = g.checkFramebufferStatus(gl.FRAMEBUFFER) == gl.FRAMEBUFFER_COMPLETE;
+    g.bindFramebuffer(gl.FRAMEBUFFER, 0);
+    return if (ok) f else 0;
+}
+
+/// Builds the programs once and the render targets for the window size.
+fn ensurePost(gfx: *Gfx, w: u32, h: u32) bool {
+    const g = &gfx.g;
+    const p = &gfx.post;
+    if (!p.programs_ok) {
+        p.ssao = makeProgramFrom(g, post_vs, ssao_fs) catch return false;
+        p.aoblur = makeProgramFrom(g, post_vs, aoblur_fs) catch return false;
+        p.bright = makeProgramFrom(g, post_vs, bright_fs) catch return false;
+        p.blur = makeProgramFrom(g, post_vs, blur_fs) catch return false;
+        p.composite = makeProgramFrom(g, post_vs, composite_fs) catch return false;
+        p.fxaa = makeProgramFrom(g, post_vs, fxaa_fs) catch return false;
+        g.genVertexArrays(1, @ptrCast(&p.vao));
+        p.programs_ok = true;
+    }
+    const iw: gl.Sizei = @intCast(w);
+    const ih: gl.Sizei = @intCast(h);
+    if (p.ready and p.w == iw and p.h == ih) return true;
+    // (Re)create the targets; old ones are simply leaked on resize, which is rare.
+    p.color = makeTarget(g, iw, ih, gl.RGBA16F, gl.RGBA, gl.FLOAT);
+    p.depth = makeTarget(g, iw, ih, gl.DEPTH_COMPONENT24, gl.DEPTH_COMPONENT, gl.FLOAT);
+    g.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, @intCast(gl.NEAREST));
+    g.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, @intCast(gl.NEAREST));
+    p.scene_fbo = makeFbo(g, p.color, p.depth);
+    for (0..2) |i| {
+        p.ao_tex[i] = makeTarget(g, iw, ih, gl.R8, gl.RED, gl.UNSIGNED_BYTE);
+        p.ao_fbo[i] = makeFbo(g, p.ao_tex[i], 0);
+    }
+    p.bw = @max(iw >> 2, 1);
+    p.bh = @max(ih >> 2, 1);
+    for (0..2) |i| {
+        p.bloom_tex[i] = makeTarget(g, p.bw, p.bh, gl.RGBA16F, gl.RGBA, gl.FLOAT);
+        p.bloom_fbo[i] = makeFbo(g, p.bloom_tex[i], 0);
+    }
+    p.ldr = makeTarget(g, iw, ih, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE);
+    p.ldr_fbo = makeFbo(g, p.ldr, 0);
+    p.w = iw;
+    p.h = ih;
+    p.ready = p.scene_fbo != 0 and p.ldr_fbo != 0 and p.ao_fbo[0] != 0 and p.bloom_fbo[0] != 0;
+    if (!p.ready) std.debug.print("post-processing targets are not complete; post-processing disabled\n", .{});
+    return p.ready;
+}
+
+fn bindTex(g: *const Gl, unit: gl.Enum, tex: gl.Uint) void {
+    g.activeTexture(gl.TEXTURE0 + unit);
+    g.bindTexture(gl.TEXTURE_2D, tex);
+}
+
+fn uloc(g: *const Gl, prog: gl.Uint, name: [*:0]const u8) gl.Int {
+    return g.getUniformLocation(prog, name);
+}
+
+fn fullscreen(g: *const Gl, p: *const PostState) void {
+    g.bindVertexArray(p.vao);
+    g.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+/// Occlusion, bloom, tone mapping and anti-aliasing over the HDR scene,
+/// ending in the default framebuffer.
+fn runPost(gfx: *Gfx, fx: Fx, cam: Camera, aspect: f32, near: f32, far: f32, size: struct { width: u32, height: u32 }) void {
+    const g = &gfx.g;
+    const p = &gfx.post;
+    g.disable(gl.DEPTH_TEST);
+    g.disable(gl.BLEND);
+    g.depthMask(0);
+    const tan_y = @tan(Camera.fov_y / 2);
+
+    if (fx.ssao) {
+        g.bindFramebuffer(gl.FRAMEBUFFER, p.ao_fbo[0]);
+        g.viewport(0, 0, p.w, p.h);
+        g.useProgram(p.ssao);
+        bindTex(g, 0, p.depth);
+        g.uniform1i(uloc(g, p.ssao, "uDepth"), 0);
+        g.uniform4f(uloc(g, p.ssao, "uProj"), tan_y * aspect, tan_y, near, far);
+        g.uniform1f(uloc(g, p.ssao, "uRadius"), std.math.clamp(cam.dist * 0.04, 0.6, 3.5));
+        fullscreen(g, p);
+        g.bindFramebuffer(gl.FRAMEBUFFER, p.ao_fbo[1]);
+        g.useProgram(p.aoblur);
+        bindTex(g, 0, p.ao_tex[0]);
+        bindTex(g, 1, p.depth);
+        g.uniform1i(uloc(g, p.aoblur, "uAo"), 0);
+        g.uniform1i(uloc(g, p.aoblur, "uDepth"), 1);
+        g.uniform2f(uloc(g, p.aoblur, "uTexel"), 1.0 / @as(f32, @floatFromInt(p.w)), 1.0 / @as(f32, @floatFromInt(p.h)));
+        fullscreen(g, p);
+    }
+    if (fx.bloom) {
+        g.viewport(0, 0, p.bw, p.bh);
+        g.bindFramebuffer(gl.FRAMEBUFFER, p.bloom_fbo[0]);
+        g.useProgram(p.bright);
+        bindTex(g, 0, p.color);
+        g.uniform1i(uloc(g, p.bright, "uHdr"), 0);
+        g.uniform2f(uloc(g, p.bright, "uTexel"), 1.0 / @as(f32, @floatFromInt(p.w)), 1.0 / @as(f32, @floatFromInt(p.h)));
+        g.uniform1f(uloc(g, p.bright, "uThreshold"), 1.1);
+        fullscreen(g, p);
+        // Two blur rounds, horizontal then vertical each time.
+        g.useProgram(p.blur);
+        g.uniform1i(uloc(g, p.blur, "uTex"), 0);
+        const dir_loc = uloc(g, p.blur, "uDir");
+        const tx = 1.0 / @as(f32, @floatFromInt(p.bw));
+        const ty = 1.0 / @as(f32, @floatFromInt(p.bh));
+        for (0..2) |_| {
+            g.bindFramebuffer(gl.FRAMEBUFFER, p.bloom_fbo[1]);
+            bindTex(g, 0, p.bloom_tex[0]);
+            g.uniform2f(dir_loc, tx, 0);
+            fullscreen(g, p);
+            g.bindFramebuffer(gl.FRAMEBUFFER, p.bloom_fbo[0]);
+            bindTex(g, 0, p.bloom_tex[1]);
+            g.uniform2f(dir_loc, 0, ty);
+            fullscreen(g, p);
+        }
+    }
+
+    // Composite (tone mapping), into the LDR target if anti-aliasing follows.
+    g.viewport(0, 0, @intCast(size.width), @intCast(size.height));
+    g.bindFramebuffer(gl.FRAMEBUFFER, if (fx.fxaa) p.ldr_fbo else 0);
+    g.useProgram(p.composite);
+    bindTex(g, 0, p.color);
+    bindTex(g, 1, p.ao_tex[1]);
+    bindTex(g, 2, p.bloom_tex[0]);
+    g.uniform1i(uloc(g, p.composite, "uHdr"), 0);
+    g.uniform1i(uloc(g, p.composite, "uAo"), 1);
+    g.uniform1i(uloc(g, p.composite, "uBloom"), 2);
+    g.uniform1i(uloc(g, p.composite, "uUseAo"), @intFromBool(fx.ssao));
+    g.uniform1i(uloc(g, p.composite, "uUseBloom"), @intFromBool(fx.bloom));
+    g.uniform1f(uloc(g, p.composite, "uBloomStrength"), 0.22);
+    fullscreen(g, p);
+    if (fx.fxaa) {
+        g.bindFramebuffer(gl.FRAMEBUFFER, 0);
+        g.useProgram(p.fxaa);
+        bindTex(g, 0, p.ldr);
+        g.uniform1i(uloc(g, p.fxaa, "uTex"), 0);
+        g.uniform2f(uloc(g, p.fxaa, "uTexel"), 1.0 / @as(f32, @floatFromInt(p.w)), 1.0 / @as(f32, @floatFromInt(p.h)));
+        fullscreen(g, p);
+    }
+    g.bindVertexArray(0);
+    g.activeTexture(gl.TEXTURE0);
+    g.enable(gl.DEPTH_TEST);
+    g.depthMask(1);
+}
 
 /// Uploads the model matrix (or bone matrices) for a draw.
 fn setModelUniforms(g: *const Gl, scene: *Scene, d: Draw, loc_model: gl.Int, loc_bones: gl.Int) void {
@@ -2518,6 +2888,19 @@ pub fn loopWith(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Came
             light_vp = renderShadows(gfx, scene, cam, sample.dir[1][0], .{ .width = size.width, .height = size.height });
         }
 
+        // With post-processing the scene renders into an offscreen HDR target.
+        const use_post = scene.fx.post() and ensurePost(gfx, size.width, size.height);
+        if (use_post) {
+            g.bindFramebuffer(gl.FRAMEBUFFER, gfx.post.scene_fbo);
+            g.viewport(0, 0, @intCast(size.width), @intCast(size.height));
+            if (scene.lighting) |lt| {
+                const e = scene.fx.exposure;
+                g.clearColor(std.math.pow(f32, lt.fog_color[0], 2.2) * e, std.math.pow(f32, lt.fog_color[1], 2.2) * e, std.math.pow(f32, lt.fog_color[2], 2.2) * e, 1);
+            }
+            g.depthMask(1);
+            g.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+        }
+
         // Sky first, without depth, centred on the eye.
         if (scene.sky) |*sk| {
             const tod_for_sky = scene.tod;
@@ -2536,6 +2919,7 @@ pub fn loopWith(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Came
             const sc = sample.color[1][0];
             g.uniform3f(gfx.sky_suncol, sc[0], sc[1], sc[2]);
             g.uniform1i(gfx.sky_modern, @intFromBool(scene.fx.modern));
+            g.uniform1i(gfx.sky_hdr_out, @intFromBool(use_post));
             g.uniform1f(gfx.sky_exposure, scene.fx.exposure);
             g.bindVertexArray(sk.vao);
             g.drawElements(gl.TRIANGLES, sk.index_count, gl.UNSIGNED_SHORT, null);
@@ -2565,6 +2949,7 @@ pub fn loopWith(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Came
             g.uniform2f(gfx.u_fogrange, s.fog_start * scene.fog_scale, s.fog_end * scene.fog_scale);
             g.uniform3f(gfx.u_eye, eye[0], eye[1], eye[2]);
             g.uniform1i(gfx.u_modern, @intFromBool(scene.fx.modern));
+            g.uniform1i(gfx.u_hdr_out, @intFromBool(use_post));
             g.uniform1f(gfx.u_exposure, scene.fx.exposure);
             g.uniform1i(gfx.u_shadow_on, if (light_vp != null) 1 else 0);
             if (light_vp) |lv| {
@@ -2587,6 +2972,11 @@ pub fn loopWith(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Came
         for (scene.draws.items) |d| drawItem(gfx, scene, d, &frustum, &dstate);
         for (scene.actor_draws.items) |d| drawItem(gfx, scene, d, &frustum, &dstate);
         for (scene.overlay.items) |d| drawItem(gfx, scene, d, &frustum, &dstate);
+        if (use_post) {
+            const near = cam.radius * 0.01;
+            const far = cam.dist + cam.radius * 10;
+            runPost(gfx, scene.fx, cam, aspect, near, far, .{ .width = size.width, .height = size.height });
+        }
         if (comptime @hasDecl(Hk, "overlay")) {
             ui.verts.clearRetainingCapacity();
             ui.width = @floatFromInt(size.width);
