@@ -37,6 +37,15 @@ pub const PathDecal = struct {
     height: f32,
 };
 
+/// An entity whose model is not stored in the save: it comes from the
+/// entity definition named `binder` (animals, guests, staff).
+pub const Actor = struct {
+    binder: []const u8,
+    position: [3]f32,
+    /// Row-major 3x3 rotation.
+    rotation: [9]f32,
+};
+
 pub const Map = struct {
     arena: std.heap.ArenaAllocator,
     name: []const u8,
@@ -47,6 +56,7 @@ pub const Map = struct {
     objects: []const Object,
     fences: []const Fence,
     paths: []const PathDecal,
+    actors: []const Actor,
 
     pub fn deinit(self: *Map) void {
         self.arena.deinit();
@@ -71,9 +81,13 @@ const Collector = struct {
     list: std.ArrayList(Object) = .empty,
     fences: std.ArrayList(Fence) = .empty,
     paths: std.ArrayList(PathDecal) = .empty,
+    actors: std.ArrayList(Actor) = .empty,
 
     fn visit(self: *Collector, e: *const xml.Element) Error!void {
-        if (std.ascii.eqlIgnoreCase(e.name, "BFGEntity")) try self.pathEntity(e);
+        if (std.ascii.eqlIgnoreCase(e.name, "BFGEntity")) {
+            try self.pathEntity(e);
+            try self.actorEntity(e);
+        }
         if (std.ascii.eqlIgnoreCase(e.name, "ZTFenceEntity")) {
             try self.fence(e);
             return;
@@ -83,6 +97,43 @@ const Collector = struct {
             return;
         }
         for (e.children) |c| try self.visit(c);
+    }
+
+    fn hasModel(phys: *const xml.Element) bool {
+        for (phys.children) |c| for (model_components) |name| {
+            if (std.ascii.eqlIgnoreCase(c.name, name)) {
+                if (c.attr("modelfile")) |m| if (m.len > 0) return true;
+            }
+        };
+        return false;
+    }
+
+    /// Entities whose `mainObj` carries no model of its own.
+    fn actorEntity(self: *Collector, e: *const xml.Element) Error!void {
+        const sub = e.child("subComponents") orelse return;
+        if (sub.child("ZTPath") != null) return;
+        const unique = e.attr("binderUniqueName") orelse return;
+        const binder = unique[0 .. std.mem.indexOfScalar(u8, unique, '/') orelse unique.len];
+        if (binder.len == 0) return;
+        for (sub.children) |c| {
+            if (!std.ascii.eqlIgnoreCase(c.name, "BFPhysObj")) continue;
+            const name = c.attr("binderUniqueName") orelse continue;
+            if (!std.mem.startsWith(u8, name, "mainObj/")) continue;
+            if (hasModel(c)) return;
+            const pos = c.child("position") orelse return;
+            var rot = [9]f32{ 1, 0, 0, 0, 1, 0, 0, 0, 1 };
+            if (c.child("rotation")) |r| {
+                const rows = [3][]const u8{ "row0", "row1", "row2" };
+                for (rows, 0..) |rn, i| if (r.child(rn)) |row| {
+                    const v = vec3(row);
+                    rot[i * 3 + 0] = v[0];
+                    rot[i * 3 + 1] = v[1];
+                    rot[i * 3 + 2] = v[2];
+                };
+            }
+            try self.actors.append(self.a, .{ .binder = binder, .position = vec3(pos), .rotation = rot });
+            return;
+        }
     }
 
     /// A path entity holds a `ZTPath` (the texture) and a physics object with
@@ -181,6 +232,7 @@ pub fn parse(gpa: std.mem.Allocator, data: []const u8) Error!Map {
         .objects = try col.list.toOwnedSlice(a),
         .fences = try col.fences.toOwnedSlice(a),
         .paths = try col.paths.toOwnedSlice(a),
+        .actors = try col.actors.toOwnedSlice(a),
     };
 }
 

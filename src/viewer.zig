@@ -10,6 +10,7 @@ const dds = @import("dds.zig");
 const model = @import("model.zig");
 const terrain_mod = @import("terrain.zig");
 const map_mod = @import("map.zig");
+const entity = @import("entity.zig");
 const bf = @import("bf.zig");
 const vfs_mod = @import("vfs.zig");
 const platform = @import("platform.zig");
@@ -202,6 +203,48 @@ fn makeProgram(g: *const Gl) !gl.Uint {
     return p;
 }
 
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i..][0..needle.len], needle)) return true;
+    }
+    return false;
+}
+
+fn poseWorld(world: []Mat4, nf: *const nif.Nif, root: Mat4, anim: ?*const bf.Animation, t: f32) void {
+    for (nf.roots) |r| poseNode(world, nf, r, root, anim, t);
+}
+
+fn poseNode(world: []Mat4, nf: *const nif.Nif, ref: nif.Ref, parent: Mat4, anim: ?*const bf.Animation, t: f32) void {
+    if (ref < 0) return;
+    const idx: usize = @intCast(ref);
+    switch (nf.blocks[idx]) {
+        .node => |n| {
+            if (n.av.flags & 1 != 0) return; // hidden
+            var local = fromTransform(n.av.transform);
+            if (anim) |an| if (an.bone(n.av.net.name)) |bone| {
+                if (bf.sampleRot(bone, t)) |q| setRotation(&local, q, n.av.transform.scale);
+                if (bf.samplePos(bone, t)) |p| {
+                    local[12] = p[0];
+                    local[13] = p[1];
+                    local[14] = p[2];
+                }
+            };
+            const w = mul(parent, local);
+            world[idx] = w;
+            if (n.kind == .lod) {
+                // Child 0 is the most detailed level.
+                if (n.children.len > 0) poseNode(world, nf, n.children[0], w, anim, t);
+                return;
+            }
+            for (n.children) |c| poseNode(world, nf, c, w, anim, t);
+        },
+        .geometry => |geo| world[idx] = mul(parent, fromTransform(geo.av.transform)),
+        else => {},
+    }
+}
+
 // ------------------------------------------------------------------ scene
 
 const max_bones = 96;
@@ -219,6 +262,8 @@ const Skin = struct {
 };
 
 const Draw = struct {
+    /// Index into `Scene.instances` whose world matrices this draw uses.
+    inst: ?u32 = null,
     /// Decals blend over what is behind them without writing depth.
     depth_write: bool = true,
     /// Second texture for terrain (steep slopes); 0 for ordinary draws.
@@ -235,6 +280,22 @@ const Draw = struct {
     tint: [4]f32,
     blend: bool,
     alpha_cut: f32,
+};
+
+/// An animated figure: its own copy of the node transforms.
+pub const Instance = struct {
+    nf: *const nif.Nif,
+    world: []Mat4,
+    root: Mat4,
+    anim: ?*const bf.Animation,
+    /// Seconds added to the clock so figures are not in lockstep.
+    phase: f32,
+};
+
+const ActorTemplate = struct {
+    nf: *nif.Nif,
+    draws: []const Draw,
+    manifest: ?model.Manifest,
 };
 
 pub const Scene = struct {
@@ -256,6 +317,13 @@ pub const Scene = struct {
     /// Single-model viewing: poses and skinning follow the animation, and the
     /// camera frames the model's bounds. Map mode turns all of these off.
     interactive: bool = true,
+    /// Build skin tables / pose-driven draws (single-model viewing and actors).
+    want_skin: bool = true,
+    dynamic_draws: bool = true,
+    /// Animated figures placed in a map, each with its own skeleton pose.
+    instances: std.ArrayList(Instance) = .empty,
+    actor_models: std.StringHashMapUnmanaged(?*ActorTemplate) = .empty,
+    anim_cache: std.StringHashMapUnmanaged(?*bf.Animation) = .empty,
     /// Loaded models by lowercase path, as draws relative to the model origin.
     models: std.StringHashMapUnmanaged(?[]const Draw) = .empty,
     fence_cache: std.StringHashMapUnmanaged(FencePieces) = .empty,
@@ -295,6 +363,29 @@ pub const Scene = struct {
     pub fn deinit(self: *Scene) void {
         self.draws.deinit(self.gpa);
         self.gpa.free(self.world);
+        for (self.instances.items) |i| self.gpa.free(i.world);
+        self.instances.deinit(self.gpa);
+        var ait = self.actor_models.iterator();
+        while (ait.next()) |e| {
+            self.gpa.free(e.key_ptr.*);
+            if (e.value_ptr.*) |t| {
+                self.gpa.free(t.draws);
+                if (t.manifest) |*m| m.deinit();
+                t.nf.deinit();
+                self.gpa.destroy(t.nf);
+                self.gpa.destroy(t);
+            }
+        }
+        self.actor_models.deinit(self.gpa);
+        var nit = self.anim_cache.iterator();
+        while (nit.next()) |e| {
+            self.gpa.free(e.key_ptr.*);
+            if (e.value_ptr.*) |an| {
+                an.deinit();
+                self.gpa.destroy(an);
+            }
+        }
+        self.anim_cache.deinit(self.gpa);
         self.arena.deinit();
         var mit = self.models.iterator();
         while (mit.next()) |e| {
@@ -377,35 +468,17 @@ pub const Scene = struct {
     /// Recomputes every node's world matrix, with bone transforms taken from
     /// `anim` at time `t` where it has tracks for them.
     pub fn pose(self: *Scene, nf: *const nif.Nif, anim: ?*const bf.Animation, t: f32) void {
-        for (nf.roots) |r| self.poseNode(nf, r, identity, anim, t);
+        poseWorld(self.world, nf, identity, anim, t);
     }
 
-    fn poseNode(self: *Scene, nf: *const nif.Nif, ref: nif.Ref, parent: Mat4, anim: ?*const bf.Animation, t: f32) void {
-        if (ref < 0) return;
-        const idx: usize = @intCast(ref);
-        switch (nf.blocks[idx]) {
-            .node => |n| {
-                if (n.av.flags & 1 != 0) return; // hidden
-                var local = fromTransform(n.av.transform);
-                if (anim) |an| if (an.bone(n.av.net.name)) |bone| {
-                    if (bf.sampleRot(bone, t)) |q| setRotation(&local, q, n.av.transform.scale);
-                    if (bf.samplePos(bone, t)) |p| {
-                        local[12] = p[0];
-                        local[13] = p[1];
-                        local[14] = p[2];
-                    }
-                };
-                const w = mul(parent, local);
-                self.world[idx] = w;
-                if (n.kind == .lod) {
-                    // Child 0 is the most detailed level.
-                    if (n.children.len > 0) self.poseNode(nf, n.children[0], w, anim, t);
-                    return;
-                }
-                for (n.children) |c| self.poseNode(nf, c, w, anim, t);
-            },
-            .geometry => |geo| self.world[idx] = mul(parent, fromTransform(geo.av.transform)),
-            else => {},
+    /// Advances every instance's animation to the clock `secs`.
+    pub fn poseInstances(self: *Scene, secs: f32) void {
+        for (self.instances.items) |inst| {
+            var t: f32 = 0;
+            if (inst.anim) |an| if (an.duration > 0) {
+                t = @mod(secs + inst.phase, an.duration);
+            };
+            poseWorld(inst.world, inst.nf, inst.root, inst.anim, t);
         }
     }
 
@@ -489,12 +562,12 @@ pub const Scene = struct {
             }
         }
 
-        const skin = if (self.interactive) try self.buildSkin(nf, geo, buf, n) else null;
+        const skin = if (self.want_skin) try self.buildSkin(nf, geo, buf, n) else null;
 
         const vao = self.uploadMesh(buf, md.indices.ptr, md.indices.len * 2);
 
         try self.draws.append(self.gpa, .{
-            .dynamic = self.interactive,
+            .dynamic = self.dynamic_draws,
             .index_type = gl.UNSIGNED_SHORT,
             .block = block,
             .skin = skin,
@@ -721,6 +794,110 @@ pub const Scene = struct {
         return true;
     }
 
+    /// Loads an animation file once; null if it cannot be read.
+    fn loadAnim(self: *Scene, path: []const u8) ?*const bf.Animation {
+        var key_buf: [512]u8 = undefined;
+        if (path.len == 0 or path.len > key_buf.len) return null;
+        for (path, 0..) |ch, i| key_buf[i] = if (ch == '\\') '/' else std.ascii.toLower(ch);
+        const key = key_buf[0..path.len];
+        if (self.anim_cache.get(key)) |c| return c;
+        const owned = self.gpa.dupe(u8, key) catch return null;
+        var result: ?*bf.Animation = null;
+        if (self.vfs.read(self.gpa, key)) |bytes| {
+            defer self.gpa.free(bytes);
+            if (bf.parse(self.gpa, bytes)) |an| {
+                if (self.gpa.create(bf.Animation)) |p| {
+                    p.* = an;
+                    result = p;
+                } else |_| {
+                    var tmp = an;
+                    tmp.deinit();
+                }
+            } else |_| {}
+        } else |_| {}
+        self.anim_cache.put(self.gpa, owned, result) catch self.gpa.free(owned);
+        return result;
+    }
+
+    /// Builds (once per model) the skinned, pose-driven draws for an actor.
+    fn actorTemplate(self: *Scene, file: []const u8) !?*ActorTemplate {
+        var key_buf: [512]u8 = undefined;
+        if (file.len == 0 or file.len > key_buf.len) return null;
+        for (file, 0..) |ch, i| key_buf[i] = if (ch == '\\') '/' else std.ascii.toLower(ch);
+        const key = key_buf[0..file.len];
+        if (self.actor_models.get(key)) |c| return c;
+        const owned = try self.gpa.dupe(u8, key);
+        errdefer self.gpa.free(owned);
+        const tmpl = try self.buildActor(key);
+        try self.actor_models.put(self.gpa, owned, tmpl);
+        return tmpl;
+    }
+
+    fn buildActor(self: *Scene, key: []const u8) !?*ActorTemplate {
+        const gpa = self.gpa;
+        if (!std.mem.endsWith(u8, key, ".bfm")) return null;
+        const mdata = self.vfs.read(gpa, key) catch return null;
+        defer gpa.free(mdata);
+        var mf = model.parseManifest(gpa, mdata) catch return null;
+        errdefer mf.deinit();
+        const bytes = self.vfs.read(gpa, mf.model_name) catch return null;
+        defer gpa.free(bytes);
+        const nfp = try gpa.create(nif.Nif);
+        errdefer gpa.destroy(nfp);
+        nfp.* = nif.parse(gpa, bytes) catch return null;
+        errdefer nfp.deinit();
+
+        const tmp = try gpa.alloc(Mat4, nfp.blocks.len);
+        defer gpa.free(tmp);
+        @memset(tmp, identity);
+        const saved = .{ self.world, self.want_skin, self.dynamic_draws };
+        self.world = tmp;
+        self.want_skin = true;
+        self.dynamic_draws = true;
+        defer {
+            self.world = saved[0];
+            self.want_skin = saved[1];
+            self.dynamic_draws = saved[2];
+        }
+        const start = self.draws.items.len;
+        self.pose(nfp, null, 0);
+        for (nfp.roots) |r| try self.walk(nfp, r);
+        const draws = try gpa.dupe(Draw, self.draws.items[start..]);
+        self.draws.shrinkRetainingCapacity(start);
+        const t = try gpa.create(ActorTemplate);
+        t.* = .{ .nf = nfp, .draws = draws, .manifest = mf };
+        return t;
+    }
+
+    /// Adds an animated figure from a `.bfm` actor file, looping an idle
+    /// animation. Returns false if the model cannot be built.
+    pub fn addActor(self: *Scene, file: []const u8, root: Mat4, phase: f32) !bool {
+        const tmpl = (try self.actorTemplate(file)) orelse return false;
+        const world = try self.gpa.alloc(Mat4, tmpl.nf.blocks.len);
+        @memset(world, identity);
+
+        var anim: ?*const bf.Animation = null;
+        if (tmpl.manifest) |*mf| {
+            var chosen: ?*const model.Animation = mf.animation("Stand_Idle");
+            if (chosen == null) for (mf.animations) |*a| {
+                if (containsIgnoreCase(a.name, "idle") and !a.explicit_use_only) {
+                    chosen = a;
+                    break;
+                }
+            };
+            if (chosen) |c| anim = self.loadAnim(c.path);
+        }
+        const idx: u32 = @intCast(self.instances.items.len);
+        try self.instances.append(self.gpa, .{ .nf = tmpl.nf, .world = world, .root = root, .anim = anim, .phase = phase });
+        poseWorld(world, tmpl.nf, root, anim, 0);
+        for (tmpl.draws) |d| {
+            var c = d;
+            c.inst = idx;
+            try self.draws.append(self.gpa, c);
+        }
+        return true;
+    }
+
     /// Model pieces for a fence type: its post and its straight segment.
     /// Looked up in the type's entity file under `fences/ai` or `paths/ai`.
     pub fn fenceModels(self: *Scene, kind: []const u8) !FencePieces {
@@ -834,6 +1011,8 @@ pub const Options = struct {
     /// Initial camera yaw and pitch in radians, if given.
     yaw: ?f32 = null,
     pitch: ?f32 = null,
+    /// Map position to look at (x, y), instead of the map centre.
+    focus: ?[2]f32 = null,
     /// Camera distance as a multiple of the default.
     zoom: f32 = 1.0,
     width: u32 = 1280,
@@ -1010,6 +1189,8 @@ fn loop(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Camera, play
             scene.pose(pb.nf, pb.anim, t);
         }
 
+        if (scene.instances.items.len > 0) scene.poseInstances(@as(f32, @floatFromInt(now_ms - start_ms)) / 1000.0);
+
         g.useProgram(gfx.prog);
         g.uniformMatrix4fv(gfx.u_vp, 1, 0, &vp);
         g.uniform1i(gfx.u_tex, 0);
@@ -1019,14 +1200,15 @@ fn loop(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Camera, play
             g.bindTexture(gl.TEXTURE_2D, d.texture2);
             g.uniform1i(gfx.u_terrain, if (d.texture2 != 0) 1 else 0);
             g.activeTexture(gl.TEXTURE0);
+            const wl: []const Mat4 = if (d.inst) |i| scene.instances.items[i].world else scene.world;
             if (d.skin) |sk| {
                 var mats: [max_bones]Mat4 = undefined;
-                for (sk.bones, sk.offsets, 0..) |bn, off, i| mats[i] = mul(scene.world[bn], off);
+                for (sk.bones, sk.offsets, 0..) |bn, off, i| mats[i] = mul(wl[bn], off);
                 g.uniform1i(gfx.u_skinned, 1);
                 g.uniformMatrix4fv(gfx.u_bones, @intCast(sk.bones.len), 0, @ptrCast(&mats));
             } else {
                 g.uniform1i(gfx.u_skinned, 0);
-                g.uniformMatrix4fv(gfx.u_model, 1, 0, if (d.dynamic) &scene.world[d.block] else &d.world);
+                g.uniformMatrix4fv(gfx.u_model, 1, 0, if (d.dynamic) &wl[d.block] else &d.world);
             }
             g.uniform4f(gfx.u_tint, d.tint[0], d.tint[1], d.tint[2], d.tint[3]);
             g.uniform1f(gfx.u_cut, d.alpha_cut);
@@ -1117,6 +1299,33 @@ pub fn run(gpa: std.mem.Allocator, vfs: *vfs_mod.Vfs, path: []const u8, opts: Op
     try loop(gpa, &gfx, &scene, cam, play, opts);
 }
 
+const ActorModel = struct { file: []const u8, scale: f32 };
+
+/// Finds the `BFActorComponent` for an entity: the most specific binder on
+/// its type path that defines one wins.
+fn actorModel(gpa: std.mem.Allocator, reg: *const entity.Registry, name: []const u8) ?ActorModel {
+    const b = reg.get(name) orelse return null;
+    const chain = reg.chain(gpa, b) catch return null;
+    defer gpa.free(chain);
+    var i = chain.len;
+    while (i > 0) {
+        i -= 1;
+        if (findActor(chain[i].root)) |m| return m;
+    }
+    return null;
+}
+
+fn findActor(e: *const @import("xml.zig").Element) ?ActorModel {
+    if (std.ascii.eqlIgnoreCase(e.name, "BFActorComponent")) {
+        if (e.attr("actorfile")) |f| if (f.len > 0) {
+            const sc = if (e.attr("scale")) |v| std.fmt.parseFloat(f32, std.mem.trim(u8, v, " ")) catch 1.0 else 1.0;
+            return .{ .file = f, .scale = sc };
+        };
+    }
+    for (e.children) |c| if (findActor(c)) |m| return m;
+    return null;
+}
+
 /// Views a whole map: terrain plus every placed object that has a model.
 pub fn runMap(gpa: std.mem.Allocator, vfs: *vfs_mod.Vfs, path: []const u8, opts: Options) !void {
     const map_bytes = try vfs.read(gpa, path);
@@ -1139,6 +1348,8 @@ pub fn runMap(gpa: std.mem.Allocator, vfs: *vfs_mod.Vfs, path: []const u8, opts:
     var scene = try Scene.init(gpa, &gfx.g, vfs);
     defer scene.deinit();
     scene.interactive = false;
+    scene.want_skin = false;
+    scene.dynamic_draws = false;
     // Ground textures come from the map's biome definition.
     var flat_tex = scene.white;
     var steep_tex = scene.white;
@@ -1183,6 +1394,20 @@ pub fn runMap(gpa: std.mem.Allocator, vfs: *vfs_mod.Vfs, path: []const u8, opts:
         if (pieces.post) |d| try scene.place(d, m);
         fences_placed += 1;
     }
+    if (mp.actors.len > 0) {
+        var reg = entity.Registry.init(gpa);
+        defer reg.deinit();
+        try reg.load(vfs);
+        var actors_placed: usize = 0;
+        for (mp.actors) |a| {
+            const def = actorModel(gpa, &reg, a.binder) orelse continue;
+            const m = fromTransform(.{ .translation = a.position, .rotation = a.rotation, .scale = def.scale });
+            const phase = @mod(a.position[0] * 0.37 + a.position[1] * 0.61, 3.0);
+            if (!try scene.addActor(def.file, m, phase)) continue;
+            actors_placed += 1;
+        }
+        std.debug.print("{d} of {d} animals/guests/staff placed\n", .{ actors_placed, mp.actors.len });
+    }
     try scene.addPaths(&terr, mp.paths);
     std.debug.print("{d} path tiles\n", .{mp.paths.len});
     std.debug.print("{d} of {d} fence segments placed\n", .{ fences_placed, mp.fences.len });
@@ -1193,8 +1418,10 @@ pub fn runMap(gpa: std.mem.Allocator, vfs: *vfs_mod.Vfs, path: []const u8, opts:
     const cx = terr.world_width / 2;
     const cy = terr.world_height / 2;
     const radius = @max(terr.world_width, terr.world_height) / 2;
+    const fx = if (opts.focus) |f| f[0] else cx;
+    const fy = if (opts.focus) |f| f[1] else cy;
     const cam: Camera = .{
-        .center = .{ cx, cy, terr.zAt(cx, cy) },
+        .center = .{ fx, fy, terr.zAt(fx, fy) },
         .radius = radius,
         .dist = radius * 1.3,
         .pitch = 0.8,

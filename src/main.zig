@@ -22,7 +22,7 @@ const usage =
     \\  ddscheck [prefix]           parse every .dds texture and report formats
     \\  nifinfo <path>               print a NIF's scene graph
     \\  view <model> [--anim A] [--time S] [--shot]  view a .nif/.bfm model
-    \\  map <file.zt2> [--shot] [--yaw R] [--pitch R] [--zoom F]  view a map
+    \\  map <file.zt2> [--shot] [--at X Y] [--yaw R] [--pitch R] [--zoom F]  view a map
     \\  mapcheck [prefix]           parse every map and its terrain
     \\  bfcheck [prefix]            parse every .bf animation and report coverage
     \\  nifcheck [prefix]           parse every .nif/.kf and report coverage
@@ -298,6 +298,9 @@ pub fn main(init: std.process.Init) !void {
             } else if (std.mem.eql(u8, rest[k], "--anim") and k + 1 < rest.len) {
                 k += 1;
                 vopts.anim = rest[k];
+            } else if (std.mem.eql(u8, rest[k], "--at") and k + 2 < rest.len) {
+                vopts.focus = .{ try std.fmt.parseFloat(f32, rest[k + 1]), try std.fmt.parseFloat(f32, rest[k + 2]) };
+                k += 2;
             } else if (std.mem.eql(u8, rest[k], "--yaw") and k + 1 < rest.len) {
                 k += 1;
                 vopts.yaw = try std.fmt.parseFloat(f32, rest[k]);
