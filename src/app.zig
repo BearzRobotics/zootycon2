@@ -354,6 +354,11 @@ pub const App = struct {
             try self.rebuildStatic();
             try self.rebuildActors();
             try self.sim.sync(&self.world);
+            // Match walking speed to the walk animation so feet do not slide.
+            for (self.actor_ids.items, 0..) |id, i| {
+                const ag = self.sim.agentFor(id) orelse continue;
+                if (self.scene.walkSpeed(i)) |sp| ag.speed = sp * self.actor_scales.items[i];
+            }
             self.synced_rev = self.world.revision;
         }
         if (self.synced_terrain_rev != self.world.terrain_revision and secs - self.last_terrain_secs > 0.1) {
@@ -854,6 +859,9 @@ pub const App = struct {
                 @tagName(self.tool), w.props.items.len, w.fences.items.len, w.paths.items.len, w.actors.items.len, sel,
                 if (self.hover != null) "yes" else "no",                self.paused,
             });
+            for (self.sim.agents.items[0..@min(self.sim.agents.items.len, 6)]) |ag| {
+                std.debug.print("agent #{d}: {s} speed={d:.2} state={s}\n", .{ ag.id, @tagName(ag.kind), ag.speed, @tagName(ag.state) });
+            }
             std.debug.print("perf: {d:.1} fps ({d} static draws, {d} actor draws)\n", .{ if (ctx.dt > 0) 1.0 / ctx.dt else 0.0, self.scene.draws.items.len, self.scene.actor_draws.items.len });
             std.debug.print("cam: yaw={d:.3} pitch={d:.3} dist={d:.2} center=({d:.1},{d:.1})\n", .{ ctx.cam.yaw, ctx.cam.pitch, ctx.cam.dist, ctx.cam.center[0], ctx.cam.center[1] });
         } else if (std.mem.eql(u8, verb, "shot")) {

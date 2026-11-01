@@ -1226,6 +1226,26 @@ pub const Scene = struct {
         return true;
     }
 
+    /// Ground speed (model units per second) of an instance's walk
+    /// animation, from how far its root bone travels over one cycle.
+    pub fn walkSpeed(self: *Scene, idx: usize) ?f32 {
+        const inst = &self.instances.items[idx];
+        const mf = inst.manifest orelse return null;
+        const entry = mf.animation("Walk_Ahead") orelse mf.animation("Walk") orelse return null;
+        const an = self.loadAnim(entry.path) orelse return null;
+        if (an.duration <= 0) return null;
+        var best: f32 = 0;
+        for ([_][]const u8{ "Bip01", "Bip01 NonAccum" }) |name| {
+            const bone = an.bone(name) orelse continue;
+            if (bone.pos.len < 2) continue;
+            const a = bone.pos[0].p;
+            const b = bone.pos[bone.pos.len - 1].p;
+            const d = @sqrt((b[0] - a[0]) * (b[0] - a[0]) + (b[1] - a[1]) * (b[1] - a[1]));
+            best = @max(best, d / an.duration);
+        }
+        return if (best > 0.05) best else null;
+    }
+
     /// Drives an animated figure from the simulation: where it stands and
     /// which animation (by manifest name, trying `names` in order) at what time.
     pub fn driveInstance(self: *Scene, idx: usize, root: Mat4, names: []const []const u8, time: f32) void {
