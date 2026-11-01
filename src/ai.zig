@@ -635,9 +635,18 @@ pub const Brain = struct {
         if (eq(name, "useContainer")) {
             const kind = if (self.target) |t| t.kind else "";
             var buf: [96]u8 = undefined;
-            const candidates = [_][]const u8{ "Use", "Drink", "Eat" };
+            if (kind.len > 0) {
+                const specific = std.fmt.bufPrint(&buf, "Use{s}", .{kind}) catch "";
+                if (specific.len > 0) if (self.lib.set(specific)) |s| return self.pushList(s.behaviors);
+            }
+            // Shelters share one generic set (`UseShelter`), rocks another.
+            const generic = [_][2][]const u8{ .{ "_Shelter", "UseShelter" }, .{ "Rock", "UseRock" } };
+            for (generic) |g| if (std.mem.indexOf(u8, kind, g[0]) != null) {
+                if (self.lib.set(g[1])) |s| return self.pushList(s.behaviors);
+            };
+            const candidates = [_][]const u8{ "Drink", "Eat" };
             for (candidates) |prefix| {
-                if (kind.len == 0 and prefix.len == 3) continue;
+                if (kind.len == 0 and prefix.len == 5) continue;
                 const n = if (std.mem.eql(u8, prefix, "Eat"))
                     "Eat"
                 else
@@ -823,7 +832,7 @@ const TestOracle = struct {
     fn findTarget(ctx: *anyopaque, class: []const u8) ?Target {
         const self: *TestOracle = @ptrCast(@alignCast(ctx));
         const t = self.target orelse return null;
-        return if (std.ascii.eqlIgnoreCase(class, "FoodDish_Hay")) t else null;
+        return if (std.ascii.eqlIgnoreCase(class, "FoodDish_Hay") or std.ascii.eqlIgnoreCase(class, "SmallRockCave_Shelter")) t else null;
     }
     fn useTarget(ctx: *anyopaque, id: u32, amount: f32) void {
         const self: *TestOracle = @ptrCast(@alignCast(ctx));
@@ -1046,4 +1055,46 @@ test "wrong diet or no feeder means no feeding task" {
     // and without a feeder in reach
     to.target = null;
     try testing.expectEqual(@as(?f32, null), brain.score(0, to.oracle()));
+}
+
+test "an animal resting in a shelter plays the generic shelter set" {
+    var lib = Library.init(testing.allocator);
+    defer lib.deinit();
+    try lib.addSets(
+        \\<Sets>
+        \\ <UseShelter><subjects><Zebra/></subjects><behaviors><BFBehAnimate targetAnim="Lie_Idle" playTime="20"/></behaviors></UseShelter>
+        \\</Sets>
+    );
+    try lib.addTasks(
+        \\<BFAITaskTemplateList>
+        \\ <BFAITaskTemplate Name="Rest"><BFAICreateData><Subjects_AND><Qualifiers inWater_OR_onLand="true"/></Subjects_AND>
+        \\   <Targets><SmallRockCave_Shelter/><Qualifiers inHabitat="true"/></Targets></BFAICreateData>
+        \\   <BFAIEvalData><BFAIAttributeFloatMap rest="-45"/></BFAIEvalData>
+        \\   <BFBehExecTask><BFBehEnter/><BFBehPlaySet behSet="useContainer"/></BFBehExecTask>
+        \\   <BFAICompletionData><BFAIAttributeFloatMap rest="-100"/></BFAICompletionData></BFAITaskTemplate>
+        \\</BFAITaskTemplateList>
+    );
+    var to = TestOracle{
+        .names = &.{ "Stand_Idle", "Lie_Idle", "Stand_2Lie", "Lie_2Stand" },
+        .target = .{ .id = 5, .pos = .{ 3, 4 }, .kind = "SmallRockCave_Shelter" },
+    };
+    const oracle = to.oracle();
+    var brain = try Brain.init(testing.allocator, &lib, &.{"Zebra"}, 3);
+    defer brain.deinit();
+    brain.needs = @splat(0);
+    brain.needs[0] = 90; // rest
+    brain.update(0.1, oracle);
+    try testing.expect(brain.current() == .goto);
+    brain.reached();
+    var lay = false;
+    for (0..80) |_| {
+        brain.update(0.1, oracle);
+        switch (brain.current()) {
+            .anim => |a| if (std.mem.eql(u8, a, "Lie_Idle")) {
+                lay = true;
+            },
+            else => {},
+        }
+    }
+    try testing.expect(lay);
 }

@@ -1244,6 +1244,12 @@ pub const App = struct {
             const x = try num(it.next());
             const y = try num(it.next());
             try self.placeFood(self.groundAt(x, y));
+        } else if (std.mem.eql(u8, verb, "item")) {
+            const x = try num(it.next());
+            const y = try num(it.next());
+            try self.placeItem(self.groundAt(x, y));
+        } else if (std.mem.eql(u8, verb, "itemname")) {
+            self.item_sel = pickByName(self.item_names.items, it.rest()) orelse return error.NotFound;
         } else if (std.mem.eql(u8, verb, "foodname")) {
             self.food_i = pickByName(self.food_names.items, it.rest()) orelse return error.NotFound;
         } else if (std.mem.eql(u8, verb, "drain")) {
@@ -1286,9 +1292,23 @@ pub const App = struct {
             try self.saveWorld();
         } else if (std.mem.eql(u8, verb, "load")) {
             try self.loadSaved();
+        } else if (std.mem.eql(u8, verb, "tasks")) {
+            for (self.sim.agents.items) |ag| if (ag.brain) |b| {
+                for (b.lib.tasks.items) |t| if (t.target != null) std.debug.print("  task {s} target={s} supported={} subjects={d} flags={d}/{d} quals={d}\n", .{ t.name, t.target.?, t.supported, t.subjects.len, t.flags_and.len, t.flags_or.len, t.quals.len });
+                break;
+            };
+        } else if (std.mem.eql(u8, verb, "brains")) {
+            for (self.sim.agents.items) |ag| if (ag.brain) |b| {
+                const tn = if (b.task) |ti| b.lib.tasks.items[ti].name else "-";
+                std.debug.print("  #{d} {s}: task={s} anim={s} pos={d:.1},{d:.1} needs=", .{ ag.id, ag.binder, tn, ag.anim_name, ag.pos[0], ag.pos[1] });
+                for (b.needs) |nv| std.debug.print("{d:.0} ", .{nv});
+                std.debug.print("\n", .{});
+            };
         } else if (std.mem.eql(u8, verb, "wait")) {
             const secs = try num(it.next());
             try self.sim.sync(&self.world);
+            self.rebuildActors() catch {};
+            self.loadFoodTasks();
             var t: f32 = 0;
             while (t < secs) : (t += 0.2) self.sim.advance(&self.world, 0.2);
         } else if (std.mem.eql(u8, verb, "propname")) {
@@ -1439,6 +1459,27 @@ pub const App = struct {
         return null;
     }
 
+    /// Toys, shelters and rocks animals can use: any such entity with a task
+    /// file of its own. The name is the binder, which behaviour sets key on.
+    fn usableKind(self: *App, binder: []const u8) ?[]const u8 {
+        const b = self.reg.get(binder) orelse return null;
+        if (b.type_path.len < 2) return null;
+        const group = b.type_path[1];
+        const dir = if (std.ascii.eqlIgnoreCase(group, "enrichment")) "enrichment" else if (std.ascii.eqlIgnoreCase(group, "shelters")) "shelters" else if (std.ascii.eqlIgnoreCase(group, "rock")) "rocks" else return null;
+        var lower: [96]u8 = undefined;
+        if (binder.len > lower.len) return null;
+        const l = std.ascii.lowerString(&lower, binder);
+        var pb: [160]u8 = undefined;
+        const path = std.fmt.bufPrint(&pb, "ai/tasks/{s}/{s}.tsk", .{ dir, l }) catch return null;
+        if (!self.vfs.exists(path)) return null;
+        return b.name;
+    }
+
+    fn hookUsable(ctx: *anyopaque, binder: []const u8) ?[]const u8 {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        return self.usableKind(binder);
+    }
+
     /// Shops and facilities, classified by their entity type names.
     fn venueNeed(b: *const entity.Binder) ?sim_mod.Need {
         for (b.type_path) |t| {
@@ -1578,7 +1619,7 @@ pub const App = struct {
     /// libraries (the tasks live with the food, not the animal).
     fn loadFoodTasks(self: *App) void {
         for (self.world.props.items) |p| {
-            if (p.binder.len == 0 or self.feederKind(p.binder) == null) continue;
+            if (p.binder.len == 0 or (self.feederKind(p.binder) == null and self.usableKind(p.binder) == null)) continue;
             var lit = self.ai_libs.iterator();
             while (lit.next()) |e| {
                 var kb: [200]u8 = undefined;
@@ -1592,16 +1633,19 @@ pub const App = struct {
                     self.gpa.free(owned);
                     continue;
                 };
-                if (self.fileExists("ai/tasks/food/{s}.tsk", .{l})) |d| {
-                    defer self.gpa.free(d);
-                    e.value_ptr.*.addTasks(d) catch {};
+                for ([_][]const u8{ "food", "enrichment", "shelters", "rocks" }) |dir| {
+                    if (self.fileExists("ai/tasks/{s}/{s}.tsk", .{ dir, l })) |d| {
+                        defer self.gpa.free(d);
+                        e.value_ptr.*.addTasks(d) catch {};
+                        break;
+                    }
                 }
             }
         }
     }
 
     fn installHooks(self: *App) void {
-        self.sim.hooks = .{ .ctx = self, .brain = hookBrain, .anim_len = hookAnimLen, .flag = hookFlag, .feeder = hookFeeder, .wage = hookWage, .venue = hookVenue, .habitat = hookHabitat };
+        self.sim.hooks = .{ .ctx = self, .brain = hookBrain, .anim_len = hookAnimLen, .flag = hookFlag, .feeder = hookFeeder, .usable = hookUsable, .wage = hookWage, .venue = hookVenue, .habitat = hookHabitat };
         self.sim.guest_binders = self.guest_names.items;
         self.updateGuestCap();
     }
@@ -1720,6 +1764,7 @@ pub const App = struct {
             });
             for (self.sim.agents.items[0..@min(self.sim.agents.items.len, 6)]) |ag| {
                 std.debug.print("agent #{d}: {s} speed={d:.2} state={s} anim={s} brain={}\n", .{ ag.id, @tagName(ag.kind), ag.speed, @tagName(ag.state), ag.anim_name, ag.brain != null });
+                if (ag.brain) |b| if (b.task) |ti| std.debug.print("  task: {s}\n", .{b.lib.tasks.items[ti].name});
                 if (ag.habitat != null) std.debug.print("  habitat {d:.0} biome {d:.0} space {d:.0} ({d:.0}/{d:.0} tiles, open={})\n", .{ ag.hab_score, ag.hab_biome, ag.hab_space, ag.hab_area, ag.hab_need, ag.hab_open });
             }
             for (self.sim.feeders.items) |f| std.debug.print("feeder #{d} {s}: food {d:.0}\n", .{ f.prop_id, f.binder, f.food });
@@ -3689,7 +3734,7 @@ pub const App = struct {
         if (self.selected) |sel| {
             var food_text: [32]u8 = undefined;
             var food: []const u8 = "";
-            if (sel.kind == .prop) for (self.sim.feeders.items) |f| if (f.prop_id == sel.id) {
+            if (sel.kind == .prop) for (self.sim.feeders.items) |f| if (f.prop_id == sel.id and !f.infinite) {
                 food = std.fmt.bufPrint(&food_text, "  FOOD {d:.0}%", .{f.food}) catch "";
             };
             const t = std.fmt.bufPrint(&buf, "SELECTED {s} #{d}{s}", .{ @tagName(sel.kind), sel.id, food }) catch "";

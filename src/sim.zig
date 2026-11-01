@@ -35,6 +35,9 @@ pub const Hooks = struct {
     flag: *const fn (ctx: *anyopaque, binder: []const u8, name: []const u8) bool,
     /// If an entity is a feeder, the kind of container it is (`FoodDish`).
     feeder: *const fn (ctx: *anyopaque, binder: []const u8) ?[]const u8,
+    /// If an entity is a toy, shelter or rock animals can use (never runs out),
+    /// the name animals' behaviour sets use for it.
+    usable: ?*const fn (ctx: *anyopaque, binder: []const u8) ?[]const u8 = null,
     /// Monthly salary of a staff entity (0 for everyone else).
     wage: ?*const fn (ctx: *anyopaque, binder: []const u8) f32 = null,
     /// If an entity is a shop or facility guests can use.
@@ -51,6 +54,8 @@ pub const Feeder = struct {
     kind: []const u8,
     /// 0..100, drops as animals eat.
     food: f32,
+    /// Toys and shelters: animals use them but nothing is consumed.
+    infinite: bool = false,
 };
 
 /// What an animal's brain can ask about its surroundings.
@@ -591,12 +596,17 @@ pub const Sim = struct {
         var next: std.ArrayList(Feeder) = .empty;
         for (w.props.items) |p| {
             if (p.binder.len == 0) continue;
-            const kind = h.feeder(h.ctx, p.binder) orelse continue;
-            var food = if (p.food < 0) 60 else p.food; // unknown levels start part full
+            var infinite = false;
+            const kind = h.feeder(h.ctx, p.binder) orelse blk: {
+                const u = h.usable orelse continue;
+                infinite = true;
+                break :blk u(h.ctx, p.binder) orelse continue;
+            };
+            var food = if (infinite) 100 else if (p.food < 0) 60 else p.food; // unknown levels start part full
             for (self.feeders.items) |old| if (old.prop_id == p.id) {
                 food = old.food;
             };
-            next.append(self.gpa, .{ .prop_id = p.id, .pos = .{ p.position[0], p.position[1] }, .binder = p.binder, .kind = kind, .food = food }) catch {};
+            next.append(self.gpa, .{ .prop_id = p.id, .pos = .{ p.position[0], p.position[1] }, .binder = p.binder, .kind = kind, .food = food, .infinite = infinite }) catch {};
         }
         self.feeders.deinit(self.gpa);
         self.feeders = next;
