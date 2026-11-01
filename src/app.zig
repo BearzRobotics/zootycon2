@@ -21,6 +21,7 @@ const terrain_mod = @import("terrain.zig");
 const environment = @import("environment.zig");
 const xml = @import("xml.zig");
 const audio_mod = @import("audio.zig");
+const uilayout = @import("uilayout.zig");
 const ai = @import("ai.zig");
 const vfs_mod = @import("vfs.zig");
 
@@ -102,6 +103,14 @@ const MenuAction = enum {
     open_maps,
     open_settings,
     open_finances,
+    open_pause,
+    toggle_pause,
+    undo,
+    zoom_in,
+    zoom_out,
+    rot_left,
+    rot_right,
+    toggle_hud,
     back,
     quit,
     toggle_help,
@@ -273,9 +282,17 @@ pub const App = struct {
     /// Sound, created after the app so it can borrow the data files.
     audio: ?audio_mod.Engine = null,
     audio_biome_dirty: bool = true,
+    /// The game's own HUD, drawn from its layout files.
+    hud: ?struct { shell: uilayout.Layout, bucks: ?uilayout.Layout } = null,
+    hud_on: bool = true,
+    hud_text: [64]u8 = undefined,
 
     pub fn deinit(self: *App) void {
         if (self.audio) |*a| a.deinit();
+        if (self.hud) |*h| {
+            h.shell.deinit();
+            if (h.bucks) |*b| b.deinit();
+        }
         for (self.undo.items) |op| if (op == .added) self.gpa.free(op.added.ids);
         self.undo.deinit(self.gpa);
         self.input_cmds.deinit(self.gpa);
@@ -1716,6 +1733,32 @@ pub const App = struct {
             .open_maps => self.openMenu(.maps),
             .open_settings => self.openMenu(.settings),
             .open_finances => self.openMenu(.finances),
+            .open_pause => self.openMenu(.pause),
+            .toggle_pause => {
+                self.paused = !self.paused;
+                self.title_dirty = true;
+            },
+            .undo => self.doUndo(),
+            .zoom_in => {
+                ctx.cam.dist = @max(3, ctx.cam.dist * 0.8);
+                ctx.snap_camera = true;
+            },
+            .zoom_out => {
+                ctx.cam.dist = @min(ctx.cam.radius * 20, ctx.cam.dist * 1.25);
+                ctx.snap_camera = true;
+            },
+            .rot_left => {
+                ctx.cam.yaw -= 0.35;
+                ctx.snap_camera = true;
+            },
+            .rot_right => {
+                ctx.cam.yaw += 0.35;
+                ctx.snap_camera = true;
+            },
+            .toggle_hud => {
+                self.hud_on = !self.hud_on;
+                self.show_help = !self.hud_on;
+            },
             .back => self.openMenu(.pause),
             .quit => ctx.quit = true,
             .toggle_help => self.show_help = !self.show_help,
@@ -1852,6 +1895,7 @@ pub const App = struct {
                 y += try self.menuButton(ui, y, scale, std.fmt.bufPrint(&b, "HELP TEXT: {s}", .{if (self.show_help) "ON" else "OFF"}) catch "", .{ .menu = .toggle_help }, self.show_help);
                 y += try self.menuButton(ui, y, scale, std.fmt.bufPrint(&b, "GUEST ARRIVALS: {s}", .{if (self.arrivals_on) "ON" else "OFF"}) catch "", .{ .menu = .toggle_arrivals }, self.arrivals_on);
                 y += try self.menuButton(ui, y, scale, std.fmt.bufPrint(&b, "DAY/NIGHT CLOCK: {s}", .{if (self.tod_auto) "RUNNING" else "STOPPED"}) catch "", .{ .menu = .toggle_clock }, self.tod_auto);
+                y += try self.menuButton(ui, y, scale, std.fmt.bufPrint(&b, "GAME HUD: {s}", .{if (self.hud_on) "ON" else "OFF"}) catch "", .{ .menu = .toggle_hud }, self.hud_on);
                 y += try self.menuButton(ui, y, scale, std.fmt.bufPrint(&b, "SOUND: {s}", .{if (self.soundOn()) "ON" else "OFF"}) catch "", .{ .menu = .toggle_sound }, self.soundOn());
                 y += try self.menuButton(ui, y, scale, std.fmt.bufPrint(&b, "MODERN LIGHTING: {s}", .{if (self.scene.fx.modern) "ON" else "OFF"}) catch "", .{ .menu = .toggle_modern }, self.scene.fx.modern);
                 y += try self.menuButton(ui, y, scale, std.fmt.bufPrint(&b, "SUN SHADOWS: {s}", .{if (self.scene.fx.shadows) "ON" else "OFF"}) catch "", .{ .menu = .toggle_shadows }, self.scene.fx.shadows);
@@ -1865,6 +1909,92 @@ pub const App = struct {
             },
             .finances, .none => {},
         }
+    }
+
+    /// How far the right-hand panels move down to clear the game's money display.
+    fn hudRightShift(self: *const App, ui: *const viewer.Ui) f32 {
+        return if (self.hudActive()) 58 * uilayout.Canvas.fit(ui.width, ui.height).scale else 0;
+    }
+
+    fn hudActive(self: *const App) bool {
+        return self.hud != null and self.hud_on and self.opts.tools;
+    }
+
+    fn loadHud(self: *App) void {
+        const sb = self.vfs.read(self.gpa, "ui/layout/shell.xml") catch return;
+        defer self.gpa.free(sb);
+        var shell = uilayout.parse(self.gpa, sb) catch return;
+        var bucks: ?uilayout.Layout = null;
+        if (self.vfs.read(self.gpa, "ui/layout/zoobucksdisplay.xml")) |bb| {
+            defer self.gpa.free(bb);
+            bucks = uilayout.parse(self.gpa, bb) catch null;
+        } else |_| {}
+        self.hud = .{ .shell = shell, .bucks = bucks };
+        _ = &shell;
+        self.show_help = false;
+    }
+
+    fn hudAction(name: []const u8) ?@TypeOf(@as(Hit, undefined).action) {
+        const eq = std.ascii.eqlIgnoreCase;
+        if (eq(name, "construction")) return .{ .tool = .prop };
+        if (eq(name, "animals") or eq(name, "staff")) return .{ .tool = .actor };
+        if (eq(name, "terraform")) return .{ .tool = .raise };
+        if (eq(name, "Zoofinance")) return .{ .menu = .open_finances };
+        if (eq(name, "undo")) return .{ .menu = .undo };
+        if (eq(name, "delete")) return .{ .menu = .delete_selected };
+        if (eq(name, "options")) return .{ .menu = .open_pause };
+        if (eq(name, "pause")) return .{ .menu = .toggle_pause };
+        if (eq(name, "Zoom In")) return .{ .menu = .zoom_in };
+        if (eq(name, "Zoom Out")) return .{ .menu = .zoom_out };
+        if (eq(name, "Rotate Left")) return .{ .menu = .rot_left };
+        if (eq(name, "Rotate Right")) return .{ .menu = .rot_right };
+        return null;
+    }
+
+    fn hudInfo(ctx: *anyopaque, n: *const uilayout.Node) uilayout.Info {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        const eq = std.ascii.eqlIgnoreCase;
+        var info: uilayout.Info = .{};
+        if (eq(n.name, "minimize") or eq(n.name, "maximize")) info.visible = false;
+        if (eq(n.name, "famestars")) {
+            info.visible = true;
+            info.percent = self.stars() / 5.0 * 100.0;
+        }
+        if (eq(n.name, "CurrentDate")) {
+            info.text = std.fmt.bufPrint(&self.hud_text, "MONTH {d}", .{self.sim.zoo.months + 1}) catch "";
+        }
+        if (eq(n.name, "zoo_bucks_static_display")) {
+            info.text = money(&self.hud_text, self.sim.zoo.income);
+        }
+        if (n.kind == .toggle or n.kind == .button) {
+            info.enabled = hudAction(n.name) != null;
+            if (eq(n.name, "construction")) info.on = self.tool == .prop or self.tool == .fence or self.tool == .path or self.tool == .food;
+            if (eq(n.name, "animals") or eq(n.name, "staff")) info.on = self.tool == .actor;
+            if (eq(n.name, "terraform")) info.on = self.tool == .raise or self.tool == .lower or self.tool == .flatten;
+            if (eq(n.name, "pause")) info.on = self.paused;
+        }
+        return info;
+    }
+
+    fn hudButton(ctx: *anyopaque, n: *const uilayout.Node, rect: [4]f32) void {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        const act = hudAction(n.name) orelse return;
+        self.hits.append(self.gpa, .{ .x = rect[0], .y = rect[1], .w = rect[2], .h = rect[3], .action = act }) catch {};
+    }
+
+    /// The game's own HUD: button panel, fame stars, date bar and money.
+    fn drawHud(self: *App, ui: *viewer.Ui, ctx: *viewer.FrameCtx) void {
+        const h = &(self.hud orelse return);
+        var d: uilayout.Draw = .{
+            .ui = ui,
+            .canvas = uilayout.Canvas.fit(ui.width, ui.height),
+            .hooks = .{ .ctx = self, .info = hudInfo, .button = hudButton },
+            .mouse = toPixels(ctx, ctx.mouse[0], ctx.mouse[1]),
+            .pressed = self.lmb,
+        };
+        const tops = [_][]const u8{ "famestarwells", "zoo fame stars", "CurrentDate Background", "Primary Game Button Panel" };
+        for (tops) |name| if (h.shell.find(name)) |n| uilayout.drawTop(&d, n);
+        if (h.bucks) |*b| if (b.find("zoo_bucks")) |n| uilayout.drawTop(&d, n);
     }
 
     fn money(buf: []u8, v: f64) []const u8 {
@@ -2233,7 +2363,9 @@ pub const App = struct {
             std.fmt.bufPrint(&buf, "{s}{s}{s}", .{ self.tool.label(), if (detail.len > 0) ": " else "", detail }) catch ""
         else
             "VIEW";
-        try ui.label(pad, y, scale, head, white);
+        // The game's date bar and stars take the top-left corner.
+        const lx = if (self.hudActive()) pad + 300 * uilayout.Canvas.fit(ui.width, ui.height).scale else pad;
+        try ui.label(lx, y, scale, head, white);
         y += line + 2 * scale;
         // The right-hand statistics take the same row, so clip the hint to fit.
         const stats_w = viewer.Ui.textWidth(self.statsText(&buf), scale);
@@ -2241,11 +2373,11 @@ pub const App = struct {
         if (self.opts.tools and self.show_help) {
             const hint = self.toolHint();
             const fit: usize = @intFromFloat(@floor(room / (6 * scale)));
-            try ui.label(pad, y, scale, hint[0..@min(hint.len, fit)], grey);
+            try ui.label(lx, y, scale, hint[0..@min(hint.len, fit)], grey);
             y += line + 2 * scale;
         }
         if (self.message_len > 0) {
-            try ui.label(pad, y, scale, self.message[0..self.message_len], yellow);
+            try ui.label(lx, y, scale, self.message[0..self.message_len], yellow);
         }
 
         // Top right: simulation status.
@@ -2258,18 +2390,20 @@ pub const App = struct {
             if (self.tod_auto) "+" else "",
         }) catch "";
         const sw = viewer.Ui.textWidth(status, scale);
-        try ui.label(ui.width - sw - pad, pad, scale, status, white);
+        const ry = if (self.hudActive()) pad + 58 * uilayout.Canvas.fit(ui.width, ui.height).scale else pad;
+        try ui.label(ui.width - sw - pad, ry, scale, status, white);
 
         // Clickable interface.
         if (self.opts.tools) try self.drawControls(ui, scale, pad, line);
+        if (self.hudActive()) self.drawHud(ui, ctx);
 
         // Zoo statistics: guests, takings, how happy they are.
         const stats = self.statsText(&buf);
         const stw = viewer.Ui.textWidth(stats, scale);
-        try ui.label(ui.width - stw - pad, pad + line + 2 * scale, scale, stats, white);
+        try ui.label(ui.width - stw - pad, ry + line + 2 * scale, scale, stats, white);
 
         // Details panel (the item list uses the same corner).
-        if (self.opts.tools and self.itemCount() == 0) try self.drawInfoPanel(ui, scale, pad, line, pad + 3.2 * (line + 2 * scale));
+        if (self.opts.tools and self.itemCount() == 0) try self.drawInfoPanel(ui, scale, pad, line, pad + 3.2 * (line + 2 * scale) + self.hudRightShift(ui));
 
         // Selection.
         if (self.selected) |sel| {
@@ -2302,7 +2436,6 @@ pub const App = struct {
                 by += line;
             }
         }
-        _ = ctx;
     }
 
     fn bar(ui: *viewer.Ui, x: f32, y: f32, w: f32, h: f32, frac: f32, color: [4]f32) !void {
@@ -2452,13 +2585,14 @@ pub const App = struct {
             .{ .t = .food, .label = "9 FOOD" },
         };
         var y = pad + line * 4.5;
-        for (tools) |t| {
-            const h = try self.drawButton(ui, pad + 2 * scale, y, scale, t.label, if (self.tool == t.t) yellow else white, .{ .tool = t.t });
-            y += h + 2 * scale;
+        if (!self.hudActive()) {
+            for (tools) |t| {
+                const h = try self.drawButton(ui, pad + 2 * scale, y, scale, t.label, if (self.tool == t.t) yellow else white, .{ .tool = t.t });
+                y += h + 2 * scale;
+            }
+            y += 4 * scale;
+            _ = try self.drawButton(ui, pad + 2 * scale, y, scale, "B FINANCES", white, .{ .menu = .open_finances });
         }
-
-        y += 4 * scale;
-        _ = try self.drawButton(ui, pad + 2 * scale, y, scale, "B FINANCES", white, .{ .menu = .open_finances });
 
         // The item list for tools that choose from a catalog.
         const n = self.itemCount();
@@ -2470,7 +2604,7 @@ pub const App = struct {
         const max_chars = 30;
         const panel_w = (max_chars + 1) * 6 * scale;
         const x = ui.width - panel_w - pad;
-        const top = pad + line * 4.2;
+        const top = pad + line * 4.2 + self.hudRightShift(ui);
         var title_buf: [48]u8 = undefined;
         const title = std.fmt.bufPrint(&title_buf, "{s} {d}/{d}", .{ self.tool.label(), cur + 1, n }) catch "";
         ui.template("blank", x - 6 * scale, top - 6 * scale, panel_w + 12 * scale, line * @as(f32, @floatFromInt(shown + 1)) + 10 * scale, scale / 2, 1.5);
@@ -2710,6 +2844,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, vfs: *vfs_mod.Vfs, path: []const u8, 
     app.sim.zoo.income = app.world.income;
     app.sim.zoo.guests_total = app.world.guests_total;
     app.sim.zoo.views = app.world.views;
+    app.loadHud();
     app.loadGuestConfig();
     app.installHooks();
     try app.buildMapList();

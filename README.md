@@ -139,6 +139,7 @@ zootycon2 play maps/default/alpinesml.zt2 --shot \
 | `ai.zig` | the game's task templates and behaviour sets (`ai/tasks`): need-based task choice and posture-aware behaviour execution for animals |
 | `viewer.zig`, `gl.zig`, `platform/` | OpenGL 3.3 renderer, SDL3 binding |
 | `audio.zig` | sound from the game's own tag files (`ui/sound/config.xml`, `entities/sound`, `world/soundtags`): wav decoding, mixer, 3D attenuation, biome ambience, animation text-key triggers |
+| `uilayout.zig` | the game's own screens (`ui/layout/*.xml`): parses a layout and draws it from the game's textures; the app drives the main HUD with it |
 | `uiskin.zig` | the game's own UI panel templates (`ui/template/backs/*.xml`), drawn from its textures at any size |
 | `app.zig` | the interactive app: tools, picking, undo, save/load, input driver |
 

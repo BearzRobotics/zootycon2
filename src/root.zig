@@ -21,6 +21,7 @@ pub const app = @import("app.zig");
 pub const font = @import("font.zig");
 pub const uiskin = @import("uiskin.zig");
 pub const audio = @import("audio.zig");
+pub const uilayout = @import("uilayout.zig");
 pub const environment = @import("environment.zig");
 pub const ai = @import("ai.zig");
 
@@ -45,6 +46,7 @@ test {
     _ = font;
     _ = uiskin;
     _ = audio;
+    _ = uilayout;
     _ = environment;
     _ = ai;
 }

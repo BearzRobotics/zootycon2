@@ -103,7 +103,8 @@ pub fn parse(gpa: std.mem.Allocator, source: []const u8) !Template {
     const root = try xml.parse(a, source, null);
     var list: std.ArrayList(Piece) = .empty;
     try collect(a, root, &list);
-    return .{ .arena = arena, .pieces = try list.toOwnedSlice(a) };
+    const pieces = try list.toOwnedSlice(a);
+    return .{ .arena = arena, .pieces = pieces };
 }
 
 test "template pieces stretch like the game's nine-slice panels" {
