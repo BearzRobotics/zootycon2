@@ -20,6 +20,7 @@ pub const sim = @import("sim.zig");
 pub const app = @import("app.zig");
 pub const font = @import("font.zig");
 pub const environment = @import("environment.zig");
+pub const ai = @import("ai.zig");
 
 test {
     _ = archive;
@@ -41,4 +42,5 @@ test {
     _ = app;
     _ = font;
     _ = environment;
+    _ = ai;
 }
