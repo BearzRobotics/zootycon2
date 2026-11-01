@@ -1174,6 +1174,7 @@ pub const App = struct {
             ctx.cam.yaw = try num(it.next());
             ctx.cam.pitch = try num(it.next());
             ctx.cam.dist = try num(it.next());
+            ctx.snap_camera = true;
             if (it.next()) |cx| {
                 ctx.cam.center[0] = try std.fmt.parseFloat(f32, cx);
                 ctx.cam.center[1] = try num(it.next());
@@ -1652,10 +1653,10 @@ pub const App = struct {
                 "1 SELECT 2 OBJECT 3 FENCE 4 PATH 5 RAISE 6 LOWER 7 FLATTEN 8 ANIMAL/PERSON 9 FOOD",
                 "[ ] CHOOSE (SHIFT: x10)  R ROTATE  Z UNDO  TAB PAUSE  , . SPEED  F5 SAVE  F9 LOAD",
                 "T RUN/STOP CLOCK   F2 F3 PREVIOUS/NEXT TIME OF DAY   G GUEST ARRIVALS   F REFILL FEEDER",
-                "RIGHT-DRAG ORBIT   WHEEL ZOOM   WASD PAN   F1 HIDE THIS   ESC QUIT",
+                "RIGHT-DRAG ORBIT  MIDDLE-DRAG PAN  WHEEL ZOOM TO CURSOR  WASD/ARROWS PAN  Q E TURN  SHIFT FAST",
             } else [_][]const u8{
                 "TAB PAUSE  , . SPEED   T RUN/STOP CLOCK   F2 F3 TIME OF DAY",
-                "RIGHT OR LEFT-DRAG ORBIT   WHEEL ZOOM   WASD PAN   ESC QUIT",
+                "LEFT-DRAG ORBIT  MIDDLE-DRAG PAN  WHEEL ZOOM  WASD/ARROWS PAN  Q E TURN  SHIFT FAST",
                 "",
                 "",
             };
@@ -1770,6 +1771,11 @@ pub const App = struct {
         buf[text.len] = 0;
         win.setTitle(buf[0..text.len :0]);
         self.title_dirty = false;
+    }
+
+    /// Terrain height for the camera to follow.
+    pub fn groundZ(self: *App, x: f32, y: f32) f32 {
+        return self.world.terrain.zAt(x, y);
     }
 
     pub fn frame(self: *App, ctx: *viewer.FrameCtx) !void {

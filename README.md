@@ -56,7 +56,9 @@ Others: `list`, `cat`, `export`, `elements`, `entity`, `entities`, `info`.
 
 ## Controls in `play`
 
-Right-drag orbits, the wheel zooms, WASD pans, Esc quits. The window title
+Right-drag orbits, middle-drag grabs and pans, the wheel zooms toward the
+cursor, WASD or the arrow keys pan (Shift is faster), Q and E turn, Esc quits.
+The camera eases towards where you point it and follows the terrain height. The window title
 shows the current tool, the selected item, and the last message.
 
 | key | action |

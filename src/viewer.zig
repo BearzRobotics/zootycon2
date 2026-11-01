@@ -181,8 +181,12 @@ const fs_src: [:0]const u8 =
     \\  if (uTerrain == 1) {
     \\    // Flat ground shows the cover texture, steep slopes the cliff texture.
     \\    float steep = smoothstep(0.2, 0.5, 1.0 - n.z);
-    \\    vec4 flat_c = c * vW.x + texture(uFlat1, vUv) * vW.y + texture(uFlat2, vUv) * vW.z + texture(uFlat3, vUv) * vW.w;
-    \\    c = mix(flat_c, texture(uTex2, vUv * 0.5), steep);
+    \\    // Only sample the textures that actually contribute here.
+    \\    vec4 flat_c = c * vW.x;
+    \\    if (vW.y > 0.002) flat_c += texture(uFlat1, vUv) * vW.y;
+    \\    if (vW.z > 0.002) flat_c += texture(uFlat2, vUv) * vW.z;
+    \\    if (vW.w > 0.002) flat_c += texture(uFlat3, vUv) * vW.w;
+    \\    c = steep > 0.002 ? mix(flat_c, texture(uTex2, vUv * 0.5), steep) : flat_c;
     \\  }
     \\  if (c.a < uAlphaCut) discard;
     \\  // Two-sided lighting: flip the normal towards the viewer.
@@ -1636,6 +1640,16 @@ const key_a: u32 = 4;
 const key_d: u32 = 7;
 const key_s: u32 = 22;
 const key_w: u32 = 26;
+const key_q: u32 = 20;
+const key_e: u32 = 8;
+const key_right: u32 = 79;
+const key_left: u32 = 80;
+const key_down: u32 = 81;
+const key_up: u32 = 82;
+const key_lshift: u32 = 225;
+const key_rshift: u32 = 229;
+const min_pitch: f32 = 0.12;
+const max_pitch: f32 = 1.5;
 
 /// Window, GL context and loaded entry points. Lives in place because the
 /// scene keeps a pointer to `g`.
@@ -1869,6 +1883,9 @@ pub const FrameCtx = struct {
     /// which are pixels, on HiDPI displays).
     win_width: u32 = 1,
     win_height: u32 = 1,
+    /// Set by a hook after it moves the camera directly, so the smoothing
+    /// does not drag it back to where it was heading.
+    snap_camera: bool = false,
     /// Set by a hook to say it handled the current event.
     consumed: bool = false,
     /// Set by a hook to capture the screenshot on this frame.
@@ -1917,7 +1934,24 @@ const Frustum = struct {
     }
 };
 
-fn drawItem(gfx: *Gfx, scene: *Scene, d: Draw, fr: *const Frustum) void {
+/// What the GL state already holds, so draws only send what changed.
+const DrawState = struct {
+    tex0: gl.Uint = std.math.maxInt(u32),
+    tex1: gl.Uint = std.math.maxInt(u32),
+    decal: gl.Uint = std.math.maxInt(u32),
+    flat: [3]gl.Uint = .{ std.math.maxInt(u32), std.math.maxInt(u32), std.math.maxInt(u32) },
+    terrain: i32 = -1,
+    decal_mode: i32 = -1,
+    light_set: i32 = -1,
+    skinned: i32 = -1,
+    blend: i32 = -1,
+    depth_write: i32 = -1,
+    vao: gl.Uint = std.math.maxInt(u32),
+    tint: [4]f32 = .{ -1, -1, -1, -1 },
+    cut: f32 = -1,
+};
+
+fn drawItem(gfx: *Gfx, scene: *Scene, d: Draw, fr: *const Frustum, st: *DrawState) void {
     if (!fr.sees(d.bound)) return;
     if (d.bound[3] >= 0 and (d.lod_range[0] > 0 or d.lod_range[1] < std.math.inf(f32))) {
         const dx = d.bound[0] - fr.eye[0];
@@ -1927,39 +1961,80 @@ fn drawItem(gfx: *Gfx, scene: *Scene, d: Draw, fr: *const Frustum) void {
         if (dist < d.lod_range[0] or dist >= d.lod_range[1]) return;
     }
     const g = &gfx.g;
-    g.activeTexture(gl.TEXTURE0 + 1);
-    g.bindTexture(gl.TEXTURE_2D, d.texture2);
-    g.uniform1i(gfx.u_terrain, if (d.texture2 != 0) 1 else 0);
-    g.uniform1i(gfx.u_lightset, d.light_set);
-    if (d.texture2 != 0) for (d.flat_extra, 0..) |tx, i| {
-        g.activeTexture(gl.TEXTURE0 + 3 + @as(gl.Enum, @intCast(i)));
-        g.bindTexture(gl.TEXTURE_2D, tx);
-    };
-    g.activeTexture(gl.TEXTURE0 + 2);
-    g.bindTexture(gl.TEXTURE_2D, d.decal);
-    g.uniform1i(gfx.u_decal_mode, if (d.decal != 0) d.decal_mode else 0);
-    g.activeTexture(gl.TEXTURE0);
+    const is_terrain: i32 = if (d.texture2 != 0) 1 else 0;
+    if (is_terrain != st.terrain) {
+        g.uniform1i(gfx.u_terrain, is_terrain);
+        st.terrain = is_terrain;
+    }
+    if (is_terrain == 1) {
+        if (d.texture2 != st.tex1) {
+            g.activeTexture(gl.TEXTURE0 + 1);
+            g.bindTexture(gl.TEXTURE_2D, d.texture2);
+            st.tex1 = d.texture2;
+        }
+        for (d.flat_extra, 0..) |tx, i| if (tx != st.flat[i]) {
+            g.activeTexture(gl.TEXTURE0 + 3 + @as(gl.Enum, @intCast(i)));
+            g.bindTexture(gl.TEXTURE_2D, tx);
+            st.flat[i] = tx;
+        };
+    }
+    const mode: i32 = if (d.decal != 0) d.decal_mode else 0;
+    if (mode != st.decal_mode) {
+        g.uniform1i(gfx.u_decal_mode, mode);
+        st.decal_mode = mode;
+    }
+    if (mode != 0 and d.decal != st.decal) {
+        g.activeTexture(gl.TEXTURE0 + 2);
+        g.bindTexture(gl.TEXTURE_2D, d.decal);
+        st.decal = d.decal;
+    }
+    if (d.light_set != st.light_set) {
+        g.uniform1i(gfx.u_lightset, d.light_set);
+        st.light_set = d.light_set;
+    }
     const wl: []const Mat4 = if (d.inst) |i| scene.instances.items[i].world else scene.world;
+    const skinned: i32 = if (d.skin != null) 1 else 0;
+    if (skinned != st.skinned) {
+        g.uniform1i(gfx.u_skinned, skinned);
+        st.skinned = skinned;
+    }
     if (d.skin) |sk| {
         var mats: [max_bones]Mat4 = undefined;
         for (sk.bones, sk.offsets, 0..) |bn, off, i| mats[i] = mul(wl[bn], off);
-        g.uniform1i(gfx.u_skinned, 1);
         g.uniformMatrix4fv(gfx.u_bones, @intCast(sk.bones.len), 0, @ptrCast(&mats));
+    } else if (d.attach_node) |n| {
+        const m = mul(wl[n], d.world);
+        g.uniformMatrix4fv(gfx.u_model, 1, 0, &m);
     } else {
-        g.uniform1i(gfx.u_skinned, 0);
-        if (d.attach_node) |n| {
-            const m = mul(wl[n], d.world);
-            g.uniformMatrix4fv(gfx.u_model, 1, 0, &m);
-        } else {
-            g.uniformMatrix4fv(gfx.u_model, 1, 0, if (d.dynamic) &wl[d.block] else &d.world);
-        }
+        g.uniformMatrix4fv(gfx.u_model, 1, 0, if (d.dynamic) &wl[d.block] else &d.world);
     }
-    g.uniform4f(gfx.u_tint, d.tint[0], d.tint[1], d.tint[2], d.tint[3]);
-    g.uniform1f(gfx.u_cut, d.alpha_cut);
-    g.bindTexture(gl.TEXTURE_2D, d.texture);
-    if (d.blend) g.enable(gl.BLEND) else g.disable(gl.BLEND);
-    g.depthMask(if (d.depth_write) 1 else 0);
-    g.bindVertexArray(d.vao);
+    if (!std.mem.eql(f32, &d.tint, &st.tint)) {
+        g.uniform4f(gfx.u_tint, d.tint[0], d.tint[1], d.tint[2], d.tint[3]);
+        st.tint = d.tint;
+    }
+    if (d.alpha_cut != st.cut) {
+        g.uniform1f(gfx.u_cut, d.alpha_cut);
+        st.cut = d.alpha_cut;
+    }
+    if (d.texture != st.tex0) {
+        g.activeTexture(gl.TEXTURE0);
+        g.bindTexture(gl.TEXTURE_2D, d.texture);
+        st.tex0 = d.texture;
+    }
+    const blend: i32 = if (d.blend) 1 else 0;
+    if (blend != st.blend) {
+        if (d.blend) g.enable(gl.BLEND) else g.disable(gl.BLEND);
+        st.blend = blend;
+    }
+    const dw: i32 = if (d.depth_write) 1 else 0;
+    if (dw != st.depth_write) {
+        g.depthMask(if (d.depth_write) 1 else 0);
+        st.depth_write = dw;
+    }
+    if (d.vao != st.vao) {
+        g.bindVertexArray(d.vao);
+        st.vao = d.vao;
+    }
     g.drawElements(gl.TRIANGLES, d.index_count, d.index_type, null);
 }
 
@@ -1974,12 +2049,22 @@ pub fn loopWith(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Came
     var cam = cam_init;
     if (opts.yaw) |y| cam.yaw = y;
     if (opts.pitch) |p| cam.pitch = p;
+    cam.pitch = std.math.clamp(cam.pitch, min_pitch, max_pitch);
     cam.dist *= opts.zoom;
-    var dragging = false;
+    var dragging = false; // orbit
+    var panning = false; // grab-pan with the middle button
     var last_x: f32 = 0;
     var last_y: f32 = 0;
     var size = gfx.win.pixelSize();
-    var held = [4]bool{ false, false, false, false }; // w a s d
+    // w a s d, arrows (left, right, up, down), q, e, shift
+    var held = [4]bool{ false, false, false, false };
+    var arrows = [4]bool{ false, false, false, false };
+    var rot_q = false;
+    var rot_e = false;
+    var fast = false;
+    // The camera eases towards where input has asked it to be.
+    var goal = cam;
+    const Hk = @typeInfo(@TypeOf(hooks)).pointer.child;
     var ui: Ui = .{ .gpa = gpa };
     defer ui.deinit();
     var ctx: FrameCtx = .{ .cam = &cam, .win = gfx.win, .width = size.width, .height = size.height, .plat = plat };
@@ -2015,6 +2100,13 @@ pub fn loopWith(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Came
                 key_a => held[1] = true,
                 key_s => held[2] = true,
                 key_d => held[3] = true,
+                key_left => arrows[0] = true,
+                key_right => arrows[1] = true,
+                key_up => arrows[2] = true,
+                key_down => arrows[3] = true,
+                key_q => rot_q = true,
+                key_e => rot_e = true,
+                key_lshift, key_rshift => fast = true,
                 else => {},
             },
             .key_up => |k| switch (k.scancode) {
@@ -2022,24 +2114,62 @@ pub fn loopWith(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Came
                 key_a => held[1] = false,
                 key_s => held[2] = false,
                 key_d => held[3] = false,
+                key_left => arrows[0] = false,
+                key_right => arrows[1] = false,
+                key_up => arrows[2] = false,
+                key_down => arrows[3] = false,
+                key_q => rot_q = false,
+                key_e => rot_e = false,
+                key_lshift, key_rshift => fast = false,
                 else => {},
             },
             .resized => |r| size = .{ .width = @max(r.width, 1), .height = @max(r.height, 1) },
-            .mouse_button => |b| if (b.button == opts.orbit_button) {
-                dragging = b.down;
+            .mouse_button => |b| {
+                if (b.button == opts.orbit_button) dragging = b.down;
+                if (b.button == 2) panning = b.down;
                 last_x = b.x;
                 last_y = b.y;
             },
             .mouse_move => |m| {
+                const dx = m.x - last_x;
+                const dy = m.y - last_y;
                 if (dragging) {
-                    cam.yaw -= (m.x - last_x) * 0.01;
-                    cam.pitch = std.math.clamp(cam.pitch + (m.y - last_y) * 0.01, -1.5, 1.5);
+                    goal.yaw -= dx * 0.006;
+                    goal.pitch = std.math.clamp(goal.pitch + dy * 0.006, min_pitch, max_pitch);
+                }
+                if (panning) {
+                    // Grab the ground: it follows the pointer. World units per
+                    // pixel at the look-at distance, stretched along the view
+                    // direction by the camera's tilt.
+                    const wpp = 2 * goal.dist * @tan(Camera.fov_y / 2) / @as(f32, @floatFromInt(@max(ctx.win_height, 1)));
+                    const fwd = [2]f32{ -@cos(goal.yaw), -@sin(goal.yaw) };
+                    const rgt = [2]f32{ fwd[1], -fwd[0] };
+                    const stretch = 1.0 / @max(@sin(goal.pitch), 0.35);
+                    goal.center[0] += (-dx * rgt[0] + dy * fwd[0] * stretch) * wpp;
+                    goal.center[1] += (-dx * rgt[1] + dy * fwd[1] * stretch) * wpp;
                 }
                 last_x = m.x;
                 last_y = m.y;
                 ctx.mouse = .{ m.x, m.y };
             },
-            .mouse_wheel => |w| cam.dist = std.math.clamp(cam.dist * std.math.pow(f32, 0.9, w.dy), cam.radius * 0.05, cam.radius * 20),
+            .mouse_wheel => |w| {
+                // Zoom towards what is under the pointer: the look-at point
+                // moves part of the way to it as the camera comes closer.
+                const old = goal.dist;
+                const next = std.math.clamp(old * std.math.pow(f32, 0.88, w.dy), @max(3.0, goal.radius * 0.02), goal.radius * 20);
+                if (next < old) {
+                    const r = goal.ray(ctx.mouse[0], ctx.mouse[1], @floatFromInt(ctx.win_width), @floatFromInt(ctx.win_height));
+                    if (r.dir[2] < -0.02) {
+                        const t = (goal.center[2] - r.origin[2]) / r.dir[2];
+                        const px = r.origin[0] + r.dir[0] * t;
+                        const py = r.origin[1] + r.dir[1] * t;
+                        const f = 1 - next / old;
+                        goal.center[0] += (px - goal.center[0]) * f;
+                        goal.center[1] += (py - goal.center[1]) * f;
+                    }
+                }
+                goal.dist = next;
+            },
             }
         }
 
@@ -2055,16 +2185,33 @@ pub fn loopWith(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Came
         ctx.win_height = logical.height;
         try hooks.frame(&ctx);
         if (ctx.quit) break :main;
-        // WASD pans the look-at point across the ground plane.
-        const fwd = [2]f32{ -@cos(cam.yaw), -@sin(cam.yaw) };
+        if (ctx.snap_camera) {
+            goal = cam;
+            ctx.snap_camera = false;
+        }
+        // Keys move the goal; the camera follows smoothly. Using a capped
+        // step keeps one slow frame from throwing the camera across the map.
+        const cdt = @min(dt, 0.05);
+        const fwd = [2]f32{ -@cos(goal.yaw), -@sin(goal.yaw) };
         const right = [2]f32{ fwd[1], -fwd[0] };
         var mv = [2]f32{ 0, 0 };
-        if (held[0]) mv = .{ mv[0] + fwd[0], mv[1] + fwd[1] };
-        if (held[2]) mv = .{ mv[0] - fwd[0], mv[1] - fwd[1] };
-        if (held[3]) mv = .{ mv[0] + right[0], mv[1] + right[1] };
-        if (held[1]) mv = .{ mv[0] - right[0], mv[1] - right[1] };
-        cam.center[0] += mv[0] * cam.dist * dt * 0.8;
-        cam.center[1] += mv[1] * cam.dist * dt * 0.8;
+        if (held[0] or arrows[2]) mv = .{ mv[0] + fwd[0], mv[1] + fwd[1] };
+        if (held[2] or arrows[3]) mv = .{ mv[0] - fwd[0], mv[1] - fwd[1] };
+        if (held[3] or arrows[1]) mv = .{ mv[0] + right[0], mv[1] + right[1] };
+        if (held[1] or arrows[0]) mv = .{ mv[0] - right[0], mv[1] - right[1] };
+        const pan_speed = goal.dist * @as(f32, if (fast) 2.2 else 0.9);
+        goal.center[0] += mv[0] * pan_speed * cdt;
+        goal.center[1] += mv[1] * pan_speed * cdt;
+        if (rot_q) goal.yaw += 1.6 * cdt;
+        if (rot_e) goal.yaw -= 1.6 * cdt;
+        // Stay over the ground when the hook knows its height.
+        if (comptime @hasDecl(Hk, "groundZ")) goal.center[2] = hooks.groundZ(goal.center[0], goal.center[1]);
+        const ease = 1 - @exp(-16 * cdt);
+        const ease_zoom = 1 - @exp(-11 * cdt);
+        for (0..3) |i| cam.center[i] += (goal.center[i] - cam.center[i]) * ease;
+        cam.yaw += (goal.yaw - cam.yaw) * ease;
+        cam.pitch += (goal.pitch - cam.pitch) * ease;
+        cam.dist += (goal.dist - cam.dist) * ease_zoom;
 
         g.viewport(0, 0, @intCast(size.width), @intCast(size.height));
         // Beyond the map edge shows the fog colour, like distant haze.
@@ -2140,11 +2287,12 @@ pub fn loopWith(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Came
         g.uniform1i(gfx.u_decal, 2);
         for (gfx.u_flat, 0..) |loc, i| g.uniform1i(loc, @intCast(3 + i));
         const frustum = Frustum.init(vp, eye);
-        if (scene.terrain) |t| drawItem(gfx, scene, t, &frustum);
-        for (scene.draws.items) |d| drawItem(gfx, scene, d, &frustum);
-        for (scene.actor_draws.items) |d| drawItem(gfx, scene, d, &frustum);
-        for (scene.overlay.items) |d| drawItem(gfx, scene, d, &frustum);
-        const Hk = @typeInfo(@TypeOf(hooks)).pointer.child;
+        var dstate: DrawState = .{};
+        g.activeTexture(gl.TEXTURE0);
+        if (scene.terrain) |t| drawItem(gfx, scene, t, &frustum, &dstate);
+        for (scene.draws.items) |d| drawItem(gfx, scene, d, &frustum, &dstate);
+        for (scene.actor_draws.items) |d| drawItem(gfx, scene, d, &frustum, &dstate);
+        for (scene.overlay.items) |d| drawItem(gfx, scene, d, &frustum, &dstate);
         if (comptime @hasDecl(Hk, "overlay")) {
             ui.verts.clearRetainingCapacity();
             ui.width = @floatFromInt(size.width);
