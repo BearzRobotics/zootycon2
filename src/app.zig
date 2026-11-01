@@ -113,7 +113,25 @@ const Alert = struct {
 pub const BuyTab = enum { fence, path, building, scenery, animal, food, staff, deform, enrich, shelter, tree, plant, rock };
 
 /// Which full-screen menu is open (if any).
-const Menu = enum { none, pause, maps, saves, settings, finances, new_zoo, save_as, main, goals };
+/// One scenario of a campaign, from `scenario/campaign/*.xml`.
+const CampEntry = struct {
+    name: []const u8,
+    key: []const u8,
+    scenario: []const u8,
+    map: []const u8,
+    cash: f64,
+    description: []const u8,
+    /// The campaign file starts it unlocked.
+    open: bool,
+};
+
+const Campaign = struct {
+    name: []const u8,
+    tutorial: bool,
+    entries: []const CampEntry,
+};
+
+const Menu = enum { none, pause, maps, saves, settings, finances, new_zoo, save_as, main, goals, campaigns, scenarios };
 
 const MenuAction = enum {
     close_menu,
@@ -123,6 +141,7 @@ const MenuAction = enum {
     open_settings,
     open_finances,
     open_goals,
+    open_campaigns,
     open_pause,
     toggle_pause,
     undo,
@@ -291,6 +310,17 @@ pub const App = struct {
     /// Scenario goals: localized strings and the running goal tree.
     strings: ?loc_mod.Loc = null,
     scen: ?*scenario_mod.Manager = null,
+    /// Key of the campaign scenario being played (for saving progress).
+    scen_key: [64]u8 = undefined,
+    scen_key_len: usize = 0,
+    camp_arena: std.heap.ArenaAllocator = undefined,
+    camp_ready: bool = false,
+    campaigns: std.ArrayList(Campaign) = .empty,
+    camp_labels: std.ArrayList([]const u8) = .empty,
+    scen_labels: std.ArrayList([]const u8) = .empty,
+    camp_sel: usize = 0,
+    /// Keys of finished scenarios.
+    done_keys: std.StringHashMapUnmanaged(void) = .empty,
     over_ui: bool = false,
 
     // Virtual input.
@@ -399,6 +429,13 @@ pub const App = struct {
         self.guest_names.deinit(self.gpa);
         self.food_names.deinit(self.gpa);
         if (self.scen) |m| m.destroy();
+        if (self.camp_ready) {
+            self.campaigns.deinit(self.gpa);
+            self.camp_labels.deinit(self.gpa);
+            self.scen_labels.deinit(self.gpa);
+            self.done_keys.deinit(self.gpa);
+            self.camp_arena.deinit();
+        }
         if (self.strings) |*st| st.deinit();
         var fl = self.food_loaded.keyIterator();
         while (fl.next()) |k| self.gpa.free(k.*);
@@ -1165,6 +1202,11 @@ pub const App = struct {
     }
 
     fn installWorld(self: *App, fresh: world_mod.World) !void {
+        if (self.scen) |m| {
+            m.destroy();
+            self.scen = null;
+        }
+        self.scen_key_len = 0;
         self.world.deinit();
         self.world = fresh;
         self.look.deinit(self.gpa);
@@ -1667,6 +1709,140 @@ pub const App = struct {
         }
     }
 
+    // ------------------------------------------------------------ campaigns
+
+    fn ensureStrings(self: *App) void {
+        if (self.strings != null) return;
+        var st = loc_mod.Loc.init(self.gpa);
+        st.load(self.vfs, "lang/1033/") catch {};
+        self.strings = st;
+    }
+
+    /// Text for a localized id, upper-cased for the font (the id itself if unknown).
+    fn locUpper(self: *App, a: std.mem.Allocator, id: []const u8) []const u8 {
+        const t = if (self.strings) |*st| st.get(id) orelse id else id;
+        return std.ascii.allocUpperString(a, t) catch t;
+    }
+
+    fn campaignFile(self: *const App, buf: []u8) []const u8 {
+        return std.fmt.bufPrint(buf, "{s}/campaign.txt", .{self.opts.save_dir}) catch "campaign.txt";
+    }
+
+    /// Reads the campaign index, every campaign's scenarios and the saved progress.
+    fn loadCampaigns(self: *App) void {
+        if (self.camp_ready) return self.buildCampaignLabels();
+        self.camp_arena = .init(self.gpa);
+        self.camp_ready = true;
+        self.ensureStrings();
+        const a = self.camp_arena.allocator();
+        const idx_bytes = self.vfs.read(self.gpa, "scenario/campaign/index.xml") catch return;
+        defer self.gpa.free(idx_bytes);
+        var scratch: std.heap.ArenaAllocator = .init(self.gpa);
+        defer scratch.deinit();
+        const idx = xml.parse(scratch.allocator(), idx_bytes, null) catch return;
+        for (idx.children) |ce| {
+            if (!std.ascii.eqlIgnoreCase(ce.name, "campaign")) continue;
+            var pb: [160]u8 = undefined;
+            const path = std.fmt.bufPrint(&pb, "scenario/campaign/{s}", .{std.mem.trim(u8, ce.text, " \t\r\n")}) catch continue;
+            const bytes = self.vfs.read(self.gpa, path) catch continue;
+            defer self.gpa.free(bytes);
+            const root = xml.parse(scratch.allocator(), bytes, null) catch continue;
+            var entries: std.ArrayList(CampEntry) = .empty;
+            for (root.children) |e| {
+                if (!std.ascii.eqlIgnoreCase(e.name, "entry")) continue;
+                const cash = std.fmt.parseFloat(f64, e.attr("cash") orelse "0") catch 0;
+                entries.append(a, .{
+                    .name = a.dupe(u8, e.attr("name") orelse "") catch continue,
+                    .key = a.dupe(u8, e.attr("key") orelse "") catch continue,
+                    .scenario = a.dupe(u8, e.attr("scenario") orelse "") catch continue,
+                    .map = a.dupe(u8, e.attr("map") orelse "") catch continue,
+                    .cash = cash,
+                    .description = a.dupe(u8, e.attr("description") orelse "") catch continue,
+                    .open = !(if (e.attr("state")) |st| std.ascii.eqlIgnoreCase(st, "locked") else false),
+                }) catch {};
+            }
+            if (entries.items.len == 0) continue;
+            self.campaigns.append(self.gpa, .{
+                .name = a.dupe(u8, root.attr("name") orelse "") catch continue,
+                .tutorial = if (root.attr("tutorial")) |t| std.ascii.eqlIgnoreCase(t, "true") else false,
+                .entries = entries.toOwnedSlice(a) catch continue,
+            }) catch {};
+        }
+        // Progress.
+        var fb: [200]u8 = undefined;
+        if (std.Io.Dir.cwd().readFileAlloc(self.io, self.campaignFile(&fb), self.gpa, .limited(64 * 1024)) catch null) |data| {
+            defer self.gpa.free(data);
+            var lines = std.mem.tokenizeAny(u8, data, "\r\n");
+            while (lines.next()) |ln| {
+                const k = a.dupe(u8, std.mem.trim(u8, ln, " ")) catch continue;
+                self.done_keys.put(self.gpa, k, {}) catch {};
+            }
+        }
+        self.buildCampaignLabels();
+    }
+
+    fn buildCampaignLabels(self: *App) void {
+        const a = self.camp_arena.allocator();
+        self.camp_labels.clearRetainingCapacity();
+        for (self.campaigns.items) |cp| {
+            self.camp_labels.append(self.gpa, self.locUpper(a, cp.name)) catch {};
+        }
+    }
+
+    /// A scenario can be played when its campaign opens it, or the one
+    /// before it has been finished.
+    fn entryOpen(self: *const App, cp: Campaign, i: usize) bool {
+        if (cp.entries[i].open or self.done_keys.contains(cp.entries[i].key)) return true;
+        return i > 0 and self.done_keys.contains(cp.entries[i - 1].key);
+    }
+
+    fn buildScenarioLabels(self: *App) void {
+        const a = self.camp_arena.allocator();
+        self.scen_labels.clearRetainingCapacity();
+        const cp = self.campaigns.items[self.camp_sel];
+        for (cp.entries, 0..) |e, i| {
+            const state: []const u8 = if (self.done_keys.contains(e.key)) "  [DONE]" else if (self.entryOpen(cp, i)) "" else "  [LOCKED]";
+            const label = std.fmt.allocPrint(a, "{s}{s}", .{ self.locUpper(a, e.name), state }) catch continue;
+            self.scen_labels.append(self.gpa, label) catch {};
+        }
+    }
+
+    /// Loads a scenario's map with its starting cash and starts its goals.
+    fn startCampaignEntry(self: *App, e: CampEntry) void {
+        var pb: [160]u8 = undefined;
+        const path = std.fmt.bufPrint(&pb, "maps/scenario/{s}.zt2", .{e.map}) catch return;
+        self.loadPath(path) catch return;
+        self.custom_len = 0;
+        self.sim.zoo.income = e.cash;
+        self.world.income = e.cash;
+        self.startScenario(e.scenario);
+        const n = @min(e.key.len, self.scen_key.len);
+        @memcpy(self.scen_key[0..n], e.key[0..n]);
+        self.scen_key_len = n;
+        self.openMenu(.none);
+    }
+
+    fn markScenarioDone(self: *App) void {
+        if (self.scen_key_len == 0 or !self.camp_ready) return;
+        const key = self.scen_key[0..self.scen_key_len];
+        if (self.done_keys.contains(key)) return;
+        const owned = self.camp_arena.allocator().dupe(u8, key) catch return;
+        self.done_keys.put(self.gpa, owned, {}) catch return;
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(self.gpa);
+        var it = self.done_keys.keyIterator();
+        while (it.next()) |k| {
+            out.appendSlice(self.gpa, k.*) catch return;
+            out.append(self.gpa, '\n') catch return;
+        }
+        const cwd = Io.Dir.cwd();
+        cwd.createDirPath(self.io, self.opts.save_dir) catch {};
+        var fb: [200]u8 = undefined;
+        cwd.writeFile(self.io, .{ .sub_path = self.campaignFile(&fb), .data = out.items }) catch {};
+        self.say("scenario complete!", .{});
+        self.pushAlert(1, "SCENARIO COMPLETE", .{});
+    }
+
     // ------------------------------------------------------------ scenarios
 
     /// Starts the goals of a scenario (`scenario/goals/*.xml`) on the
@@ -1894,6 +2070,22 @@ pub const App = struct {
             }
             for (self.sim.feeders.items) |f| std.debug.print("feeder #{d} {s}: food {d:.0}\n", .{ f.prop_id, f.binder, f.food });
             std.debug.print("animal welfare: {d:.0}\n", .{self.sim.animalWelfare()});
+            if (self.scen) |m| {
+                const Dump = struct {
+                    fn node(mm: *scenario_mod.Manager, n: *const scenario_mod.Node, depth: usize) void {
+                        std.debug.print("  scenario:", .{});
+                        for (0..depth + 1) |_| std.debug.print("  ", .{});
+                        std.debug.print("{s} {s} [{s}]{s}\n", .{ if (n.is_group) "group" else "rule", n.name, @tagName(n.state), if (n.hidden) " hidden" else "" });
+                        for (n.children) |k| node(mm, k, depth + 1);
+                    }
+                };
+                for (m.roots.items) |r| Dump.node(m, r, 0);
+                if (m.eng.missing.count() > 0) {
+                    std.debug.print("  scenario: missing:", .{});
+                    for (m.eng.missing.keys(), m.eng.missing.values()) |k, v| std.debug.print(" {s}({d})", .{ k, v });
+                    std.debug.print("\n", .{});
+                }
+            }
             if (self.audio) |*au| {
                 var live: usize = 0;
                 for (au.voices) |v| if (v != null) {
@@ -2222,6 +2414,10 @@ pub const App = struct {
             .open_maps => self.openMenu(.maps),
             .open_settings => self.openMenu(.settings),
             .open_goals => self.openMenu(.goals),
+            .open_campaigns => {
+                self.loadCampaigns();
+                self.openMenu(.campaigns);
+            },
             .open_finances => {
                 self.status_tab = 1;
                 self.openMenu(.finances);
@@ -2277,7 +2473,7 @@ pub const App = struct {
                 self.hud_on = !self.hud_on;
                 self.show_help = !self.hud_on;
             },
-            .back => self.openMenu(if (self.in_main) .main else .pause),
+            .back => self.openMenu(if (self.menu == .scenarios) .campaigns else if (self.in_main) .main else .pause),
             .quit => ctx.quit = true,
             .toggle_help => self.show_help = !self.show_help,
             .toggle_arrivals => {
@@ -2304,6 +2500,17 @@ pub const App = struct {
                 self.loadPath(self.map_paths.items[i]) catch {};
                 self.custom_len = 0;
                 self.openMenu(.none);
+            },
+            .campaigns => if (i < self.campaigns.items.len) {
+                self.camp_sel = i;
+                self.buildScenarioLabels();
+                self.openMenu(.scenarios);
+            },
+            .scenarios => {
+                const cp = self.campaigns.items[self.camp_sel];
+                if (i < cp.entries.len) {
+                    if (self.entryOpen(cp, i)) self.startCampaignEntry(cp.entries[i]) else self.say("finish the scenario before it first", .{});
+                }
             },
             .saves => if (i < self.save_paths.items.len) {
                 self.loadPath(self.save_paths.items[i]) catch {};
@@ -2354,6 +2561,8 @@ pub const App = struct {
                 const n = switch (self.menu) {
                     .maps => self.map_labels.items.len,
                     .saves => self.save_labels.items.len,
+                    .campaigns => self.camp_labels.items.len,
+                    .scenarios => self.scen_labels.items.len,
                     else => 0,
                 };
                 if (w.dy > 0 and self.menu_first > 0) self.menu_first -= 1;
@@ -2385,6 +2594,8 @@ pub const App = struct {
             .settings => "SETTINGS",
             .finances => "FINANCES",
             .goals => "GOALS",
+            .campaigns => "CAMPAIGNS",
+            .scenarios => "CHOOSE A SCENARIO",
             .new_zoo => "NEW BLANK ZOO",
             .save_as => "SAVE YOUR ZOO",
             .main => "ZOOTYCON2",
@@ -2404,12 +2615,18 @@ pub const App = struct {
                 y += try self.menuButton(ui, y, scale, "SAVE GAME...", .{ .menu = .open_save_as }, false);
                 y += try self.menuButton(ui, y, scale, "LOAD GAME", .{ .menu = .open_saves }, false);
                 y += try self.menuButton(ui, y, scale, "NEW MAP", .{ .menu = .open_maps }, false);
+                y += try self.menuButton(ui, y, scale, "CAMPAIGNS", .{ .menu = .open_campaigns }, false);
                 y += try self.menuButton(ui, y, scale, "MAIN MENU", .{ .menu = .open_main }, false);
                 y += try self.menuButton(ui, y, scale, "SETTINGS", .{ .menu = .open_settings }, false);
                 y += try self.menuButton(ui, y, scale, "QUIT", .{ .menu = .quit }, false);
             },
-            .maps, .saves => {
-                const labels = if (self.menu == .maps) self.map_labels.items else self.save_labels.items;
+            .maps, .saves, .campaigns, .scenarios => {
+                const labels = switch (self.menu) {
+                    .maps => self.map_labels.items,
+                    .campaigns => self.camp_labels.items,
+                    .scenarios => self.scen_labels.items,
+                    else => self.save_labels.items,
+                };
                 if (labels.len == 0) {
                     const msg = if (self.menu == .maps) "NO MAPS FOUND" else "NO SAVED ZOOS YET";
                     const mw = viewer.Ui.textWidth(msg, scale);
@@ -3156,6 +3373,7 @@ pub const App = struct {
         if (buyTabFor(name)) |t| return .{ .buy_tab = t };
         if (eq(name, "Freeform Button")) return .{ .menu = .open_maps };
         if (eq(name, "Load Save Game Button")) return .{ .menu = .open_saves };
+        if (eq(name, "Campaign Game Button")) return .{ .menu = .open_campaigns };
         if (eq(name, "Game Options Button")) return .{ .menu = .open_settings };
         if (eq(name, "Exit Game Button")) return .{ .menu = .quit };
         if (eq(name, "close")) return .{ .menu = .close_selection };
@@ -3282,7 +3500,7 @@ pub const App = struct {
             .{ .node = "Load Save Game Button", .pointer = "Load Save Game Pointer", .label = "LOAD A SAVED ZOO" },
             .{ .node = "Game Options Button", .pointer = "Game Options Pointer", .label = "GAME OPTIONS" },
             .{ .node = "Exit Game Button", .pointer = "Exit Game Pointer", .label = "QUIT" },
-            .{ .node = "Campaign Game Button", .pointer = "Campaign Game Pointer", .label = "CAMPAIGN: COMING SOON" },
+            .{ .node = "Campaign Game Button", .pointer = "Campaign Game Pointer", .label = "PLAY THE CAMPAIGNS" },
             .{ .node = "Challenge Button", .pointer = "Challenge Pointer", .label = "CHALLENGES: COMING SOON" },
             .{ .node = "Downloads Button", .pointer = "Downloads Pointer", .label = "DOWNLOADS: NOT AVAILABLE" },
         };
@@ -4293,7 +4511,10 @@ pub const App = struct {
             self.updateGuestCap();
             if (!self.paused and self.menu == .none) {
                 self.sim.advance(&self.world, ctx.dt * self.speed);
-                if (self.scen) |m| m.update(ctx.dt * self.speed);
+                if (self.scen) |m| {
+                    m.update(ctx.dt * self.speed);
+                    if (m.roots.items.len > 0 and m.roots.items[0].state == .success) self.markScenarioDone();
+                }
             }
             for (self.actor_ids.items, 0..) |id, i| {
                 const ag = self.sim.agentFor(id) orelse continue;
