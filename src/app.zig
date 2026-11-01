@@ -449,7 +449,7 @@ pub const App = struct {
             } else if ((std.mem.startsWith(u8, path, "entities/objects/fences/ai/") or std.mem.startsWith(u8, path, "entities/objects/paths/ai/")) and std.mem.endsWith(u8, path, ".xml")) {
                 const base = std.fs.path.basename(path);
                 const kind = base[0 .. base.len - 4];
-                const bad = [_][]const u8{ "broken", "gate", "_end", "_mm" };
+                const bad = [_][]const u8{ "broken", "_end", "_mm" };
                 var ok = true;
                 for (bad) |b| if (std.mem.indexOf(u8, kind, b) != null) {
                     ok = false;
@@ -533,10 +533,17 @@ pub const App = struct {
     }
 
     fn fenceMatrix(self: *App, f: world_mod.Fence) Mat4 {
-        const z = self.world.terrain.zAt(f.position[0], f.position[1]);
+        const z0 = self.world.terrain.zAt(f.position[0], f.position[1]);
+        const z1 = self.world.terrain.zAt(f.position[0] + @cos(f.rotation) * 3.0, f.position[1] + @sin(f.rotation) * 3.0);
+        // Tilt the segment so it follows the ground instead of cutting straight across.
+        const alpha = std.math.atan2(z1 - z0, 3.0);
+        const c = @cos(f.rotation);
+        const sn = @sin(f.rotation);
+        const ca = @cos(alpha);
+        const sa = @sin(alpha);
         return viewer.fromTransform(.{
-            .translation = .{ f.position[0], f.position[1], z },
-            .rotation = world_mod.yawRotation(f.rotation),
+            .translation = .{ f.position[0], f.position[1], z0 },
+            .rotation = .{ c * ca, -sn, -c * sa, sn * ca, c, -sn * sa, sa, 0, ca },
             .scale = 1,
         });
     }
@@ -854,6 +861,37 @@ pub const App = struct {
         const id = try self.world.addPath(self.path_textures.items[self.path_i], .{ x, y }, 6, 6);
         self.pushAdded(&.{id}, path_cost);
         self.sfx("place_path");
+    }
+
+    fn isGateKind(self: *const App) bool {
+        if (self.fence_kinds.items.len == 0) return false;
+        return std.ascii.findIgnoreCase(self.fence_kinds.items[self.fence_i], "gate") != null;
+    }
+
+    /// Puts a gate in the fence: it replaces a fence segment that starts at
+    /// this spot (keeping its direction), or goes in as a new piece facing `yaw`.
+    fn placeGate(self: *App, at: [2]f32) !void {
+        const kind = self.fence_kinds.items[self.fence_i];
+        var rot: f32 = self.yaw;
+        var replaced: ?world_mod.Fence = null;
+        for (self.world.fences.items) |f| {
+            const dx = f.position[0] - at[0];
+            const dy = f.position[1] - at[1];
+            if (dx * dx + dy * dy < 1.6 * 1.6 and std.ascii.findIgnoreCase(f.kind, "gate") == null) {
+                replaced = f;
+                rot = f.rotation;
+                break;
+            }
+        }
+        const cost = self.costOf(kind, 150);
+        if (!self.charge(cost, kind, .construction)) return;
+        if (replaced) |f| {
+            _ = self.world.remove(f.id);
+        }
+        const id = try self.world.addFence(kind, .{ at[0], at[1], 0 }, rot);
+        self.pushAdded(&.{id}, cost);
+        self.sfx("place_fence");
+        self.say("gate: {s} (${d:.0}){s}", .{ kind, cost, if (replaced != null) " replacing a fence piece" else "" });
     }
 
     fn placeFenceLine(self: *App, a: [2]f32, b: [2]f32) !void {
@@ -2736,7 +2774,14 @@ pub const App = struct {
         const s = c.scale;
         const ts: f32 = @max(1, @round(s * 1.8));
         const h = (16 + 14 * @as(f32, @floatFromInt(n))) * s;
-        ui.template("topbars", 300 * s, 8 * s, 440 * s, h, s, 1.5);
+        // The bar is as wide as its longest message (within the layout's room).
+        var widest: f32 = 0;
+        for (self.alerts) |a| if (a.len > 0 and self.app_time - a.t < 14) {
+            widest = @max(widest, viewer.Ui.textWidth(a.text[0..a.len], ts));
+        };
+        const bar_w = std.math.clamp(widest + 70 * s, 280 * s, 560 * s);
+        const bar_x = 300 * s + (440 * s - bar_w) / 2;
+        ui.template("topbars", bar_x, 8 * s, bar_w, h, s, 1.5);
         var y = 8 * s + 10 * s;
         for (self.alerts) |a| {
             if (a.len == 0 or self.app_time - a.t >= 14) continue;
@@ -2747,11 +2792,11 @@ pub const App = struct {
             };
             var tsz = ts;
             var w = viewer.Ui.textWidth(a.text[0..a.len], tsz);
-            if (w > 400 * s) {
+            if (w > bar_w - 40 * s) {
                 tsz = @max(1, ts - 1);
                 w = viewer.Ui.textWidth(a.text[0..a.len], tsz);
             }
-            _ = ui.text(300 * s + (440 * s - w) / 2, y, tsz, a.text[0..a.len], col) catch {};
+            _ = ui.text(bar_x + (bar_w - w) / 2, y, tsz, a.text[0..a.len], col) catch {};
             y += 14 * s;
         }
     }
@@ -2766,6 +2811,20 @@ pub const App = struct {
 
     /// Thought icons over guests' heads: a need that has become urgent, or
     /// whether the guest is delighted or miserable.
+    /// Shows where the next fence piece starts and where the pointer would put it.
+    fn drawFenceMarkers(self: *App, ui: *viewer.Ui, ctx: *viewer.FrameCtx) void {
+        if (self.tool != .fence or self.isGateKind()) return;
+        const sz = @max(8, ui.height / 60);
+        if (self.hover) |h| {
+            const p = [3]f32{ snap(h[0], 3.0), snap(h[1], 3.0), self.world.terrain.zAt(snap(h[0], 3.0), snap(h[1], 3.0)) };
+            if (ctx.cam.project(p, ui.width, ui.height)) |sp| ui.rect(sp[0] - sz / 2, sp[1] - sz / 2, sz, sz, .{ 1, 1, 1, 0.8 }) catch {};
+        }
+        if (self.fence_start) |st| {
+            const p = [3]f32{ st[0], st[1], self.world.terrain.zAt(st[0], st[1]) };
+            if (ctx.cam.project(p, ui.width, ui.height)) |sp| ui.rect(sp[0] - sz * 0.7, sp[1] - sz * 0.7, sz * 1.4, sz * 1.4, .{ 1, 0.85, 0.2, 0.9 }) catch {};
+        }
+    }
+
     fn drawEmotes(self: *App, ui: *viewer.Ui, ctx: *viewer.FrameCtx) void {
         if (ctx.cam.dist > 90) return;
         const size = @max(18, ui.height / 24) * self.ui_zoom;
@@ -2874,10 +2933,8 @@ pub const App = struct {
             // The paw pointer that goes with the hovered button.
             info.visible = self.main_hover.len > 0 and std.ascii.eqlIgnoreCase(std.mem.trim(u8, n.name, " "), self.main_hover);
         }
-        if (eq(n.name, "famestars")) {
-            info.visible = true;
-            info.percent = self.stars() / 5.0 * 100.0;
-        }
+        // The fame stars are drawn by hand over the star wells (see drawHud).
+        if (eq(n.name, "famestars") or eq(n.name, "zoo fame stars")) info.visible = false;
         if (eq(n.name, "CurrentDate")) {
             info.text = std.fmt.bufPrint(&self.hud_text, "MONTH {d}", .{self.sim.zoo.months + 1}) catch "";
         }
@@ -2923,9 +2980,19 @@ pub const App = struct {
             .mouse = toPixels(ctx, ctx.mouse[0], ctx.mouse[1]),
             .pressed = self.lmb,
         };
-        const tops = [_][]const u8{ "famestarwells", "zoo fame stars", "CurrentDate Background", "Primary Game Button Panel" };
+        const tops = [_][]const u8{ "famestarwells", "CurrentDate Background", "Primary Game Button Panel" };
         for (tops) |name| if (h.shell.find(name)) |n| uilayout.drawTop(&d, n);
         if (h.bucks) |*b| if (b.find("zoo_bucks")) |n| uilayout.drawTop(&d, n);
+        // Fill the star wells: the star strip cropped to the rating.
+        if (ui.sprite("ui/photosaf/stars.dds")) |spr| {
+            const cs = d.canvas.scale;
+            const frac = std.math.clamp(self.stars() / 5.0, 0, 1);
+            const wx = 47 * cs;
+            const wy = 61 * cs;
+            const ww = 224 * cs;
+            const wh = 38 * cs;
+            ui.image(spr, wx, wy, ww * frac, wh, .{ 0, 0, spr.w * frac, spr.h }, .{ 1, 1, 1, 1 }) catch {};
+        }
         self.drawBuyPanel(ui, &d, &h.shell);
         if (h.info) |*il| self.drawEntityInfo(ui, &d, il) else self.info_drawn = false;
     }
@@ -3313,8 +3380,21 @@ pub const App = struct {
             .path => if (hit) |h| self.placePath(h) catch {},
             .fence => if (hit) |h| {
                 const p = [2]f32{ snap(h[0], 3.0), snap(h[1], 3.0) };
+                if (self.isGateKind()) {
+                    self.placeGate(p) catch {};
+                    return;
+                }
                 if (self.fence_start) |s| {
-                    self.placeFenceLine(s, p) catch {};
+                    // Go along the longer way first, then turn to reach the click.
+                    const dx = p[0] - s[0];
+                    const dy = p[1] - s[1];
+                    if (@abs(dx) >= @abs(dy)) {
+                        self.placeFenceLine(s, .{ p[0], s[1] }) catch {};
+                        self.placeFenceLine(.{ p[0], s[1] }, p) catch {};
+                    } else {
+                        self.placeFenceLine(s, .{ s[0], p[1] }) catch {};
+                        self.placeFenceLine(.{ s[0], p[1] }, p) catch {};
+                    }
                     self.fence_start = p; // keep drawing from the end
                 } else self.fence_start = p;
                 self.title_dirty = true;
@@ -3496,6 +3576,7 @@ pub const App = struct {
         try ui.label(ui.width - sw - pad, ry, scale, status, white);
 
         self.drawEmotes(ui, ctx);
+        self.drawFenceMarkers(ui, ctx);
 
         // Clickable interface.
         if (self.opts.tools) try self.drawControls(ui, scale, pad, line);
