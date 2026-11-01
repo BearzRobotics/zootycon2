@@ -20,6 +20,7 @@ const usage =
     \\  window [seconds]             open a test window (Esc or close to quit)
     \\  modelcheck [prefix]         parse every .bfm manifest and .bfmat material
     \\  ddscheck [prefix]           parse every .dds texture and report formats
+    \\  nifinfo <path>               print a NIF's scene graph
     \\  nifcheck [prefix]           parse every .nif/.kf and report coverage
     \\  xmlcheck [prefix]            parse every .xml and report failures
     \\
@@ -259,6 +260,53 @@ pub fn main(init: std.process.Init) !void {
             gpa.free(px);
         }
         try out.print("{d} textures: dxt1 {d}, dxt3 {d}, dxt5 {d}, rgba8 {d}; {d} cube maps; {d} with partial mip chains; {d} failed\n", .{ names.items.len, counts[0], counts[1], counts[2], counts[3], cubes, short_mips, failed });
+    } else if (std.mem.eql(u8, cmd, "nifinfo") and rest.len > 0) {
+        const data = try vfs.read(gpa, rest[0]);
+        defer gpa.free(data);
+        var parsed = try zootycon2.nif.parse(gpa, data);
+        defer parsed.deinit();
+        try out.print("{d} blocks, roots:", .{parsed.blocks.len});
+        for (parsed.roots) |rt| try out.print(" {d}", .{rt});
+        try out.writeAll("\n");
+        const Dump = struct {
+            fn tex(o: *Io.Writer, nf: *const zootycon2.nif.Nif, ref: zootycon2.nif.Ref, label: []const u8) !void {
+                if (ref < 0) return;
+                switch (nf.blocks[@intCast(ref)]) {
+                    .source_texture => |st| try o.print(" {s}={s}", .{ label, st.file_name orelse "(internal)" }),
+                    else => {},
+                }
+            }
+            fn node(o: *Io.Writer, nf: *const zootycon2.nif.Nif, ref: zootycon2.nif.Ref, depth: usize) anyerror!void {
+                if (ref < 0) return;
+                const b = nf.blocks[@intCast(ref)];
+                for (0..depth) |_| try o.writeAll("  ");
+                switch (b) {
+                    .node => |n| {
+                        try o.print("[{d}] {s} \"{s}\" t=({d:.2},{d:.2},{d:.2}) s={d:.2}\n", .{ ref, @tagName(n.kind), n.av.net.name, n.av.transform.translation[0], n.av.transform.translation[1], n.av.transform.translation[2], n.av.transform.scale });
+                        for (n.children) |c| try node(o, nf, c, depth + 1);
+                    },
+                    .geometry => |g| {
+                        try o.print("[{d}] {s} \"{s}\"", .{ ref, nf.typeName(@intCast(ref)), g.av.net.name });
+                        if (g.data >= 0) switch (nf.blocks[@intCast(g.data)]) {
+                            .mesh_data => |m| try o.print(" verts={d} tris={d} uvsets={d}", .{ m.vertices.len, m.indices.len / 3, m.uv_sets.len }),
+                            else => {},
+                        };
+                        if (g.skin >= 0) try o.writeAll(" skinned");
+                        for (g.av.properties) |pr| {
+                            if (pr < 0) continue;
+                            switch (nf.blocks[@intCast(pr)]) {
+                                .texturing => |t| if (t.base) |bt| try tex(o, nf, bt.source, "base"),
+                                .material => |m| try o.print(" mat=\"{s}\"", .{m.net.name}),
+                                else => {},
+                            }
+                        }
+                        try o.writeAll("\n");
+                    },
+                    else => try o.print("[{d}] {s}\n", .{ ref, nf.typeName(@intCast(ref)) }),
+                }
+            }
+        };
+        for (parsed.roots) |rt| try Dump.node(out, &parsed, rt, 0);
     } else if (std.mem.eql(u8, cmd, "nifcheck")) {
         const prefix = if (rest.len > 0) rest[0] else "";
         var names: std.ArrayList([]const u8) = .empty;

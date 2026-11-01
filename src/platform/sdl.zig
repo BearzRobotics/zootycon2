@@ -5,7 +5,7 @@
 const std = @import("std");
 const c = @import("sdl_c");
 
-pub const Error = error{ SdlInit, WindowCreate };
+pub const Error = error{ SdlInit, WindowCreate, GlContext };
 
 pub const Event = union(enum) {
     quit,
@@ -75,6 +75,24 @@ pub const Platform = struct {
     }
 };
 
+pub const GlContext = struct {
+    ctx: c.SDL_GLContext,
+    window: *c.SDL_Window,
+
+    pub fn destroy(self: GlContext) void {
+        _ = c.SDL_GL_DestroyContext(self.ctx);
+    }
+
+    pub fn swap(self: GlContext) void {
+        _ = c.SDL_GL_SwapWindow(self.window);
+    }
+};
+
+/// Resolves an OpenGL function by name (valid while a context is current).
+pub fn glGetProcAddress(name: [*:0]const u8) ?*const anyopaque {
+    return @ptrCast(c.SDL_GL_GetProcAddress(name));
+}
+
 pub const Window = struct {
     handle: *c.SDL_Window,
 
@@ -82,6 +100,32 @@ pub const Window = struct {
         const w = c.SDL_CreateWindow(title.ptr, @intCast(width), @intCast(height), c.SDL_WINDOW_RESIZABLE | c.SDL_WINDOW_HIGH_PIXEL_DENSITY) orelse
             return error.WindowCreate;
         return .{ .handle = w };
+    }
+
+    /// Creates a window that can host an OpenGL 3.3 core context.
+    pub fn createGl(title: [:0]const u8, width: u32, height: u32) Error!Window {
+        _ = c.SDL_GL_SetAttribute(c.SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+        _ = c.SDL_GL_SetAttribute(c.SDL_GL_CONTEXT_MINOR_VERSION, 3);
+        _ = c.SDL_GL_SetAttribute(c.SDL_GL_CONTEXT_PROFILE_MASK, c.SDL_GL_CONTEXT_PROFILE_CORE);
+        _ = c.SDL_GL_SetAttribute(c.SDL_GL_DEPTH_SIZE, 24);
+        _ = c.SDL_GL_SetAttribute(c.SDL_GL_DOUBLEBUFFER, 1);
+        const w = c.SDL_CreateWindow(title.ptr, @intCast(width), @intCast(height), c.SDL_WINDOW_RESIZABLE | c.SDL_WINDOW_HIGH_PIXEL_DENSITY | c.SDL_WINDOW_OPENGL) orelse
+            return error.WindowCreate;
+        return .{ .handle = w };
+    }
+
+    /// Size of the drawable area in pixels (differs from window size on HiDPI).
+    pub fn pixelSize(self: Window) struct { width: u32, height: u32 } {
+        var w: c_int = 0;
+        var h: c_int = 0;
+        _ = c.SDL_GetWindowSizeInPixels(self.handle, &w, &h);
+        return .{ .width = @intCast(@max(w, 1)), .height = @intCast(@max(h, 1)) };
+    }
+
+    pub fn glCreateContext(self: Window) Error!GlContext {
+        const ctx = c.SDL_GL_CreateContext(self.handle) orelse return error.GlContext;
+        _ = c.SDL_GL_SetSwapInterval(1);
+        return .{ .ctx = ctx, .window = self.handle };
     }
 
     pub fn destroy(self: Window) void {

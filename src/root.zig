@@ -7,6 +7,7 @@ pub const config = @import("config.zig");
 pub const xml = @import("xml.zig");
 pub const entity = @import("entity.zig");
 pub const platform = @import("platform.zig");
+pub const gl = @import("gl.zig");
 pub const nif = @import("nif.zig");
 pub const dds = @import("dds.zig");
 pub const model = @import("model.zig");
@@ -18,6 +19,7 @@ test {
     _ = xml;
     _ = entity;
     _ = platform;
+    _ = gl;
     _ = nif;
     _ = dds;
     _ = model;
