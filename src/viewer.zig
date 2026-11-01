@@ -235,10 +235,15 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
 }
 
 fn poseWorld(world: []Mat4, nf: *const nif.Nif, root: Mat4, anim: ?*const bf.Animation, t: f32) void {
-    for (nf.roots) |r| poseNode(world, nf, r, root, anim, t);
+    for (nf.roots) |r| poseNode(world, nf, r, root, anim, t, false);
 }
 
-fn poseNode(world: []Mat4, nf: *const nif.Nif, ref: nif.Ref, parent: Mat4, anim: ?*const bf.Animation, t: f32) void {
+/// Like `poseWorld`, but also positions every level of detail of LOD nodes.
+fn poseWorldAllLods(world: []Mat4, nf: *const nif.Nif, root: Mat4) void {
+    for (nf.roots) |r| poseNode(world, nf, r, root, null, 0, true);
+}
+
+fn poseNode(world: []Mat4, nf: *const nif.Nif, ref: nif.Ref, parent: Mat4, anim: ?*const bf.Animation, t: f32, all_lods: bool) void {
     if (ref < 0) return;
     const idx: usize = @intCast(ref);
     switch (nf.blocks[idx]) {
@@ -257,10 +262,12 @@ fn poseNode(world: []Mat4, nf: *const nif.Nif, ref: nif.Ref, parent: Mat4, anim:
             world[idx] = w;
             if (n.kind == .lod) {
                 // Child 0 is the most detailed level.
-                if (n.children.len > 0) poseNode(world, nf, n.children[0], w, anim, t);
+                if (all_lods) {
+                    for (n.children) |c| poseNode(world, nf, c, w, anim, t, true);
+                } else if (n.children.len > 0) poseNode(world, nf, n.children[0], w, anim, t, false);
                 return;
             }
-            for (n.children) |c| poseNode(world, nf, c, w, anim, t);
+            for (n.children) |c| poseNode(world, nf, c, w, anim, t, all_lods);
         },
         .geometry => |geo| world[idx] = mul(parent, fromTransform(geo.av.transform)),
         else => {},
@@ -373,6 +380,9 @@ const Skin = struct {
 };
 
 pub const Draw = struct {
+    /// Camera distances (near, far) between which this draw is shown, for
+    /// models with levels of detail.
+    lod_range: [2]f32 = .{ 0, std.math.inf(f32) },
     /// Bounding sphere (x, y, z, radius). In a cached model's draws it is in
     /// model space; `place` turns it into world space. A negative radius
     /// means "never cull".
@@ -480,6 +490,12 @@ pub const Scene = struct {
     model_bounds: std.StringHashMapUnmanaged([2]f32) = .empty,
     build_r: f32 = 0,
     build_h: f32 = 0,
+    /// While building placed models: keep every LOD level, tagged by range.
+    lod_all: bool = false,
+    cur_lod: [2]f32 = .{ 0, std.math.inf(f32) },
+    /// Multiplies LOD distances: the data's ranges are tuned for the
+    /// original game's closer camera.
+    lod_bias: f32 = 3.0,
     actor_models: std.StringHashMapUnmanaged(?*ActorTemplate) = .empty,
     anim_cache: std.StringHashMapUnmanaged(?*bf.Animation) = .empty,
     /// Loaded models by lowercase path, as draws relative to the model origin.
@@ -646,18 +662,31 @@ pub const Scene = struct {
     }
 
     fn walk(self: *Scene, nf: *const nif.Nif, ref: nif.Ref) !void {
+        return self.walkLod(nf, ref, .{ 0, std.math.inf(f32) });
+    }
+
+    /// Visits the scene graph. With `lod_all` (placed models) every level of
+    /// detail is built and tagged with the distances it is shown at;
+    /// otherwise only the most detailed child of a LOD node is used.
+    fn walkLod(self: *Scene, nf: *const nif.Nif, ref: nif.Ref, lod: [2]f32) !void {
         if (ref < 0) return;
         switch (nf.blocks[@intCast(ref)]) {
             .node => |n| {
                 if (n.av.flags & 1 != 0) return; // hidden
                 if (n.kind == .lod) {
-                    if (n.children.len > 0) try self.walk(nf, n.children[0]);
+                    if (self.lod_all and n.lod_ranges.len > 0) {
+                        for (n.children, 0..) |c, i| {
+                            const r = n.lod_ranges[@min(i, n.lod_ranges.len - 1)];
+                            try self.walkLod(nf, c, .{ @max(lod[0], r[0]), @min(lod[1], r[1]) });
+                        }
+                    } else if (n.children.len > 0) try self.walkLod(nf, n.children[0], lod);
                     return;
                 }
-                for (n.children) |c| try self.walk(nf, c);
+                for (n.children) |c| try self.walkLod(nf, c, lod);
             },
             .geometry => |geo| {
                 if (geo.av.flags & 1 != 0) return;
+                self.cur_lod = lod;
                 try self.addGeometry(nf, geo, @intCast(ref));
             },
             else => {},
@@ -777,6 +806,7 @@ pub const Scene = struct {
                 const r: f32 = if (skin != null) -1 else @sqrt(half[0] * half[0] + half[1] * half[1] + half[2] * half[2]) * sc;
                 break :blk .{ wc[0], wc[1], wc[2], r };
             },
+            .lod_range = self.cur_lod,
             .texture = tex,
             .decal = decal,
             .decal_mode = decal_mode,
@@ -871,7 +901,9 @@ pub const Scene = struct {
     /// (used for placement previews and selection highlights).
     pub fn addOverlay(self: *Scene, draws: []const Draw, m: Mat4, tint: [4]f32) !void {
         for (draws) |d| {
+            if (d.lod_range[0] > 0) continue; // previews use the detailed level only
             var c = d;
+            c.lod_range = .{ 0, std.math.inf(f32) };
             c.world = mul(m, d.world);
             c.dynamic = false;
             c.skin = null;
@@ -1076,7 +1108,10 @@ pub const Scene = struct {
         self.world = tmp;
         defer self.world = saved;
         const start = self.draws.items.len;
-        self.pose(&nf, null, 0);
+        poseWorldAllLods(self.world, &nf, identity);
+        const saved_lod = self.lod_all;
+        self.lod_all = true;
+        defer self.lod_all = saved_lod;
         for (nf.roots) |r| try self.walk(&nf, r);
         const out = try gpa.dupe(Draw, self.draws.items[start..]);
         self.draws.shrinkRetainingCapacity(start);
@@ -1212,7 +1247,9 @@ pub const Scene = struct {
         }
         if (head) |h| if (tmpl.head_node) |node| {
             if (try self.loadModel(h.model)) |hdraws| for (hdraws) |d| {
+                if (d.lod_range[0] > 0) continue; // heads use the detailed level
                 var c = d;
+                c.lod_range = .{ 0, std.math.inf(f32) };
                 c.inst = idx;
                 c.attach_node = node;
                 c.dynamic = false;
@@ -1315,6 +1352,8 @@ pub const Scene = struct {
                 const sc = @sqrt(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]);
                 c.bound = .{ wc[0], wc[1], wc[2], d.bound[3] * sc };
             } else c.bound[3] = -1;
+            const lsc = @sqrt(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]) * self.lod_bias;
+            c.lod_range = .{ d.lod_range[0] * lsc, d.lod_range[1] * lsc };
             self.applySwaps(&c, swaps);
             try self.draws.append(self.gpa, c);
         }
@@ -1655,6 +1694,13 @@ const Frustum = struct {
 
 fn drawItem(gfx: *Gfx, scene: *Scene, d: Draw, fr: *const Frustum) void {
     if (!fr.sees(d.bound)) return;
+    if (d.bound[3] >= 0 and (d.lod_range[0] > 0 or d.lod_range[1] < std.math.inf(f32))) {
+        const dx = d.bound[0] - fr.eye[0];
+        const dy = d.bound[1] - fr.eye[1];
+        const dz = d.bound[2] - fr.eye[2];
+        const dist = @sqrt(dx * dx + dy * dy + dz * dz);
+        if (dist < d.lod_range[0] or dist >= d.lod_range[1]) return;
+    }
     const g = &gfx.g;
     g.activeTexture(gl.TEXTURE0 + 1);
     g.bindTexture(gl.TEXTURE_2D, d.texture2);

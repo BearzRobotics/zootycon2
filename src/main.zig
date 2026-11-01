@@ -514,6 +514,7 @@ pub fn main(init: std.process.Init) !void {
                 switch (b) {
                     .node => |n| {
                         try o.print("[{d}] {s} \"{s}\" t=({d:.2},{d:.2},{d:.2}) s={d:.2}\n", .{ ref, @tagName(n.kind), n.av.net.name, n.av.transform.translation[0], n.av.transform.translation[1], n.av.transform.translation[2], n.av.transform.scale });
+                        for (n.lod_ranges, 0..) |lr, li| try o.print("    lod {d}: {d:.1} .. {d:.1}\n", .{ li, lr[0], lr[1] });
                         for (n.children) |c| try node(o, nf, c, depth + 1);
                     },
                     .geometry => |g| {

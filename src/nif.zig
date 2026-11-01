@@ -46,6 +46,9 @@ pub const Node = struct {
     av: AvObject,
     children: []const Ref,
     effects: []const Ref,
+    /// For `lod` nodes: the (near, far) camera distances at which each child
+    /// is shown, in the node's own units. Empty otherwise.
+    lod_ranges: []const [2]f32 = &.{},
 };
 
 pub const Geometry = struct {
@@ -433,15 +436,18 @@ fn readBlock(r: *Reader, type_name: []const u8) Error!Block {
         const children = try r.refs();
         const effects = try r.refs();
         var kind: NodeKind = .node;
+        var ranges: []const [2]f32 = &.{};
         if (eql(u8, type_name, "NiBillboardNode")) {
             kind = .billboard;
         } else if (eql(u8, type_name, "NiLODNode")) {
             kind = .lod;
             try r.skip(4 + 12); // index, LOD center
             const n = try r.count(try r.u32_(), 8);
-            try r.skip(n * 8); // LOD ranges
+            const rs = try a.alloc([2]f32, n);
+            for (rs) |*x| x.* = .{ try r.f32_(), try r.f32_() };
+            ranges = rs;
         }
-        return .{ .node = .{ .kind = kind, .av = av, .children = children, .effects = effects } };
+        return .{ .node = .{ .kind = kind, .av = av, .children = children, .effects = effects, .lod_ranges = ranges } };
     }
 
     if (eql(u8, type_name, "NiTriShape") or eql(u8, type_name, "NiTriStrips") or
