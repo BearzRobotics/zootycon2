@@ -93,6 +93,30 @@ pub const Graph = struct {
     }
 };
 
+/// A fence segment animals cannot cross.
+pub const Wall = struct { ax: f32, ay: f32, bx: f32, by: f32 };
+
+fn ccw(ax: f32, ay: f32, bx: f32, by: f32, cx: f32, cy: f32) f32 {
+    return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+}
+
+/// True if segment p-q properly crosses segment a-b.
+fn segmentsCross(p: [2]f32, q: [2]f32, w: Wall) bool {
+    const d1 = ccw(p[0], p[1], q[0], q[1], w.ax, w.ay);
+    const d2 = ccw(p[0], p[1], q[0], q[1], w.bx, w.by);
+    const d3 = ccw(w.ax, w.ay, w.bx, w.by, p[0], p[1]);
+    const d4 = ccw(w.ax, w.ay, w.bx, w.by, q[0], q[1]);
+    return ((d1 > 0) != (d2 > 0)) and ((d3 > 0) != (d4 > 0));
+}
+
+/// Fences that block movement. Curbs and gates do not.
+fn blocksMovement(kind: []const u8) bool {
+    var buf: [64]u8 = undefined;
+    if (kind.len > buf.len) return true;
+    const k = std.ascii.lowerString(&buf, kind);
+    return std.mem.indexOf(u8, k, "curb") == null and std.mem.indexOf(u8, k, "gate") == null;
+}
+
 pub fn classify(binder: []const u8) Kind {
     const people = [_][]const u8{ "guest", "staff", "keeper", "maintenance", "vet", "tour", "worker", "photographer", "specialist" };
     var buf: [128]u8 = undefined;
@@ -107,6 +131,8 @@ pub const Sim = struct {
     rng: std.Random.DefaultPrng,
     agents: std.ArrayList(Agent) = .empty,
     graph: Graph = .{},
+    walls: std.ArrayList(Wall) = .empty,
+    walls_for: usize = std.math.maxInt(usize),
     /// Simulated seconds since the start.
     time: f64 = 0,
     /// World revision the walkway graph was built from.
@@ -121,7 +147,13 @@ pub const Sim = struct {
 
     pub fn deinit(self: *Sim) void {
         self.agents.deinit(self.gpa);
+        self.walls.deinit(self.gpa);
         self.graph.deinit();
+    }
+
+    fn blocked(self: *const Sim, p: [2]f32, q: [2]f32) bool {
+        for (self.walls.items) |w| if (segmentsCross(p, q, w)) return true;
+        return false;
     }
 
     pub fn agentFor(self: *Sim, id: u32) ?*Agent {
@@ -162,6 +194,19 @@ pub const Sim = struct {
                 .target = .{ a.position[0], a.position[1] },
                 .timer = self.rng.random().float(f32) * 3.0,
             });
+        }
+        if (self.walls_for != w.fences.items.len) {
+            self.walls.clearRetainingCapacity();
+            for (w.fences.items) |f| {
+                if (!blocksMovement(f.kind)) continue;
+                try self.walls.append(self.gpa, .{
+                    .ax = f.position[0],
+                    .ay = f.position[1],
+                    .bx = f.position[0] + @cos(f.rotation) * 3.0,
+                    .by = f.position[1] + @sin(f.rotation) * 3.0,
+                });
+            }
+            self.walls_for = w.fences.items.len;
         }
         if (self.graph_paths != w.paths.items.len) {
             self.graph.deinit();
@@ -277,8 +322,15 @@ pub const Sim = struct {
         // Only advance once roughly facing the target.
         if (@abs(diff) < 1.0) {
             const step = @min(ag.speed * dt, dist);
-            ag.pos[0] += dx / dist * step;
-            ag.pos[1] += dy / dist * step;
+            const nx = ag.pos[0] + dx / dist * step;
+            const ny = ag.pos[1] + dy / dist * step;
+            // Animals cannot walk through fences: stop and rest instead.
+            if (ag.kind == .animal and self.blocked(.{ ag.pos[0], ag.pos[1] }, .{ nx, ny })) {
+                self.rest(ag);
+                return;
+            }
+            ag.pos[0] = nx;
+            ag.pos[1] = ny;
             ag.pos[2] = w.terrain.zAt(ag.pos[0], ag.pos[1]) + ag.ground_offset;
         }
     }
@@ -379,6 +431,39 @@ test "animals wander near home and the sim is deterministic" {
     }
     try testing.expectEqual(results[0][0], results[1][0]);
     try testing.expectEqual(results[0][1], results[1][1]);
+}
+
+test "animals stay inside a fenced pen" {
+    const gpa = testing.allocator;
+    var w = world_mod.World.init(gpa, try testTerrain(gpa));
+    defer w.deinit();
+    // A 12x12 pen from (24,24) to (36,36) built from 3-unit segments.
+    const corners = [_][3]f32{ .{ 24, 24, 0 }, .{ 36, 24, std.math.pi / 2.0 }, .{ 36, 36, std.math.pi }, .{ 24, 36, 3.0 * std.math.pi / 2.0 } };
+    for (corners) |c| {
+        for (0..4) |i| {
+            const k = @as(f32, @floatFromInt(i)) * 3.0;
+            _ = try w.addFence("zoowall", .{ c[0] + @cos(c[2]) * k, c[1] + @sin(c[2]) * k, 0 }, c[2]);
+        }
+    }
+    _ = try w.addActor("Lion_Adult_F", .{ 30, 30, 6 }, world_mod.identity_rotation, &.{});
+    var sim = Sim.init(gpa, 99);
+    defer sim.deinit();
+    try sim.sync(&w);
+    try testing.expectEqual(@as(usize, 16), sim.walls.items.len);
+    var moved = false;
+    for (0..6000) |_| {
+        sim.advance(&w, 1.0 / 30.0);
+        const p = sim.agents.items[0].pos;
+        if (@abs(p[0] - 30) > 1 or @abs(p[1] - 30) > 1) moved = true;
+        try testing.expect(p[0] > 24 and p[0] < 36 and p[1] > 24 and p[1] < 36);
+    }
+    try testing.expect(moved);
+}
+
+test "curbs and gates do not block" {
+    try testing.expect(blocksMovement("zoowall"));
+    try testing.expect(!blocksMovement("curb_jungle"));
+    try testing.expect(!blocksMovement("alpinefencegate_df"));
 }
 
 test "removing an actor removes its agent" {

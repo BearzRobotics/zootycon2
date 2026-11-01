@@ -1,0 +1,101 @@
+# zootycon2
+
+An open-source engine for Zoo Tycoon 2, written in Zig. It plays the game from
+the player's own install: **no game assets are included**, and the engine
+never runs or patches `zt.exe`. See `specs.md` for goals and the clean-room
+rules.
+
+Status: an asset pipeline (every model, texture, animation and map in the
+game loads), a renderer, a small simulation, and build tools. It is not yet
+a playable game. There is no UI, economy, or real AI.
+
+## Build and run
+
+Needs Zig 0.17. SDL3 is vendored; there is nothing else to install.
+
+```
+zig build                      # builds zig-out/bin/zootycon2
+zig build test                 # unit tests
+zig build run -- <command>     # run a command
+```
+
+Game data is found the way OpenMW finds its data: `--data <dir>`,
+`$ZOOTYCON2_DATA`, `~/.config/zootycon2/config` (`data=<dir>`), a working copy
+made by `import`, then standard Windows/Wine locations. `zootycon2 where`
+shows what it would use.
+
+## Commands
+
+Playing and viewing
+
+| command | what it does |
+| --- | --- |
+| `play <map\|save>` | Interactive zoo with build tools and the simulation. |
+| `map <file.zt2>` | Look at a map (no tools, no simulation). |
+| `view <model>` | View one `.nif` or `.bfm` model; `--anim <name\|file.bf>` plays an animation. |
+
+`play` accepts a map from the game data (`maps/default/alpinesml.zt2`) or a
+save on disk. Useful flags: `--no-sim`, `--view` (no tools), `--seed N`,
+`--save-dir D`, `--at X Y --yaw R --pitch R --zoom F` (camera), `--shot`
+(write a PPM screenshot to stdout and exit).
+
+Data checks (all run over the whole game and print a summary)
+
+`nifcheck`, `ddscheck`, `bfcheck`, `modelcheck`, `xmlcheck`, `mapcheck`.
+Others: `list`, `cat`, `export`, `elements`, `entity`, `entities`, `info`.
+
+## Controls in `play`
+
+Right-drag orbits, the wheel zooms, WASD pans, Esc quits. The window title
+shows the current tool, the selected item, and the last message.
+
+| key | action |
+| --- | --- |
+| `1` | select (click an object; `Delete` or `X` removes it) |
+| `2` | place an object (`[` `]` choose, `R` rotates) |
+| `3` | fence line (click the start, then each corner) |
+| `4` | paint path tiles (click or drag) |
+| `5` `6` `7` | raise, lower, flatten terrain (hold left mouse) |
+| `8` | place an animal or person (`[` `]` choose) |
+| `Z` | undo |
+| `Tab`, `,`, `.` | pause, slower, faster simulation |
+| `F5`, `F9` | save, load the last save |
+
+Hold Shift with `[` `]` to jump ten items. Saves go to
+`~/.local/share/zootycon2/saves/<map>.zt2` (plus a `.dat` with the edited
+terrain). They use the game's own map schema, so `play` and `map` open them;
+the original game does not.
+
+## Driving it without a person
+
+`play` can be scripted, which is how most of it is tested:
+
+* `--script "cmd; cmd"` runs build commands at startup (`prop X Y`,
+  `fence X1 Y1 X2 Y2`, `raise X Y SECONDS`, `wait SECONDS`, `save`, ...).
+* `--input "action; action"` plays a **virtual mouse and keyboard** through
+  SDL's real event queue, one action per frame: `at X Y` (pointer over a world
+  position), `click`, `down 3`, `key 2`, `keydown w`, `wheel 3`, `wait 30`,
+  `cam YAW PITCH DIST [CX CY]`, `info`, `shot`, `quit`. The same code runs as
+  for a person at the keyboard.
+* `--shot` writes the final frame as a PPM to stdout.
+
+```
+zootycon2 play maps/default/alpinesml.zt2 --shot \
+  --input "cam -1 0.9 70 60 60; key 3; at 45 45; click; at 75 45; click; shot" > out.ppm
+```
+
+## Layout
+
+| file | purpose |
+| --- | --- |
+| `vfs.zig`, `archive.zig`, `config.zig` | game data: z2f archives (plain ZIP), loose files, data discovery |
+| `xml.zig`, `entity.zig` | XML reader; entity definitions and their inheritance |
+| `nif.zig`, `bf.zig`, `dds.zig`, `model.zig` | models, skeletal animation, textures, manifests/materials |
+| `terrain.zig`, `map.zig` | `.dat` terrain and `.zt2` maps/saves |
+| `world.zig` | the editable world and its save format |
+| `sim.zig` | agents, walkway graph, idle/walk tasks, fence blocking |
+| `viewer.zig`, `gl.zig`, `platform/` | OpenGL 3.3 renderer, SDL3 binding |
+| `app.zig` | the interactive app: tools, picking, undo, save/load, input driver |
+
+Format notes live in the header comment of each reader (`bf.zig` and
+`terrain.zig` document formats that had no public documentation).
