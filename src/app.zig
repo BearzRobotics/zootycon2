@@ -74,6 +74,15 @@ pub const Tool = enum {
     }
 };
 
+/// A clickable rectangle in pixel coordinates.
+const Hit = struct {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    action: union(enum) { tool: Tool, pick: usize, none },
+};
+
 const SelKind = enum { prop, fence, path, actor };
 const Sel = struct { kind: SelKind, id: u32 };
 
@@ -169,6 +178,10 @@ pub const App = struct {
     title_dirty: bool = true,
     undo: std.ArrayList(UndoOp) = .empty,
 
+    // Clickable interface, rebuilt each frame by `overlay`.
+    hits: std.ArrayList(Hit) = .empty,
+    over_ui: bool = false,
+
     // Virtual input.
     input_cmds: std.ArrayList([]const u8) = .empty,
     input_i: usize = 0,
@@ -190,6 +203,7 @@ pub const App = struct {
         for (self.undo.items) |op| if (op == .added) self.gpa.free(op.added);
         self.undo.deinit(self.gpa);
         self.input_cmds.deinit(self.gpa);
+        self.hits.deinit(self.gpa);
         self.props.deinit(self.gpa);
         self.fence_kinds.deinit(self.gpa);
         self.path_textures.deinit(self.gpa);
@@ -1070,8 +1084,17 @@ pub const App = struct {
                 sc.lshift, sc.rshift => self.shift = false,
                 else => {},
             },
+            .mouse_wheel => |w| if (self.opts.tools and self.over_ui and w.dy != 0) {
+                // Scrolling over the item list moves through the items.
+                self.stepItemBy(if (w.dy > 0) -1 else 1);
+                ctx.consumed = true;
+            },
             .mouse_button => |b| if (self.opts.tools and b.button == 1) {
                 if (b.down) {
+                    if (self.uiClick(b.x, b.y, ctx)) {
+                        ctx.consumed = true;
+                        return;
+                    }
                     self.lmb = true;
                     self.click(ctx);
                 } else {
@@ -1081,6 +1104,91 @@ pub const App = struct {
             },
             else => {},
         }
+    }
+
+    /// Pixel position of a window-coordinate mouse position.
+    fn toPixels(ctx: *const viewer.FrameCtx, x: f32, y: f32) [2]f32 {
+        const sx = @as(f32, @floatFromInt(ctx.width)) / @as(f32, @floatFromInt(@max(ctx.win_width, 1)));
+        const sy = @as(f32, @floatFromInt(ctx.height)) / @as(f32, @floatFromInt(@max(ctx.win_height, 1)));
+        return .{ x * sx, y * sy };
+    }
+
+    fn hitAt(self: *const App, px: [2]f32) ?Hit {
+        for (self.hits.items) |h| {
+            if (px[0] >= h.x and px[0] < h.x + h.w and px[1] >= h.y and px[1] < h.y + h.h) return h;
+        }
+        return null;
+    }
+
+    /// Handles a click on the interface; true if it hit a button or the list.
+    fn uiClick(self: *App, x: f32, y: f32, ctx: *const viewer.FrameCtx) bool {
+        const h = self.hitAt(toPixels(ctx, x, y)) orelse return false;
+        switch (h.action) {
+            .tool => |t| {
+                self.tool = t;
+                self.fence_start = null;
+                self.title_dirty = true;
+            },
+            .pick => |i| self.pickItem(i),
+            .none => {},
+        }
+        return true;
+    }
+
+    fn itemCount(self: *const App) usize {
+        return switch (self.tool) {
+            .prop => self.props.items.len,
+            .fence => self.fence_kinds.items.len,
+            .path => self.path_textures.items.len,
+            .actor => self.actor_names.items.len,
+            else => 0,
+        };
+    }
+
+    fn itemIndex(self: *const App) usize {
+        return switch (self.tool) {
+            .prop => self.prop_i,
+            .fence => self.fence_i,
+            .path => self.path_i,
+            .actor => self.actor_i,
+            else => 0,
+        };
+    }
+
+    fn itemLabel(self: *const App, i: usize) []const u8 {
+        return switch (self.tool) {
+            .prop => std.fs.path.basename(self.props.items[i]),
+            .fence => self.fence_kinds.items[i],
+            .path => std.fs.path.basename(self.path_textures.items[i]),
+            .actor => self.actor_names.items[i],
+            else => "",
+        };
+    }
+
+    /// Chooses catalog item `i` for the current tool.
+    fn pickItem(self: *App, i: usize) void {
+        if (i >= self.itemCount()) return;
+        switch (self.tool) {
+            .prop => self.prop_i = i,
+            .fence => self.fence_i = i,
+            .path => self.path_i = i,
+            .actor => {
+                if (self.actorDef(self.actor_names.items[i]) == null) {
+                    self.say("{s} has no model", .{self.actor_names.items[i]});
+                    return;
+                }
+                self.actor_i = i;
+            },
+            else => {},
+        }
+        self.title_dirty = true;
+    }
+
+    fn stepItemBy(self: *App, delta: i32) void {
+        const saved = self.shift;
+        self.shift = false;
+        self.stepItem(delta);
+        self.shift = saved;
     }
 
     fn toolKey(self: *App, code: u32) void {
@@ -1271,6 +1379,10 @@ pub const App = struct {
         const sw = viewer.Ui.textWidth(status, scale);
         try ui.label(ui.width - sw - pad, pad, scale, status, white);
 
+        // Clickable interface.
+        self.hits.clearRetainingCapacity();
+        if (self.opts.tools) try self.drawControls(ui, scale, pad, line);
+
         // Selection.
         if (self.selected) |sel| {
             const t = std.fmt.bufPrint(&buf, "SELECTED {s} #{d}", .{ @tagName(sel.kind), sel.id }) catch "";
@@ -1298,6 +1410,73 @@ pub const App = struct {
             }
         }
         _ = ctx;
+    }
+
+    fn drawButton(self: *App, ui: *viewer.Ui, x: f32, y: f32, scale: f32, text: []const u8, color: [4]f32, action: @TypeOf(@as(Hit, undefined).action)) !f32 {
+        const pad = 2 * scale;
+        const w = viewer.Ui.textWidth(text, scale) + pad * 2 - scale;
+        const h = 7 * scale + pad * 2;
+        try ui.rect(x - pad, y - pad, w, h, .{ 0, 0, 0, 0.6 });
+        _ = try ui.text(x, y, scale, text, color);
+        try self.hits.append(self.gpa, .{ .x = x - pad, .y = y - pad, .w = w, .h = h, .action = action });
+        return h;
+    }
+
+    /// Tool buttons down the left edge and the item list on the right.
+    fn drawControls(self: *App, ui: *viewer.Ui, scale: f32, pad: f32, line: f32) !void {
+        const white = [4]f32{ 1, 1, 1, 1 };
+        const yellow = [4]f32{ 1, 0.92, 0.5, 1 };
+        const tools = [_]struct { t: Tool, label: []const u8 }{
+            .{ .t = .select, .label = "1 SELECT" },
+            .{ .t = .prop, .label = "2 OBJECT" },
+            .{ .t = .fence, .label = "3 FENCE" },
+            .{ .t = .path, .label = "4 PATH" },
+            .{ .t = .raise, .label = "5 RAISE" },
+            .{ .t = .lower, .label = "6 LOWER" },
+            .{ .t = .flatten, .label = "7 FLATTEN" },
+            .{ .t = .actor, .label = "8 ANIMAL" },
+        };
+        var y = pad + line * 4.5;
+        for (tools) |t| {
+            const h = try self.drawButton(ui, pad + 2 * scale, y, scale, t.label, if (self.tool == t.t) yellow else white, .{ .tool = t.t });
+            y += h + 2 * scale;
+        }
+
+        // The item list for tools that choose from a catalog.
+        const n = self.itemCount();
+        if (n == 0) return;
+        const rows: usize = 16;
+        const cur = self.itemIndex();
+        const first = if (n <= rows) 0 else @min(cur -| rows / 2, n - rows);
+        const shown = @min(rows, n);
+        const max_chars = 30;
+        const panel_w = (max_chars + 1) * 6 * scale;
+        const x = ui.width - panel_w - pad;
+        const top = pad + line * 2.5;
+        var title_buf: [48]u8 = undefined;
+        const title = std.fmt.bufPrint(&title_buf, "{s} {d}/{d}", .{ self.tool.label(), cur + 1, n }) catch "";
+        try ui.rect(x - 2 * scale, top - 2 * scale, panel_w + 4 * scale, line * @as(f32, @floatFromInt(shown + 1)) + 4 * scale, .{ 0, 0, 0, 0.55 });
+        _ = try ui.text(x, top, scale, title, white);
+        // The whole panel is one hit area so the wheel scrolls it; rows override it.
+        try self.hits.append(self.gpa, .{
+            .x = x - 2 * scale,
+            .y = top - 2 * scale,
+            .w = panel_w + 4 * scale,
+            .h = line * @as(f32, @floatFromInt(shown + 1)) + 4 * scale,
+            .action = .none,
+        });
+        var row: usize = 0;
+        while (row < shown) : (row += 1) {
+            const i = first + row;
+            const ry = top + line * @as(f32, @floatFromInt(row + 1));
+            const label = self.itemLabel(i);
+            const clipped = label[0..@min(label.len, max_chars)];
+            const is_cur = i == cur;
+            if (is_cur) try ui.rect(x - scale, ry - scale, panel_w + 2 * scale, line, .{ 0.3, 0.3, 0.1, 0.8 });
+            _ = try ui.text(x, ry, scale, clipped, if (is_cur) yellow else white);
+            // Row hits go before the panel hit so they win.
+            try self.hits.insert(self.gpa, 0, .{ .x = x - scale, .y = ry - scale, .w = panel_w + 2 * scale, .h = line, .action = .{ .pick = i } });
+        }
     }
 
     fn updateTitle(self: *App, win: platform.Window) void {
@@ -1345,8 +1524,9 @@ pub const App = struct {
 
         // Hover point under the mouse.
         if (self.opts.tools) {
+            self.over_ui = self.hitAt(toPixels(ctx, ctx.mouse[0], ctx.mouse[1])) != null;
             const r = ctx.cam.ray(ctx.mouse[0], ctx.mouse[1], @floatFromInt(ctx.win_width), @floatFromInt(ctx.win_height));
-            self.hover = terrainHit(&self.world.terrain, r.origin, r.dir);
+            self.hover = if (self.over_ui) null else terrainHit(&self.world.terrain, r.origin, r.dir);
             if (self.lmb and self.hover != null) switch (self.tool) {
                 .raise, .lower, .flatten => self.brush(self.hover.?[0], self.hover.?[1], ctx.dt),
                 .path => self.placePath(self.hover.?) catch {},

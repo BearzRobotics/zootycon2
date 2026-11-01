@@ -63,7 +63,9 @@ shows the current tool, the selected item, and the last message.
 | `F5`, `F9` | save, load the last save |
 
 An on-screen display shows the current tool, a hint for it, the simulation
-status and a key reference; `F1` hides the help. Hold Shift with `[` `]` to
+status and a key reference; `F1` hides the help. The tool buttons on the left
+can be clicked, and tools that choose from a catalog show a list on the right:
+click an entry or scroll the wheel over it. Hold Shift with `[` `]` to
 jump ten items. Saves go to
 `~/.local/share/zootycon2/saves/<map>.zt2` (plus a `.dat` with the edited
 terrain). They use the game's own map schema, so `play` and `map` open them;
@@ -106,7 +108,8 @@ zootycon2 play maps/default/alpinesml.zt2 --shot \
 | `terrain.zig`, `map.zig` | `.dat` terrain and `.zt2` maps/saves |
 | `world.zig` | the editable world and its save format |
 | `environment.zig` | time-of-day lights, ambient and fog from the game's lighting files |
-| `sim.zig` | agents, walkway graph, idle/walk tasks, fence blocking |
+| `sim.zig` | agents, walkway graph, fence blocking; people walk the paths, animals run their data-driven brains |
+| `ai.zig` | the game's task templates and behaviour sets (`ai/tasks`): need-based task choice and posture-aware behaviour execution for animals |
 | `viewer.zig`, `gl.zig`, `platform/` | OpenGL 3.3 renderer, SDL3 binding |
 | `app.zig` | the interactive app: tools, picking, undo, save/load, input driver |
 

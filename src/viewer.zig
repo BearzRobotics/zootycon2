@@ -1869,6 +1869,8 @@ pub const FrameCtx = struct {
     /// which are pixels, on HiDPI displays).
     win_width: u32 = 1,
     win_height: u32 = 1,
+    /// Set by a hook to say it handled the current event.
+    consumed: bool = false,
     /// Set by a hook to capture the screenshot on this frame.
     shot_request: bool = false,
     /// For synthetic input.
@@ -1995,6 +1997,16 @@ pub fn loopWith(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Came
             ctx.height = size.height;
             hooks.event(ev, &ctx);
             if (ctx.quit) break :main;
+            // A hook that used the event (a click on a button) keeps the
+            // camera from reacting to it too.
+            if (ctx.consumed) {
+                ctx.consumed = false;
+                switch (ev) {
+                    .mouse_move => |m| ctx.mouse = .{ m.x, m.y },
+                    else => {},
+                }
+                continue;
+            }
             switch (ev) {
             .quit => break :main,
             .key_down => |k| switch (k.scancode) {
