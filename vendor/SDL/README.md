@@ -1,0 +1,148 @@
+<!--
+© 2024 Carl Åstholm
+SPDX-License-Identifier: MIT
+-->
+
+# SDL ported to the Zig build system
+
+This is a port of [SDL](https://libsdl.org/) to the Zig build system, packaged for the Zig package manager.
+
+## Usage
+
+Requires Zig 0.16.0 or 0.17.0-dev (master).
+
+```sh
+zig fetch --save git+https://github.com/castholm/SDL.git
+```
+
+```zig
+const sdl_dep = b.dependency("sdl", .{
+    .target = target,
+    .optimize = optimize,
+    //.preferred_linkage = .static,
+    //.strip = null,
+    //.sanitize_c = null,
+    //.pic = null,
+    //.lto = null,
+    //.emscripten_pthreads = false,
+    //.system_include_path = null,
+    //.system_framework_path = null,
+    //.library_path = null,
+});
+const sdl_lib = sdl_dep.artifact("SDL3");
+const sdl_test_lib = sdl_dep.artifact("SDL3_test");
+```
+
+## Examples
+
+Example projects using this SDL package:
+
+- [castholm/zig-examples/breakout](https://github.com/castholm/zig-examples/tree/master/breakout)
+- [castholm/zig-examples/snake](https://github.com/castholm/zig-examples/tree/master/snake)
+- [castholm/zig-examples/opengl-hexagon](https://github.com/castholm/zig-examples/tree/master/opengl-hexagon)
+
+## Supported targets
+
+<table>
+<thead>
+<tr><th rowspan=2 align=center valign=center>Target<th colspan=3 align=center>Host
+<tr><th align=center>Windows<th align=center>Linux<th align=center>macOS
+<tbody>
+<tr><th colspan=4 align=left>First-class targets
+<tr><td><code>x86_64-windows-gnu</code><td align=center>✅<td align=center>✅<td align=center>✅
+<tr><td><code>x86_64-linux-gnu</code><td align=center>✅<td align=center>✅<td align=center>✅
+<tr><td><code>aarch64-macos-none</code><td align=center>❌<td align=center>❌<td align=center>🉑
+<tr><td><code>wasm32-emscripten-musl</code><td align=center>🉑<td align=center>🉑<td align=center>🉑
+<tbody>
+<tr><th colspan=4 align=left>Second-class targets (experimental)
+<tr><td><code>x86_64-windows-msvc</code><td align=center>🉑<td align=center>❌<td align=center>❌
+<tr><td><code>aarch64-windows-gnu</code><td align=center>✅<td align=center>✅<td align=center>✅
+<tr><td><code>aarch64-windows-msvc</code><td align=center>🉑<td align=center>❌<td align=center>❌
+<tr><td><code>x86_64-linux-musl</code><td align=center>✅<td align=center>✅<td align=center>✅
+<tr><td><code>aarch64-linux-gnu</code><td align=center>✅<td align=center>✅<td align=center>✅
+<tr><td><code>aarch64-linux-musl</code><td align=center>✅<td align=center>✅<td align=center>✅
+<tr><td><code>x86_64-macos-none</code><td align=center>❌<td align=center>❌<td align=center>🉑
+</table>
+
+Legend:
+
+- ✅ Supported
+- 🉑 Supported, but requires external SDKs
+- ❌ Not supported
+
+### Windows
+
+Building for `x86_64-windows-gnu` from any host system works out of the box.
+
+Building for `msvc` targets requires Microsoft Visual C++ and the Windows 11 SDK to be installed on the host Windows system.
+
+`aarch64` Windows support is experimental and not yet actively tested.
+
+### Linux
+
+Building for `x86_64-linux-gnu/musl` from any host system works out of the box.
+
+The [SDL_linux_deps](https://github.com/castholm/SDL_linux_deps) package provides supplementary headers and source files required for compiling for Linux.
+
+`aarch64` Linux support is experimental and not yet actively tested.
+
+### macOS
+
+Building for `aarch64/x86_64-macos` requires Xcode 14.1 or later to be installed on the host macOS system.
+
+> [!NOTE]
+> **Cross-compiling for macOS from Windows or Linux host systems is not supported** because [the Xcode and Apple SDKs Agreement](https://www.apple.com/legal/sla/docs/xcode.pdf) explicitly prohibits using macOS SDK files from non-Apple-branded systems.
+
+When building for non-native macOS targets (for example for x86-64 from an AArch64 Mac), you need to explicitly provide paths to the macOS SDK header, framework and library directories:
+
+```sh
+macos_sdk_path="$(xcrun --sdk macosx --show-sdk-path)"
+zig build -Dtarget=x86_64-macos \
+	"-Dsystem_include_path=$macos_sdk_path/usr/include" \
+	"-Dsystem_framework_path=$macos_sdk_path/System/Library/Frameworks" \
+	"-Dlibrary_path=$macos_sdk_path/usr/lib"
+```
+
+### Emscripten (web)
+
+> [!IMPORTANT]
+> Before you proceed, please understand that **Emscripten is an advanced target** and that **building an SDL app for the Web requires significantly more effort compared to Windows, Linux or macOS**:
+>
+> - You will need to compile your app into an object file or a static library instead of an executable.
+> - If you use libc headers (e.g. by translating C code to Zig), you will need to add the `include` directory inside the Emscripten sysroot to your header search paths.
+> - To build the final HTML/JS/Wasm artifacts, you will need to invoke `emcc` using run steps.
+> - You will likely need to do a lot of your own research and try out different combinations of `emcc` options to get satisfactory results. Make sure you read [the official Emscripten documentation](https://emscripten.org/docs/index.html) as well as [SDL's Emscripten README](https://wiki.libsdl.org/SDL3/README/emscripten).
+>
+> In addition, note that Emscripten 4.0.4 or later will provide its own official port of SDL3 if you pass `-sUSE_SDL=3` to `emcc`. Depending on your use case **you might not even need this package at all**.
+>
+> Refer to [the example projects](#examples) for examples on how to set up your `build.zig` for building for the Web.
+
+Building for `wasm32-emscripten` requires an Emscripten development environment to be set up on the host system. It is strongly recommended that you use [the Emscripten SDK](https://emscripten.org/docs/getting_started/downloads.html) for installing and managing Emscripten.
+
+When building for Emscripten, you need to explicitly provide a path to the Emscripten SDK header directory:
+
+```sh
+zig build -Dtarget=wasm32-emscripten "-Dsystem_include_path=$(em-config CACHE)/sysroot/include"
+```
+
+Depending on the state of your Emscripten cache, you might need to run `embuilder build sysroot` to ensure that the Emscripten sysroot is built before you run `zig build`.
+
+To build with [pthreads support](https://emscripten.org/docs/porting/pthreads.html), specify `.emscripten_pthreads = true`.
+
+## Contributing
+
+Pull requests have been disabled for this repository. If you encounter a problem with the package, or have suggestions for improvements, please open an issue.
+
+## License
+
+[![REUSE status](https://api.reuse.software/badge/github.com/castholm/SDL)](https://api.reuse.software/info/github.com/castholm/SDL)
+
+This repository is [REUSE-compliant](https://reuse.software/). The effective SPDX license expression for the repository as a whole is:
+
+```
+(BSD-3-Clause OR GPL-3.0 OR HIDAPI) AND Apache-2.0 AND BSD-3-Clause AND CC0-1.0 AND HIDAPI AND HPND-sell-variant AND MIT AND SunPro AND Unlicense AND Zlib
+```
+
+(This is identical to the upstream SDL repository, just expressed in more explicit terms.)
+
+Copyright notices and license texts have been reproduced in [`LICENSE.txt`](LICENSE.txt), for your convenience.

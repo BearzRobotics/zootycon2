@@ -1,0 +1,6 @@
+# © 2024 Carl Åstholm
+# SPDX-License-Identifier: MIT
+
+/_tmp/
+.zig-cache/
+zig-out/
