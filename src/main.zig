@@ -4,7 +4,7 @@ const zootycon2 = @import("zootycon2");
 const config = zootycon2.config;
 
 const usage =
-    \\usage: zootycon2 [--data <dir>] <command> [args]
+    \\usage: zootycon2 [--data <dir>] [--mod <dir>]... <command> [args]
     \\
     \\Game data is found via --data, $ZOOTYCON2_DATA, the config file
     \\(~/.config/zootycon2/config, line "data=<dir>"), an imported working copy,
@@ -45,6 +45,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Split --data from the positional arguments.
     var data_opt: ?[]const u8 = null;
+    var mods: std.ArrayList([]const u8) = .empty;
     var pos: std.ArrayList([]const u8) = .empty;
     var i: usize = 1;
     while (i < argv.len) : (i += 1) {
@@ -52,6 +53,10 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             if (i >= argv.len) return fail("--data needs a directory\n");
             data_opt = argv[i];
+        } else if (std.mem.eql(u8, argv[i], "--mod")) {
+            i += 1;
+            if (i >= argv.len) return fail("--mod needs a directory\n");
+            try mods.append(init.arena.allocator(), argv[i]);
         } else try pos.append(init.arena.allocator(), argv[i]);
     }
     if (pos.items.len == 0) return fail(usage);
@@ -123,6 +128,42 @@ pub fn main(init: std.process.Init) !void {
         var extras = try config.extraDlcDirs(gpa, io, env);
         defer config.freeList(gpa, &extras);
         for (extras.items) |x| try vfs.addExtraDir(x);
+    }
+
+    // Override folders (texture packs, replacement data): ./mods/*, the user
+    // data dir's mods/*, then --mod directories; later ones win.
+    {
+        const user = config.userDataDir(gpa, env) catch null;
+        defer if (user) |u| gpa.free(u);
+        var roots: [2]?[]u8 = .{ null, null };
+        defer for (roots) |r| if (r) |x| gpa.free(x);
+        roots[0] = gpa.dupe(u8, "mods") catch null;
+        if (user) |u| roots[1] = std.fs.path.join(gpa, &.{ u, "mods" }) catch null;
+        for (roots) |r0| {
+            const r = r0 orelse continue;
+            var d = Io.Dir.cwd().openDir(io, r, .{ .iterate = true }) catch continue;
+            defer d.close(io);
+            var names: std.ArrayList([]u8) = .empty;
+            defer {
+                for (names.items) |n| gpa.free(n);
+                names.deinit(gpa);
+            }
+            var it = d.iterate();
+            while (it.next(io) catch null) |e| {
+                if (e.kind == .directory) try names.append(gpa, try gpa.dupe(u8, e.name));
+            }
+            std.mem.sort([]u8, names.items, {}, struct {
+                fn less(_: void, a: []u8, b: []u8) bool {
+                    return std.ascii.lessThanIgnoreCase(a, b);
+                }
+            }.less);
+            for (names.items) |n| {
+                const full = try std.fs.path.join(gpa, &.{ r, n });
+                defer gpa.free(full);
+                vfs.addOverrideDir(full) catch {};
+            }
+        }
+        for (mods.items) |m| vfs.addOverrideDir(m) catch return fail("--mod: cannot open directory\n");
     }
 
     if (std.mem.eql(u8, cmd, "info")) {

@@ -85,6 +85,14 @@ jump ten items. Saves go to
 terrain). They use the game's own map schema, so `play` and `map` open them;
 the original game does not.
 
+## Texture packs and mods
+
+Folders of loose files override the game's files of the same path (case and
+slashes ignored), so a replacement `textures/foo.dds` or edited XML just
+works. Folders are read from `mods/<name>/` next to where you run the game,
+`<user data dir>/mods/<name>/`, and any `--mod <dir>` (repeatable); later ones
+win.
+
 ## Performance
 
 Large maps have thousands of draw calls. Placed objects are frustum- and

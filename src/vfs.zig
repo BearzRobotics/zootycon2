@@ -19,6 +19,9 @@ pub const Vfs = struct {
     winners: std.StringHashMapUnmanaged(*Archive) = .empty,
     /// Normalized path -> real path on disk (owned by `strings`).
     loose: std.StringHashMapUnmanaged([]const u8) = .empty,
+    /// Mod/override files: normalized path -> absolute real path. These win
+    /// over everything else (texture packs, replacement data).
+    over: std.StringHashMapUnmanaged([]const u8) = .empty,
     strings: std.heap.ArenaAllocator,
     root: ?Io.Dir = null,
 
@@ -31,6 +34,7 @@ pub const Vfs = struct {
         self.archives.deinit(self.gpa);
         self.winners.deinit(self.gpa);
         self.loose.deinit(self.gpa);
+        self.over.deinit(self.gpa);
         self.strings.deinit();
         if (self.root) |d| d.close(self.io);
     }
@@ -119,6 +123,24 @@ pub const Vfs = struct {
         }
     }
 
+    /// Mounts a folder of loose files that override the game's: a file at
+    /// `<dir>/textures/foo.dds` replaces `textures/foo.dds`. Later calls win.
+    pub fn addOverrideDir(self: *Vfs, dir_path: []const u8) !void {
+        const io = self.io;
+        var dir = Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return error.FileNotFound;
+        defer dir.close(io);
+        const arena = self.strings.allocator();
+        const base = try Io.Dir.cwd().realPathFileAlloc(io, dir_path, arena);
+        var walker = try dir.walk(self.gpa);
+        defer walker.deinit();
+        while (try walker.next(io)) |e| {
+            if (e.kind != .file) continue;
+            const key = try normalize(arena, e.path);
+            const real = try std.fs.path.join(arena, &.{ base, e.path });
+            try self.over.put(self.gpa, key, real);
+        }
+    }
+
     fn hasArchive(self: *const Vfs, basename: []const u8, size: u64) bool {
         for (self.archives.items) |a| {
             if (a.size == size and std.ascii.eqlIgnoreCase(std.fs.path.basename(a.path), basename)) return true;
@@ -129,13 +151,14 @@ pub const Vfs = struct {
     pub fn exists(self: *const Vfs, path: []const u8) bool {
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         const key = normalizeBuf(&buf, path) orelse return false;
-        return self.winners.contains(key) or self.loose.contains(key);
+        return self.over.contains(key) or self.winners.contains(key) or self.loose.contains(key);
     }
 
     /// Returns the contents of `path`; caller owns the result.
     pub fn read(self: *Vfs, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         const key = normalizeBuf(&buf, path) orelse return error.FileNotFound;
+        if (self.over.get(key)) |real| return Io.Dir.cwd().readFileAlloc(self.io, real, gpa, .unlimited);
         if (self.winners.get(key)) |a| return a.readAlloc(gpa, key);
         if (self.loose.get(key)) |real| {
             const root = self.root orelse return error.FileNotFound;
@@ -146,19 +169,25 @@ pub const Vfs = struct {
 
     /// Calls `f(ctx, normalized_path)` for every visible file.
     pub fn forEach(self: *const Vfs, ctx: anytype, comptime f: fn (@TypeOf(ctx), []const u8) anyerror!void) !void {
+        var oit = self.over.keyIterator();
+        while (oit.next()) |k| try f(ctx, k.*);
         var it = self.winners.keyIterator();
-        while (it.next()) |k| try f(ctx, k.*);
+        while (it.next()) |k| if (!self.over.contains(k.*)) try f(ctx, k.*);
         var lit = self.loose.iterator();
         while (lit.next()) |e| {
-            if (!self.winners.contains(e.key_ptr.*)) try f(ctx, e.key_ptr.*);
+            if (!self.winners.contains(e.key_ptr.*) and !self.over.contains(e.key_ptr.*)) try f(ctx, e.key_ptr.*);
         }
     }
 
     pub fn fileCount(self: *const Vfs) usize {
-        var n = self.winners.count();
+        var n = self.over.count();
+        var wit = self.winners.keyIterator();
+        while (wit.next()) |k| {
+            if (!self.over.contains(k.*)) n += 1;
+        }
         var lit = self.loose.keyIterator();
         while (lit.next()) |k| {
-            if (!self.winners.contains(k.*)) n += 1;
+            if (!self.winners.contains(k.*) and !self.over.contains(k.*)) n += 1;
         }
         return n;
     }
