@@ -45,6 +45,7 @@ const sc = struct {
     const period: u32 = 55;
     const t: u32 = 23;
     const m: u32 = 16;
+    const b: u32 = 5;
     const esc: u32 = 41;
     const f1: u32 = 58;
     const f2: u32 = 59;
@@ -92,7 +93,7 @@ const Hit = struct {
 };
 
 /// Which full-screen menu is open (if any).
-const Menu = enum { none, pause, maps, saves, settings };
+const Menu = enum { none, pause, maps, saves, settings, finances };
 
 const MenuAction = enum {
     close_menu,
@@ -100,6 +101,7 @@ const MenuAction = enum {
     open_saves,
     open_maps,
     open_settings,
+    open_finances,
     back,
     quit,
     toggle_help,
@@ -633,14 +635,14 @@ pub const App = struct {
     }
 
     /// Takes `cost` from the budget; refuses (and says so) when it cannot be paid.
-    fn charge(self: *App, cost: f64, what: []const u8) bool {
+    fn charge(self: *App, cost: f64, what: []const u8, cat: sim_mod.Cat) bool {
         if (cost <= 0) return true;
         if (self.sim.zoo.income < cost) {
             self.sfx("noplacement");
             self.say("cannot afford {s}: ${d:.0}, have ${d:.0}", .{ what, cost, self.sim.zoo.income });
             return false;
         }
-        self.sim.zoo.income -= cost;
+        self.sim.zoo.spend(cat, cost);
         return true;
     }
 
@@ -680,7 +682,7 @@ pub const App = struct {
     fn placeProp(self: *App, at: [3]f32) !void {
         if (self.props.items.len == 0) return;
         const model = self.props.items[self.prop_i];
-        if (!self.charge(prop_cost, std.fs.path.basename(model))) return;
+        if (!self.charge(prop_cost, std.fs.path.basename(model), .construction)) return;
         const id = try self.world.addProp(model, at, world_mod.yawRotation(self.yaw), 1.0, &.{});
         self.pushAdded(&.{id}, prop_cost);
         self.sfx("placement");
@@ -696,7 +698,7 @@ pub const App = struct {
         };
         _ = def;
         const cost = self.costOf(name, 100);
-        if (!self.charge(cost, name)) return;
+        if (!self.charge(cost, name, if (sim_mod.classify(name) == .person) .staff else .animals)) return;
         const id = try self.world.addActor(name, at, world_mod.yawRotation(self.yaw), &.{});
         self.pushAdded(&.{id}, cost);
         self.sfx("placement");
@@ -708,7 +710,7 @@ pub const App = struct {
         const name = self.food_names.items[self.food_i];
         const m = viewer.binderModel(self.gpa, &self.reg, name, "mainObj") orelse return;
         const cost = self.costOf(name, 50);
-        if (!self.charge(cost, name)) return;
+        if (!self.charge(cost, name, .construction)) return;
         const id = try self.world.addPropEx(m.file, at, world_mod.yawRotation(self.yaw), m.scale, &.{}, name, 100);
         self.pushAdded(&.{id}, cost);
         self.sfx("place_building");
@@ -740,7 +742,7 @@ pub const App = struct {
             filled += 1;
         }
         if (filled == 0) return self.say("select a feeder first (tool 1), then press F", .{});
-        self.sim.zoo.income -= refill_cost * @as(f64, @floatFromInt(filled));
+        self.sim.zoo.spend(.supplies, refill_cost * @as(f64, @floatFromInt(filled)));
         self.say("refilled {d} feeder(s) for ${d:.0}", .{ filled, refill_cost * @as(f64, @floatFromInt(filled)) });
     }
 
@@ -751,7 +753,7 @@ pub const App = struct {
         for (self.world.paths.items) |p| {
             if (@abs(p.position[0] - x) < 1.0 and @abs(p.position[1] - y) < 1.0) return;
         }
-        if (!self.charge(path_cost, "path")) return;
+        if (!self.charge(path_cost, "path", .construction)) return;
         const id = try self.world.addPath(self.path_textures.items[self.path_i], .{ x, y }, 6, 6);
         self.pushAdded(&.{id}, path_cost);
         self.sfx("place_path");
@@ -771,7 +773,7 @@ pub const App = struct {
         defer ids.deinit(self.gpa);
         const each = self.costOf(kind, 20);
         const total = each * @as(f64, @floatFromInt(n));
-        if (!self.charge(total, kind)) return;
+        if (!self.charge(total, kind, .construction)) return;
         for (0..n) |i| {
             const k = @as(f32, @floatFromInt(i)) * 3.0;
             const x = a[0] + @cos(theta) * k;
@@ -817,6 +819,7 @@ pub const App = struct {
             .added => |a| {
                 for (a.ids) |id| _ = self.world.remove(id);
                 self.sim.zoo.income += a.cost;
+                self.sim.zoo.month.spent[@intFromEnum(sim_mod.Cat.construction)] -= a.cost;
                 self.gpa.free(a.ids);
             },
             .removed_prop => |p| _ = self.world.addProp(p.model, p.position, p.rotation, p.scale, p.swaps) catch {},
@@ -1594,6 +1597,7 @@ pub const App = struct {
                     },
                     sc.f1 => self.show_help = !self.show_help,
                     sc.m => self.toggleSound(),
+                    sc.b => self.openMenu(if (self.menu == .finances) .none else .finances),
                     sc.t => {
                         self.tod_auto = !self.tod_auto;
                         self.say("time of day {s}", .{if (self.tod_auto) "running" else "stopped"});
@@ -1711,6 +1715,7 @@ pub const App = struct {
             .open_saves => self.openMenu(.saves),
             .open_maps => self.openMenu(.maps),
             .open_settings => self.openMenu(.settings),
+            .open_finances => self.openMenu(.finances),
             .back => self.openMenu(.pause),
             .quit => ctx.quit = true,
             .toggle_help => self.show_help = !self.show_help,
@@ -1797,8 +1802,10 @@ pub const App = struct {
             .maps => "CHOOSE A MAP",
             .saves => "LOAD A SAVED ZOO",
             .settings => "SETTINGS",
+            .finances => "FINANCES",
             .none => "",
         };
+        if (self.menu == .finances) return self.drawFinances(ui, scale);
         const tscale = scale * 1.6;
         const tw = viewer.Ui.textWidth(title, tscale);
         var y = ui.height * 0.12;
@@ -1856,8 +1863,93 @@ pub const App = struct {
                 y += 6 * scale;
                 y += try self.menuButton(ui, y, scale, "BACK", .{ .menu = .back }, false);
             },
-            .none => {},
+            .finances, .none => {},
         }
+    }
+
+    fn money(buf: []u8, v: f64) []const u8 {
+        const r: i64 = @intFromFloat(@round(v));
+        return if (r < 0)
+            std.fmt.bufPrint(buf, "-${d}", .{-r}) catch ""
+        else
+            std.fmt.bufPrint(buf, "${d}", .{r}) catch "";
+    }
+
+    /// The finance screen: income and spending by category for this month,
+    /// last month and overall, on the game's own panel art.
+    fn drawFinances(self: *App, ui: *viewer.Ui, scale: f32) !void {
+        const z = &self.sim.zoo;
+        const white = [4]f32{ 1, 1, 1, 1 };
+        const gold = [4]f32{ 1, 0.92, 0.5, 1 };
+        const green = [4]f32{ 0.55, 0.95, 0.55, 1 };
+        const red = [4]f32{ 1, 0.55, 0.5, 1 };
+        const grey = [4]f32{ 0.8, 0.85, 0.9, 1 };
+        const s = scale * 0.68;
+        const cw = 13 * 6 * s; // column width
+        const name_w = 15 * 6 * s;
+        const panel_w = name_w + cw * 3 + 16 * s;
+        const rows: f32 = 2 + 7 + 1 + 7 + 1 + 2;
+        const row_h = 11 * s;
+        const panel_h = 22 * s + rows * row_h + 34 * s;
+        const x0 = (ui.width - panel_w) / 2;
+        var y = @max(8, (ui.height - panel_h) / 2);
+        ui.template("blank", x0, y, panel_w, panel_h, s / 2, 1.5);
+        ui.template("header", x0 + 4 * s, y + 4 * s, panel_w - 8 * s, 16 * s, s / 2, 1.5);
+        var tb: [48]u8 = undefined;
+        const title = std.fmt.bufPrint(&tb, "FINANCES   MONTH {d}", .{z.months + 1}) catch "FINANCES";
+        _ = try ui.text(x0 + 12 * s, y + 8 * s, s, title, gold);
+        y += 24 * s;
+        const x = x0 + 8 * s;
+        // Column headings.
+        const heads = [_][]const u8{ "THIS MONTH", "LAST MONTH", "ALL TIME" };
+        for (heads, 0..) |h, i| {
+            const hx = x + name_w + cw * @as(f32, @floatFromInt(i)) + cw - viewer.Ui.textWidth(h, s);
+            _ = try ui.text(hx, y, s, h, grey);
+        }
+        y += row_h;
+        const ledgers = [3]sim_mod.Ledger{ z.month, z.last_month, z.total };
+        var buf: [32]u8 = undefined;
+        // Income, then expenses.
+        for ([2]bool{ true, false }) |income| {
+            _ = try ui.text(x, y, s, if (income) "INCOME" else "EXPENSES", gold);
+            y += row_h;
+            var sums: [3]f64 = @splat(0);
+            for (sim_mod.cat_names, 0..) |name, ci| {
+                _ = try ui.text(x + 4 * s, y, s, name, white);
+                for (ledgers, 0..) |l, i| {
+                    const v = if (income) l.earned[ci] else l.spent[ci];
+                    sums[i] += v;
+                    const txt = money(&buf, v);
+                    const vx = x + name_w + cw * @as(f32, @floatFromInt(i)) + cw - viewer.Ui.textWidth(txt, s);
+                    _ = try ui.text(vx, y, s, txt, if (v == 0) grey else white);
+                }
+                y += row_h;
+            }
+            _ = try ui.text(x, y, s, if (income) "TOTAL INCOME" else "TOTAL EXPENSES", white);
+            for (sums, 0..) |v, i| {
+                const txt = money(&buf, v);
+                const vx = x + name_w + cw * @as(f32, @floatFromInt(i)) + cw - viewer.Ui.textWidth(txt, s);
+                _ = try ui.text(vx, y, s, txt, if (income) green else red);
+            }
+            y += row_h * 1.4;
+        }
+        _ = try ui.text(x, y, s, "NET", white);
+        for (ledgers, 0..) |l, i| {
+            const net = l.totalEarned() - l.totalSpent();
+            const txt = money(&buf, net);
+            const vx = x + name_w + cw * @as(f32, @floatFromInt(i)) + cw - viewer.Ui.textWidth(txt, s);
+            _ = try ui.text(vx, y, s, txt, if (net >= 0) green else red);
+        }
+        y += row_h;
+        _ = try ui.text(x, y, s, "BALANCE", gold);
+        const bt = money(&buf, z.income);
+        _ = try ui.text(x + name_w + cw * 3 - viewer.Ui.textWidth(bt, s), y, s, bt, gold);
+        y += row_h * 1.6;
+        const bw = 12 * 6 * s;
+        const bx = (ui.width - bw) / 2;
+        ui.template("buttonbar", bx, y, bw, 14 * s, s / 2, 1);
+        _ = try ui.text(bx + (bw - viewer.Ui.textWidth("CLOSE", s)) / 2, y + 4 * s, s, "CLOSE", white);
+        try self.hits.append(self.gpa, .{ .x = bx, .y = y, .w = bw, .h = 14 * s, .action = .{ .menu = .close_menu } });
     }
 
     /// Pixel position of a window-coordinate mouse position.
@@ -2364,6 +2456,9 @@ pub const App = struct {
             const h = try self.drawButton(ui, pad + 2 * scale, y, scale, t.label, if (self.tool == t.t) yellow else white, .{ .tool = t.t });
             y += h + 2 * scale;
         }
+
+        y += 4 * scale;
+        _ = try self.drawButton(ui, pad + 2 * scale, y, scale, "B FINANCES", white, .{ .menu = .open_finances });
 
         // The item list for tools that choose from a catalog.
         const n = self.itemCount();

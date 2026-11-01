@@ -144,8 +144,35 @@ pub const Venue = struct {
     uses: u32 = 0,
 };
 
+/// What money was earned or spent on, for the finance screen.
+pub const Cat = enum { admission, concessions, construction, animals, staff, upkeep, supplies };
+pub const cat_count = 7;
+pub const cat_names = [cat_count][]const u8{ "ADMISSION", "SHOPS", "CONSTRUCTION", "ANIMALS", "STAFF", "UPKEEP", "SUPPLIES" };
+
+pub const Ledger = struct {
+    earned: [cat_count]f64 = @splat(0),
+    spent: [cat_count]f64 = @splat(0),
+
+    pub fn totalEarned(self: Ledger) f64 {
+        var t: f64 = 0;
+        for (self.earned) |v| t += v;
+        return t;
+    }
+    pub fn totalSpent(self: Ledger) f64 {
+        var t: f64 = 0;
+        for (self.spent) |v| t += v;
+        return t;
+    }
+};
+
 /// Zoo-wide numbers shown to the player.
 pub const Zoo = struct {
+    /// This month, the one before, and everything so far.
+    month: Ledger = .{},
+    last_month: Ledger = .{},
+    total: Ledger = .{},
+    months: u32 = 0,
+
     guests_total: u32 = 0,
     guests_left: u32 = 0,
     /// Admission taken so far.
@@ -158,6 +185,18 @@ pub const Zoo = struct {
     /// Purchases made at shops, and upkeep paid on buildings.
     sales: u32 = 0,
     upkeep_paid: f64 = 0,
+
+    pub fn earn(self: *Zoo, cat: Cat, amount: f64) void {
+        self.income += amount;
+        self.month.earned[@intFromEnum(cat)] += amount;
+        self.total.earned[@intFromEnum(cat)] += amount;
+    }
+
+    pub fn spend(self: *Zoo, cat: Cat, amount: f64) void {
+        self.income -= amount;
+        self.month.spent[@intFromEnum(cat)] += amount;
+        self.total.spent[@intFromEnum(cat)] += amount;
+    }
 };
 
 /// What a keeper is doing about feeders.
@@ -706,13 +745,16 @@ pub const Sim = struct {
         if (self.month_timer <= 0) {
             self.month_timer += self.month_secs;
             for (self.agents.items) |ag| if (ag.wage > 0) {
-                self.zoo.income -= ag.wage;
+                self.zoo.spend(.staff, ag.wage);
                 self.zoo.wages_paid += ag.wage;
             };
             for (self.venues.items) |v| {
-                self.zoo.income -= v.upkeep;
+                self.zoo.spend(.upkeep, v.upkeep);
                 self.zoo.upkeep_paid += v.upkeep;
             }
+            self.zoo.last_month = self.zoo.month;
+            self.zoo.month = .{};
+            self.zoo.months += 1;
         }
         for (self.agents.items) |*ag| {
             ag.anim_time += dt;
@@ -878,7 +920,7 @@ pub const Sim = struct {
                 if (ag.timer > 0) return;
                 if (self.feederById(ag.job_feeder)) |f| {
                     f.food = 100;
-                    self.zoo.income -= self.refill_fee;
+                    self.zoo.spend(.supplies, self.refill_fee);
                     self.zoo.refills += 1;
                 }
                 ag.job = .none;
@@ -957,7 +999,7 @@ pub const Sim = struct {
         try self.agents.append(self.gpa, try self.makeAgent(a, w));
         self.agents.items[self.agents.items.len - 1].node = node;
         self.zoo.guests_total += 1;
-        self.zoo.income += if (isChild(binder)) self.child_price else self.adult_price;
+        self.zoo.earn(.admission, if (isChild(binder)) self.child_price else self.adult_price);
     }
 
     /// Sets the guest's route to `to` from the node it stands on.
@@ -1044,7 +1086,7 @@ pub const Sim = struct {
                     ag.needs[i] = 0;
                     v.uses += 1;
                     self.zoo.sales += 1;
-                    self.zoo.income += v.price;
+                    self.zoo.earn(.concessions, v.price);
                     ag.happiness = @min(100, ag.happiness + 4 + (if (v.need == .gift) @as(f32, 4) else 0));
                     ag.anim_name = "Stand_Idle";
                     break;
