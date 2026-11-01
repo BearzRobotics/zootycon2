@@ -335,10 +335,7 @@ pub fn main(init: std.process.Init) !void {
             } else return fail("play <map|save> [--save-dir D] [--seed N] [--no-sim] [--view] [--shot] [--at X Y] [--yaw R] [--pitch R] [--zoom F]\n");
         }
         if (aopts.save_dir.len == 0) {
-            const base = if (env.get("XDG_DATA_HOME")) |x| try std.fs.path.join(gpa, &.{ x, "zootycon2", "saves" }) else blk: {
-                const home = env.get("HOME") orelse return fail("HOME is not set; pass --save-dir\n");
-                break :blk try std.fs.path.join(gpa, &.{ home, ".local", "share", "zootycon2", "saves" });
-            };
+            const base = config.savesDir(gpa, env) catch return fail("cannot work out where to save; pass --save-dir\n");
             save_dir_owned = base;
             aopts.save_dir = base;
         }

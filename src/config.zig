@@ -10,8 +10,11 @@
 //!   5. standard install locations
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const Environ = std.process.Environ;
+
+const is_windows = builtin.os.tag == .windows;
 
 pub const Source = enum { command_line, environment, config_file, working_copy, standard_location };
 
@@ -38,15 +41,37 @@ pub fn isInstall(io: Io, path: []const u8) bool {
 }
 
 pub fn configDir(gpa: std.mem.Allocator, env: *const Environ.Map) ![]u8 {
+    if (is_windows) {
+        const base = env.get("APPDATA") orelse return error.NoHomeDirectory;
+        return std.fs.path.join(gpa, &.{ base, "zootycon2" });
+    }
     if (env.get("XDG_CONFIG_HOME")) |x| return std.fs.path.join(gpa, &.{ x, "zootycon2" });
     const home = env.get("HOME") orelse return error.NoHomeDirectory;
     return std.fs.path.join(gpa, &.{ home, ".config", "zootycon2" });
 }
 
-pub fn workingCopyDir(gpa: std.mem.Allocator, env: *const Environ.Map) ![]u8 {
-    if (env.get("XDG_DATA_HOME")) |x| return std.fs.path.join(gpa, &.{ x, "zootycon2", "data" });
+/// Where this user's engine data lives: saves and the imported working copy.
+pub fn userDataDir(gpa: std.mem.Allocator, env: *const Environ.Map) ![]u8 {
+    if (is_windows) {
+        const base = env.get("LOCALAPPDATA") orelse env.get("APPDATA") orelse return error.NoHomeDirectory;
+        return std.fs.path.join(gpa, &.{ base, "zootycon2" });
+    }
+    if (env.get("XDG_DATA_HOME")) |x| return std.fs.path.join(gpa, &.{ x, "zootycon2" });
     const home = env.get("HOME") orelse return error.NoHomeDirectory;
-    return std.fs.path.join(gpa, &.{ home, ".local", "share", "zootycon2", "data" });
+    return std.fs.path.join(gpa, &.{ home, ".local", "share", "zootycon2" });
+}
+
+pub fn workingCopyDir(gpa: std.mem.Allocator, env: *const Environ.Map) ![]u8 {
+    const base = try userDataDir(gpa, env);
+    defer gpa.free(base);
+    return std.fs.path.join(gpa, &.{ base, "data" });
+}
+
+/// Where saves go by default.
+pub fn savesDir(gpa: std.mem.Allocator, env: *const Environ.Map) ![]u8 {
+    const base = try userDataDir(gpa, env);
+    defer gpa.free(base);
+    return std.fs.path.join(gpa, &.{ base, "saves" });
 }
 
 /// Finds the game data. Caller owns `path` of the result.
@@ -138,6 +163,16 @@ fn isDir(io: Io, path: []const u8) bool {
 }
 
 fn windowsRoots(gpa: std.mem.Allocator, env: *const Environ.Map, list: *std.ArrayList([]u8)) !void {
+    if (is_windows) {
+        // Native Windows: the system drive first, then the other common drives.
+        const sys = env.get("SystemDrive") orelse "C:";
+        try list.append(gpa, try std.fmt.allocPrint(gpa, "{s}\\", .{sys}));
+        for ([_][]const u8{ "D:\\", "E:\\", "F:\\" }) |d| {
+            if (std.ascii.startsWithIgnoreCase(sys, d[0..2])) continue;
+            try list.append(gpa, try gpa.dupe(u8, d));
+        }
+        return;
+    }
     try list.append(gpa, try gpa.dupe(u8, "/mnt/c"));
     if (env.get("WINEPREFIX")) |w| try list.append(gpa, try std.fs.path.join(gpa, &.{ w, "drive_c" }));
     if (env.get("HOME")) |h| try list.append(gpa, try std.fs.path.join(gpa, &.{ h, ".wine", "drive_c" }));
