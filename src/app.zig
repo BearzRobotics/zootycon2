@@ -97,7 +97,7 @@ const Hit = struct {
 pub const BuyTab = enum { fence, path, building, scenery, animal, food, staff, deform };
 
 /// Which full-screen menu is open (if any).
-const Menu = enum { none, pause, maps, saves, settings, finances, new_zoo };
+const Menu = enum { none, pause, maps, saves, settings, finances, new_zoo, save_as };
 
 const MenuAction = enum {
     close_menu,
@@ -115,6 +115,8 @@ const MenuAction = enum {
     rot_right,
     toggle_hud,
     open_new_zoo,
+    open_save_as,
+    confirm_save_as,
     new_zoo_size,
     new_zoo_biome,
     new_zoo_start,
@@ -296,6 +298,13 @@ pub const App = struct {
     /// The game's own HUD, drawn from its layout files.
     hud: ?struct { shell: uilayout.Layout, bucks: ?uilayout.Layout, info: ?uilayout.Layout = null } = null,
     hud_on: bool = true,
+    /// A name the player gave the zoo's save (empty: derived from the map).
+    custom_name: [48]u8 = undefined,
+    custom_len: usize = 0,
+    /// Text being typed on the save screen.
+    name_buf: [40]u8 = undefined,
+    name_len: usize = 0,
+    blink: u32 = 0,
     nz_size: u8 = 1,
     nz_biome: u8 = 6,
     /// Interface size multiplier (settings: UI SIZE).
@@ -942,7 +951,7 @@ pub const App = struct {
     // ------------------------------------------------------- save and load
 
     fn saveName(self: *const App, buf: []u8) []const u8 {
-        var name: []const u8 = self.world.name;
+        var name: []const u8 = if (self.custom_len > 0) self.custom_name[0..self.custom_len] else self.world.name;
         if (std.mem.indexOfScalar(u8, name, ':')) |i| name = name[i + 1 ..];
         if (name.len == 0) name = "zoo";
         var n: usize = 0;
@@ -952,6 +961,26 @@ pub const App = struct {
             n += 1;
         }
         return buf[0..n];
+    }
+
+    fn setCustomName(self: *App, name: []const u8) void {
+        var n: usize = 0;
+        for (name) |ch| {
+            if (n >= self.custom_name.len) break;
+            self.custom_name[n] = if (std.ascii.isAlphanumeric(ch) or ch == '_' or ch == '-') ch else '_';
+            n += 1;
+        }
+        self.custom_len = n;
+    }
+
+    /// The character a key types on the save screen, if it types one.
+    fn typedChar(scancode: u32, shift: bool) ?u8 {
+        if (scancode >= 4 and scancode <= 29) return @intCast('a' + (scancode - 4));
+        if (scancode >= 30 and scancode <= 38) return @intCast('1' + (scancode - 30));
+        if (scancode == 39) return '0';
+        if (scancode == 45) return if (shift) '_' else '-';
+        if (scancode == 44) return '_';
+        return null;
     }
 
     fn saveWorld(self: *App) !void {
@@ -1023,6 +1052,7 @@ pub const App = struct {
             self.say("could not start the zoo ({s})", .{@errorName(e)});
             return;
         };
+        self.custom_len = 0;
         self.say("new {d}x{d} tile zoo", .{ tiles, tiles });
     }
 
@@ -1492,6 +1522,9 @@ pub const App = struct {
             .{ .n = "tab", .c = sc.tab },
             .{ .n = "delete", .c = sc.delete },
             .{ .n = "esc", .c = 41 },
+            .{ .n = "enter", .c = 40 },
+            .{ .n = "space", .c = 44 },
+            .{ .n = "backspace", .c = 42 },
             .{ .n = "f5", .c = sc.f5 },
             .{ .n = "f9", .c = sc.f9 },
             .{ .n = "f1", .c = sc.f1 },
@@ -1796,6 +1829,16 @@ pub const App = struct {
             self.save_paths.append(self.gpa, full) catch continue;
             self.save_labels.append(self.gpa, label) catch continue;
         }
+        // Alphabetical, keeping paths and labels together.
+        const n = self.save_labels.items.len;
+        var i: usize = 1;
+        while (i < n) : (i += 1) {
+            var j = i;
+            while (j > 0 and std.ascii.lessThanIgnoreCase(self.save_labels.items[j], self.save_labels.items[j - 1])) : (j -= 1) {
+                std.mem.swap([]const u8, &self.save_labels.items[j], &self.save_labels.items[j - 1]);
+                std.mem.swap([]const u8, &self.save_paths.items[j], &self.save_paths.items[j - 1]);
+            }
+        }
     }
 
     fn openMenu(self: *App, m: Menu) void {
@@ -1809,6 +1852,21 @@ pub const App = struct {
         switch (a) {
             .close_menu => self.openMenu(.none),
             .save => {
+                self.saveWorld() catch |e| self.say("save failed: {s}", .{@errorName(e)});
+                self.openMenu(.none);
+            },
+            .open_save_as => {
+                var nb: [64]u8 = undefined;
+                const cur = self.saveName(&nb);
+                const n = @min(cur.len, self.name_buf.len);
+                @memcpy(self.name_buf[0..n], cur[0..n]);
+                self.name_len = n;
+                self.openMenu(.save_as);
+                self.buildSaveList();
+            },
+            .confirm_save_as => {
+                if (self.name_len == 0) return self.say("type a name first", .{});
+                self.setCustomName(self.name_buf[0..self.name_len]);
                 self.saveWorld() catch |e| self.say("save failed: {s}", .{@errorName(e)});
                 self.openMenu(.none);
             },
@@ -1892,10 +1950,12 @@ pub const App = struct {
         switch (self.menu) {
             .maps => if (i < self.map_paths.items.len) {
                 self.loadPath(self.map_paths.items[i]) catch {};
+                self.custom_len = 0;
                 self.openMenu(.none);
             },
             .saves => if (i < self.save_paths.items.len) {
                 self.loadPath(self.save_paths.items[i]) catch {};
+                self.setCustomName(self.save_labels.items[i]);
                 self.openMenu(.none);
             },
             else => {},
@@ -1906,10 +1966,25 @@ pub const App = struct {
     fn menuEvent(self: *App, ev: platform.Event, ctx: *viewer.FrameCtx) void {
         ctx.consumed = true;
         switch (ev) {
-            .key_down => |k| if (!k.repeat and k.scancode == sc.esc) {
-                switch (self.menu) {
-                    .pause => self.openMenu(.none),
-                    else => self.openMenu(.pause),
+            .key_down => |k| {
+                if (self.menu == .save_as and k.scancode != sc.esc) {
+                    if (k.scancode == 42) {
+                        if (self.name_len > 0) self.name_len -= 1;
+                    } else if (k.scancode == 40 or k.scancode == 88) {
+                        if (!k.repeat) self.menuAction(.confirm_save_as, ctx);
+                    } else if (typedChar(k.scancode, self.shift)) |ch| {
+                        if (self.name_len < self.name_buf.len) {
+                            self.name_buf[self.name_len] = ch;
+                            self.name_len += 1;
+                        }
+                    }
+                    return;
+                }
+                if (!k.repeat and k.scancode == sc.esc) {
+                    switch (self.menu) {
+                        .pause => self.openMenu(.none),
+                        else => self.openMenu(.pause),
+                    }
                 }
             },
             .mouse_button => |b| if (b.button == 1 and b.down) {
@@ -1955,6 +2030,7 @@ pub const App = struct {
             .settings => "SETTINGS",
             .finances => "FINANCES",
             .new_zoo => "NEW BLANK ZOO",
+            .save_as => "SAVE YOUR ZOO",
             .none => "",
         };
         if (self.menu == .finances) return self.drawFinances(ui, scale);
@@ -1966,7 +2042,7 @@ pub const App = struct {
         switch (self.menu) {
             .pause => {
                 y += try self.menuButton(ui, y, scale, "RESUME", .{ .menu = .close_menu }, false);
-                y += try self.menuButton(ui, y, scale, "SAVE GAME", .{ .menu = .save }, false);
+                y += try self.menuButton(ui, y, scale, "SAVE GAME...", .{ .menu = .open_save_as }, false);
                 y += try self.menuButton(ui, y, scale, "LOAD GAME", .{ .menu = .open_saves }, false);
                 y += try self.menuButton(ui, y, scale, "NEW MAP", .{ .menu = .open_maps }, false);
                 y += try self.menuButton(ui, y, scale, "SETTINGS", .{ .menu = .open_settings }, false);
@@ -2025,6 +2101,32 @@ pub const App = struct {
                 y += 6 * scale;
                 y += try self.menuButton(ui, y, scale, "START", .{ .menu = .new_zoo_start }, true);
                 y += try self.menuButton(ui, y, scale, "BACK", .{ .menu = .open_maps }, false);
+            },
+            .save_as => {
+                const label = "NAME YOUR SAVE, THEN PRESS ENTER";
+                const lw = viewer.Ui.textWidth(label, scale);
+                _ = try ui.text((ui.width - lw) / 2, y, scale, label, .{ 0.8, 0.85, 0.9, 1 });
+                y += 12 * scale;
+                const bw = 30 * 6 * scale;
+                const bx = (ui.width - bw) / 2;
+                const bh = 7 * scale + 10 * scale;
+                ui.template("displayfield", bx, y, bw, bh, scale / 2, 1.5);
+                var shown: [48]u8 = undefined;
+                const caret: []const u8 = if ((self.blink / 30) % 2 == 0) "_" else " ";
+                const txt = std.fmt.bufPrint(&shown, "{s}{s}", .{ self.name_buf[0..self.name_len], caret }) catch "";
+                _ = try ui.text(bx + 5 * scale, y + 5 * scale, scale, txt, .{ 1, 1, 1, 1 });
+                y += bh + 6 * scale;
+                // Warn when this would replace an existing save.
+                for (self.save_labels.items) |l| if (std.ascii.eqlIgnoreCase(l, self.name_buf[0..self.name_len])) {
+                    const warn = "THIS REPLACES AN EXISTING SAVE";
+                    const ww = viewer.Ui.textWidth(warn, scale * 0.8);
+                    _ = try ui.text((ui.width - ww) / 2, y, scale * 0.8, warn, .{ 1, 0.7, 0.5, 1 });
+                    y += 10 * scale;
+                    break;
+                };
+                y += 4 * scale;
+                y += try self.menuButton(ui, y, scale, "SAVE", .{ .menu = .confirm_save_as }, true);
+                y += try self.menuButton(ui, y, scale, "CANCEL", .{ .menu = .back }, false);
             },
             .finances, .none => {},
         }
@@ -3280,6 +3382,7 @@ pub const App = struct {
     }
 
     pub fn frame(self: *App, ctx: *viewer.FrameCtx) !void {
+        self.blink +%= 1;
         self.playInput(ctx);
         if (self.reset_camera) {
             // A different map was loaded: look at its middle.

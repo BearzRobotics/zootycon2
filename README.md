@@ -80,7 +80,8 @@ shows the current tool, the selected item, and the last message.
 | `G` | turn guest arrivals on or off |
 | pause menu > NEW MAP > NEW BLANK ZOO | a flat empty zoo, 96 to 256 tiles a side (the biggest stock map is 96), in a biome of your choice |
 | `M` | sound on or off (`--no-sound` disables it entirely) |
-| `F5`, `F9` | save, load the last save |
+| `F5`, `F9` | quick save to the current save name, load it again |
+| pause menu > SAVE GAME... | name your save and press Enter; LOAD GAME lists every save by name |
 
 An on-screen display shows the current tool, a hint for it, the simulation
 status and a key reference; `F1` hides the help. The tool buttons on the left
