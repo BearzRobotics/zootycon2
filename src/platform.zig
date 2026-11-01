@@ -12,3 +12,4 @@ pub const lastError = sdl.lastError;
 test {
     _ = sdl;
 }
+pub const AudioOut = sdl.AudioOut;

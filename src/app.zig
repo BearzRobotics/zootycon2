@@ -20,6 +20,7 @@ const map_mod = @import("map.zig");
 const terrain_mod = @import("terrain.zig");
 const environment = @import("environment.zig");
 const xml = @import("xml.zig");
+const audio_mod = @import("audio.zig");
 const ai = @import("ai.zig");
 const vfs_mod = @import("vfs.zig");
 
@@ -43,6 +44,7 @@ const sc = struct {
     const comma: u32 = 54;
     const period: u32 = 55;
     const t: u32 = 23;
+    const m: u32 = 16;
     const esc: u32 = 41;
     const f1: u32 = 58;
     const f2: u32 = 59;
@@ -103,6 +105,7 @@ const MenuAction = enum {
     toggle_help,
     toggle_arrivals,
     toggle_clock,
+    toggle_sound,
     toggle_modern,
     toggle_shadows,
     toggle_ssao,
@@ -143,6 +146,7 @@ pub const Options = struct {
     modern: bool = false,
     no_shadows: bool = false,
     no_post: bool = false,
+    no_sound: bool = false,
     /// Open the map picker at startup (no map was named on the command line).
     pick_map: bool = false,
     /// Build commands run at startup, separated by `;` (for tests and demos):
@@ -264,8 +268,12 @@ pub const App = struct {
     guests_base: f32 = 30,
     guests_per_star: f32 = 20,
     catalog_arena: std.heap.ArenaAllocator,
+    /// Sound, created after the app so it can borrow the data files.
+    audio: ?audio_mod.Engine = null,
+    audio_biome_dirty: bool = true,
 
     pub fn deinit(self: *App) void {
+        if (self.audio) |*a| a.deinit();
         for (self.undo.items) |op| if (op == .added) self.gpa.free(op.added.ids);
         self.undo.deinit(self.gpa);
         self.input_cmds.deinit(self.gpa);
@@ -628,11 +636,45 @@ pub const App = struct {
     fn charge(self: *App, cost: f64, what: []const u8) bool {
         if (cost <= 0) return true;
         if (self.sim.zoo.income < cost) {
+            self.sfx("noplacement");
             self.say("cannot afford {s}: ${d:.0}, have ${d:.0}", .{ what, cost, self.sim.zoo.income });
             return false;
         }
         self.sim.zoo.income -= cost;
         return true;
+    }
+
+    fn soundOn(self: *const App) bool {
+        return if (self.audio) |a| a.enabled else false;
+    }
+
+    fn toggleSound(self: *App) void {
+        const a = &(self.audio orelse return self.say("sound is off (--no-sound)", .{}));
+        a.setEnabled(!a.enabled);
+        self.audio_biome_dirty = true;
+        self.say("sound {s}{s}", .{ if (a.enabled) "on" else "off", if (a.enabled and !a.hasDevice()) " (no audio device)" else "" });
+    }
+
+    /// Plays a UI sound tag from the game's `ui/sound/config.xml`.
+    fn sfx(self: *App, name: []const u8) void {
+        if (self.audio) |*a| _ = a.play(name, null);
+    }
+
+    /// The most common natural biome painted on the terrain, for ambience.
+    fn dominantBiome(self: *const App) []const u8 {
+        const t = &self.world.terrain;
+        var counts: [sim_mod.habitat_biomes.len]u32 = @splat(0);
+        for (t.paint) |idx| {
+            if (idx >= t.biomes.len) continue;
+            for (sim_mod.habitat_biomes, 0..) |b, i| if (std.ascii.eqlIgnoreCase(b, t.biomes[idx])) {
+                counts[i] += 1;
+            };
+        }
+        var best: usize = 0;
+        for (counts, 0..) |c, i| if (c > counts[best]) {
+            best = i;
+        };
+        return sim_mod.habitat_biomes[best];
     }
 
     fn placeProp(self: *App, at: [3]f32) !void {
@@ -641,6 +683,7 @@ pub const App = struct {
         if (!self.charge(prop_cost, std.fs.path.basename(model))) return;
         const id = try self.world.addProp(model, at, world_mod.yawRotation(self.yaw), 1.0, &.{});
         self.pushAdded(&.{id}, prop_cost);
+        self.sfx("placement");
         self.say("placed {s} (${d:.0})", .{ std.fs.path.basename(model), prop_cost });
     }
 
@@ -656,6 +699,7 @@ pub const App = struct {
         if (!self.charge(cost, name)) return;
         const id = try self.world.addActor(name, at, world_mod.yawRotation(self.yaw), &.{});
         self.pushAdded(&.{id}, cost);
+        self.sfx("placement");
         self.say("placed {s} (${d:.0})", .{ name, cost });
     }
 
@@ -667,6 +711,7 @@ pub const App = struct {
         if (!self.charge(cost, name)) return;
         const id = try self.world.addPropEx(m.file, at, world_mod.yawRotation(self.yaw), m.scale, &.{}, name, 100);
         self.pushAdded(&.{id}, cost);
+        self.sfx("place_building");
         self.say("placed {s} (${d:.0})", .{ name, cost });
     }
 
@@ -709,6 +754,7 @@ pub const App = struct {
         if (!self.charge(path_cost, "path")) return;
         const id = try self.world.addPath(self.path_textures.items[self.path_i], .{ x, y }, 6, 6);
         self.pushAdded(&.{id}, path_cost);
+        self.sfx("place_path");
     }
 
     fn placeFenceLine(self: *App, a: [2]f32, b: [2]f32) !void {
@@ -734,6 +780,7 @@ pub const App = struct {
             try ids.append(self.gpa, id);
         }
         self.pushAdded(ids.items, total);
+        self.sfx("place_fence");
         self.say("fence: {d} x {s} (${d:.0})", .{ n, kind, total });
     }
 
@@ -757,7 +804,10 @@ pub const App = struct {
                 break;
             },
         }
-        if (self.world.remove(sel.id)) self.say("deleted", .{});
+        if (self.world.remove(sel.id)) {
+            self.sfx("delete");
+            self.say("deleted", .{});
+        }
         self.selected = null;
     }
 
@@ -1435,6 +1485,13 @@ pub const App = struct {
             }
             for (self.sim.feeders.items) |f| std.debug.print("feeder #{d} {s}: food {d:.0}\n", .{ f.prop_id, f.binder, f.food });
             std.debug.print("animal welfare: {d:.0}\n", .{self.sim.animalWelfare()});
+            if (self.audio) |*au| {
+                var live: usize = 0;
+                for (au.voices) |v| if (v != null) {
+                    live += 1;
+                };
+                std.debug.print("audio: tags={d} device={} on={} voices={d} played={d} last={s} biome={s}\n", .{ au.lib.tags.count(), au.hasDevice(), au.enabled, live, au.played, au.last_tag, au.ambient_biome });
+            }
             std.debug.print("perf: {d:.1} fps ({d} static draws, {d} actor draws)\n", .{ if (ctx.dt > 0) 1.0 / ctx.dt else 0.0, self.scene.draws.items.len, self.scene.actor_draws.items.len });
             std.debug.print("zoo: guests={d} total={d} left={d} income={d:.0} views={d} happy={d:.0}\n", .{
                 self.sim.liveGuests(), self.sim.zoo.guests_total, self.sim.zoo.guests_left, self.sim.zoo.income, self.sim.zoo.views, self.sim.happiness(),
@@ -1536,6 +1593,7 @@ pub const App = struct {
                         self.title_dirty = true;
                     },
                     sc.f1 => self.show_help = !self.show_help,
+                    sc.m => self.toggleSound(),
                     sc.t => {
                         self.tod_auto = !self.tod_auto;
                         self.say("time of day {s}", .{if (self.tod_auto) "running" else "stopped"});
@@ -1661,6 +1719,7 @@ pub const App = struct {
                 self.updateGuestCap();
             },
             .toggle_clock => self.tod_auto = !self.tod_auto,
+            .toggle_sound => self.toggleSound(),
             .toggle_modern => self.scene.fx.modern = !self.scene.fx.modern,
             .toggle_shadows => self.scene.fx.shadows = !self.scene.fx.shadows,
             .toggle_ssao => self.scene.fx.ssao = !self.scene.fx.ssao,
@@ -1786,6 +1845,7 @@ pub const App = struct {
                 y += try self.menuButton(ui, y, scale, std.fmt.bufPrint(&b, "HELP TEXT: {s}", .{if (self.show_help) "ON" else "OFF"}) catch "", .{ .menu = .toggle_help }, self.show_help);
                 y += try self.menuButton(ui, y, scale, std.fmt.bufPrint(&b, "GUEST ARRIVALS: {s}", .{if (self.arrivals_on) "ON" else "OFF"}) catch "", .{ .menu = .toggle_arrivals }, self.arrivals_on);
                 y += try self.menuButton(ui, y, scale, std.fmt.bufPrint(&b, "DAY/NIGHT CLOCK: {s}", .{if (self.tod_auto) "RUNNING" else "STOPPED"}) catch "", .{ .menu = .toggle_clock }, self.tod_auto);
+                y += try self.menuButton(ui, y, scale, std.fmt.bufPrint(&b, "SOUND: {s}", .{if (self.soundOn()) "ON" else "OFF"}) catch "", .{ .menu = .toggle_sound }, self.soundOn());
                 y += try self.menuButton(ui, y, scale, std.fmt.bufPrint(&b, "MODERN LIGHTING: {s}", .{if (self.scene.fx.modern) "ON" else "OFF"}) catch "", .{ .menu = .toggle_modern }, self.scene.fx.modern);
                 y += try self.menuButton(ui, y, scale, std.fmt.bufPrint(&b, "SUN SHADOWS: {s}", .{if (self.scene.fx.shadows) "ON" else "OFF"}) catch "", .{ .menu = .toggle_shadows }, self.scene.fx.shadows);
                 y += try self.menuButton(ui, y, scale, std.fmt.bufPrint(&b, "AMBIENT OCCLUSION: {s}", .{if (self.scene.fx.ssao) "ON" else "OFF"}) catch "", .{ .menu = .toggle_ssao }, self.scene.fx.ssao);
@@ -1817,6 +1877,7 @@ pub const App = struct {
     /// Handles a click on the interface; true if it hit a button or the list.
     fn uiClick(self: *App, x: f32, y: f32, ctx: *viewer.FrameCtx) bool {
         const h = self.hitAt(toPixels(ctx, x, y)) orelse return false;
+        self.sfx("uiclick");
         switch (h.action) {
             .tool => |t| {
                 self.tool = t;
@@ -2394,6 +2455,7 @@ pub const App = struct {
             ctx.cam.dist = ctx.cam.radius * 1.3;
             ctx.snap_camera = true;
             self.reset_camera = false;
+            self.audio_biome_dirty = true;
         }
         if (self.tod_auto) {
             self.tod += ctx.dt * (if (self.paused) 0 else self.speed) / self.day_len;
@@ -2437,12 +2499,24 @@ pub const App = struct {
                     const names = [_][]const u8{ ag.anim_name, "Stand_Idle", "Idle" };
                     self.scene.driveInstance(i, root, &names, ag.anim_time);
                     self.inst_anim.items[i] = ag.anim_name;
+                    if (self.audio) |*au| if (self.scene.instances.items[i].manifest) |mf| if (mf.animation(ag.anim_name)) |an| {
+                        au.animStarted(ag.binder, an.path, ag.pos);
+                    };
                 } else {
                     const inst = &self.scene.instances.items[i];
                     inst.root = root;
                     inst.time = ag.anim_time;
                 }
             }
+        }
+
+        if (self.audio) |*a| {
+            if (self.audio_biome_dirty) {
+                self.audio_biome_dirty = false;
+                if (a.enabled) a.setBiome(self.dominantBiome());
+            }
+            a.setListener(ctx.cam.center, ctx.cam.yaw);
+            a.update(ctx.dt);
         }
 
         if (self.title_dirty) self.updateTitle(ctx.win);
@@ -2537,6 +2611,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, vfs: *vfs_mod.Vfs, path: []const u8, 
         .save_arena = .init(gpa),
     };
     defer app.deinit();
+    if (!opts.no_sound) app.audio = audio_mod.Engine.init(gpa, vfs, opts.seed, opts.viewer.screenshot == null);
     app.sim.zoo.income = app.world.income;
     app.sim.zoo.guests_total = app.world.guests_total;
     app.sim.zoo.views = app.world.views;

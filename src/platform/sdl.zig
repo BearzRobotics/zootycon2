@@ -195,6 +195,37 @@ pub const Window = struct {
     }
 };
 
+/// Stereo f32 playback at a fixed rate, fed by `put` (no callback thread).
+pub const AudioOut = struct {
+    stream: *c.SDL_AudioStream,
+    rate: u32,
+
+    pub fn open(rate: u32) ?AudioOut {
+        if (!c.SDL_InitSubSystem(c.SDL_INIT_AUDIO)) return null;
+        const spec: c.SDL_AudioSpec = .{ .format = c.SDL_AUDIO_F32, .channels = 2, .freq = @intCast(rate) };
+        const st = c.SDL_OpenAudioDeviceStream(c.SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, null, null) orelse return null;
+        if (!c.SDL_ResumeAudioStreamDevice(st)) {
+            c.SDL_DestroyAudioStream(st);
+            return null;
+        }
+        return .{ .stream = st, .rate = rate };
+    }
+
+    pub fn close(self: AudioOut) void {
+        c.SDL_DestroyAudioStream(self.stream);
+    }
+
+    /// Bytes waiting to be played.
+    pub fn queued(self: AudioOut) usize {
+        return @intCast(@max(0, c.SDL_GetAudioStreamQueued(self.stream)));
+    }
+
+    /// Queues interleaved stereo frames.
+    pub fn put(self: AudioOut, samples: []const f32) void {
+        _ = c.SDL_PutAudioStreamData(self.stream, samples.ptr, @intCast(samples.len * 4));
+    }
+};
+
 test "event union is usable without SDL initialised" {
     const e: Event = .{ .key_down = .{ .scancode = scancode_escape, .repeat = false } };
     try std.testing.expect(e == .key_down);

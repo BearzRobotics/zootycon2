@@ -78,6 +78,7 @@ shows the current tool, the selected item, and the last message.
 | `Tab`, `,`, `.` | pause, slower, faster simulation |
 | `T`, `F2`, `F3` | run or stop the clock, previous or next time of day |
 | `G` | turn guest arrivals on or off |
+| `M` | sound on or off (`--no-sound` disables it entirely) |
 | `F5`, `F9` | save, load the last save |
 
 An on-screen display shows the current tool, a hint for it, the simulation
@@ -137,6 +138,7 @@ zootycon2 play maps/default/alpinesml.zt2 --shot \
 | `sim.zig` | agents, walkway graph, fence blocking; people walk the paths, animals run their data-driven brains |
 | `ai.zig` | the game's task templates and behaviour sets (`ai/tasks`): need-based task choice and posture-aware behaviour execution for animals |
 | `viewer.zig`, `gl.zig`, `platform/` | OpenGL 3.3 renderer, SDL3 binding |
+| `audio.zig` | sound from the game's own tag files (`ui/sound/config.xml`, `entities/sound`, `world/soundtags`): wav decoding, mixer, 3D attenuation, biome ambience, animation text-key triggers |
 | `uiskin.zig` | the game's own UI panel templates (`ui/template/backs/*.xml`), drawn from its textures at any size |
 | `app.zig` | the interactive app: tools, picking, undo, save/load, input driver |
 

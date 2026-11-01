@@ -432,6 +432,8 @@ pub fn main(init: std.process.Init) !void {
             } else if (std.mem.eql(u8, arg, "--modern")) {
                 aopts.modern = true;
                 if (aopts.viewer.msaa == 0) aopts.viewer.msaa = 4;
+            } else if (std.mem.eql(u8, arg, "--no-sound")) {
+                aopts.no_sound = true;
             } else if (std.mem.eql(u8, arg, "--no-post")) {
                 aopts.no_post = true;
             } else if (std.mem.eql(u8, arg, "--no-shadows")) {
