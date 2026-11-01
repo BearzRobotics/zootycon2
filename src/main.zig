@@ -290,11 +290,15 @@ pub fn main(init: std.process.Init) !void {
             gpa.free(px);
         }
         try out.print("{d} textures: dxt1 {d}, dxt3 {d}, dxt5 {d}, rgba8 {d}; {d} cube maps; {d} with partial mip chains; {d} failed\n", .{ names.items.len, counts[0], counts[1], counts[2], counts[3], cubes, short_mips, failed });
-    } else if (std.mem.eql(u8, cmd, "play") and rest.len > 0) {
+    } else if (std.mem.eql(u8, cmd, "play")) {
         var aopts: zootycon2.app.Options = .{ .save_dir = "" };
         var save_dir_owned: ?[]u8 = null;
         defer if (save_dir_owned) |d| gpa.free(d);
-        var k: usize = 1;
+        // `play` alone shows the map picker over a default map.
+        const named = rest.len > 0 and !std.mem.startsWith(u8, rest[0], "--");
+        const map_path: []const u8 = if (named) rest[0] else "maps/default/alpinesml.zt2";
+        aopts.pick_map = !named;
+        var k: usize = if (named) 1 else 0;
         while (k < rest.len) : (k += 1) {
             const arg = rest[k];
             if (std.mem.eql(u8, arg, "--save-dir") and k + 1 < rest.len) {
@@ -339,7 +343,7 @@ pub fn main(init: std.process.Init) !void {
             save_dir_owned = base;
             aopts.save_dir = base;
         }
-        try zootycon2.app.run(gpa, io, &vfs, rest[0], aopts);
+        try zootycon2.app.run(gpa, io, &vfs, map_path, aopts);
     } else if ((std.mem.eql(u8, cmd, "view") or std.mem.eql(u8, cmd, "map")) and rest.len > 0) {
         var shot = false;
         var vopts: zootycon2.viewer.Options = .{};

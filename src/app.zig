@@ -43,6 +43,7 @@ const sc = struct {
     const comma: u32 = 54;
     const period: u32 = 55;
     const t: u32 = 23;
+    const esc: u32 = 41;
     const f1: u32 = 58;
     const f2: u32 = 59;
     const f3: u32 = 60;
@@ -85,7 +86,27 @@ const Hit = struct {
     y: f32,
     w: f32,
     h: f32,
-    action: union(enum) { tool: Tool, pick: usize, none },
+    action: union(enum) { tool: Tool, pick: usize, none, menu: MenuAction, entry: usize },
+};
+
+/// Which full-screen menu is open (if any).
+const Menu = enum { none, pause, maps, saves, settings };
+
+const MenuAction = enum {
+    close_menu,
+    save,
+    open_saves,
+    open_maps,
+    open_settings,
+    back,
+    quit,
+    toggle_help,
+    toggle_arrivals,
+    toggle_clock,
+    speed_up,
+    speed_down,
+    delete_selected,
+    refill_selected,
 };
 
 const SelKind = enum { prop, fence, path, actor };
@@ -113,6 +134,8 @@ pub const Options = struct {
     tod_auto: bool = false,
     /// Directory saves are written to.
     save_dir: []const u8,
+    /// Open the map picker at startup (no map was named on the command line).
+    pick_map: bool = false,
     /// Build commands run at startup, separated by `;` (for tests and demos):
     ///   prop X Y | actor X Y | path X Y | fence X1 Y1 X2 Y2 | raise X Y SECS
     ///   lower X Y SECS | flatten X Y SECS | delete X Y | undo | save | load
@@ -184,6 +207,21 @@ pub const App = struct {
     title_dirty: bool = true,
     undo: std.ArrayList(UndoOp) = .empty,
 
+    // Menus.
+    menu: Menu = .none,
+    /// First visible row of a list menu.
+    menu_first: usize = 0,
+    /// Maps in the game data (paths) and their display names.
+    map_paths: std.ArrayList([]const u8) = .empty,
+    map_labels: std.ArrayList([]const u8) = .empty,
+    /// Saves found on disk (full paths) and their names.
+    save_paths: std.ArrayList([]const u8) = .empty,
+    save_labels: std.ArrayList([]const u8) = .empty,
+    save_arena: std.heap.ArenaAllocator,
+    reset_camera: bool = false,
+    /// Rows of a list menu that fit on screen (set when drawing).
+    menu_rows: usize = 8,
+
     // Clickable interface, rebuilt each frame by `overlay`.
     hits: std.ArrayList(Hit) = .empty,
     feeder_state: u64 = 0,
@@ -223,6 +261,11 @@ pub const App = struct {
         self.undo.deinit(self.gpa);
         self.input_cmds.deinit(self.gpa);
         self.hits.deinit(self.gpa);
+        self.map_paths.deinit(self.gpa);
+        self.map_labels.deinit(self.gpa);
+        self.save_paths.deinit(self.gpa);
+        self.save_labels.deinit(self.gpa);
+        self.save_arena.deinit();
         self.props.deinit(self.gpa);
         self.fence_kinds.deinit(self.gpa);
         self.path_textures.deinit(self.gpa);
@@ -781,8 +824,14 @@ pub const App = struct {
         const zt2_name = try std.fmt.bufPrint(&zt2_buf, "{s}.zt2", .{name});
         const zt2_path = try std.fs.path.join(self.gpa, &.{ self.opts.save_dir, zt2_name });
         defer self.gpa.free(zt2_path);
+        try self.loadPath(zt2_path);
+    }
+
+    /// Replaces the world with the map or save at `zt2_path` (a game-data
+    /// path or a file on disk).
+    fn loadPath(self: *App, zt2_path: []const u8) !void {
         const fresh = loadWorld(self.gpa, self.io, self.vfs, zt2_path) catch |e| {
-            self.say("no save to load ({s})", .{@errorName(e)});
+            self.say("could not load ({s})", .{@errorName(e)});
             return;
         };
         self.world.deinit();
@@ -803,7 +852,11 @@ pub const App = struct {
         self.sim.zoo.views = self.world.views;
         self.loadGuestConfig();
         self.installHooks();
-        self.say("loaded {s}", .{zt2_path});
+        // The new map has its own environment and needs the camera moved to it.
+        if (self.env) |*e| e.deinit();
+        self.env = loadEnvironment(self.gpa, self.vfs, self.world.environment);
+        self.reset_camera = true;
+        self.say("loaded {s}", .{std.fs.path.basename(zt2_path)});
     }
 
     // ------------------------------------------------------------ scripting
@@ -1266,6 +1319,16 @@ pub const App = struct {
     }
 
     pub fn event(self: *App, ev: platform.Event, ctx: *viewer.FrameCtx) void {
+        if (self.menu != .none) return self.menuEvent(ev, ctx);
+        // Escape opens the pause menu instead of quitting.
+        switch (ev) {
+            .key_down => |k| if (!k.repeat and k.scancode == sc.esc) {
+                self.openMenu(.pause);
+                ctx.consumed = true;
+                return;
+            },
+            else => {},
+        }
         switch (ev) {
             .key_down => |k| {
                 if (k.repeat) return;
@@ -1326,6 +1389,218 @@ pub const App = struct {
         }
     }
 
+    // ---------------------------------------------------------------- menus
+
+    const MapScan = struct {
+        app: *App,
+        fn add(self: MapScan, path: []const u8) anyerror!void {
+            if (!std.mem.startsWith(u8, path, "maps/") or !std.mem.endsWith(u8, path, ".zt2")) return;
+            const a = self.app;
+            const ar = a.save_arena.allocator();
+            try a.map_paths.append(a.gpa, try ar.dupe(u8, path));
+        }
+    };
+
+    fn lessLabel(_: void, a: []const u8, b: []const u8) bool {
+        // Default maps before scenario maps, then alphabetical.
+        const a_scen = std.mem.indexOf(u8, a, "/scenario/") != null;
+        const b_scen = std.mem.indexOf(u8, b, "/scenario/") != null;
+        if (a_scen != b_scen) return !a_scen;
+        return std.mem.lessThan(u8, a, b);
+    }
+
+    /// Lists the maps in the game data.
+    fn buildMapList(self: *App) !void {
+        self.map_paths.clearRetainingCapacity();
+        self.map_labels.clearRetainingCapacity();
+        try self.vfs.forEach(MapScan{ .app = self }, MapScan.add);
+        std.mem.sort([]const u8, self.map_paths.items, {}, lessLabel);
+        const ar = self.save_arena.allocator();
+        for (self.map_paths.items) |p| {
+            const base = std.fs.path.basename(p);
+            const stem = base[0 .. base.len - 4];
+            if (std.mem.eql(u8, stem, "nomap")) continue;
+            const label = try std.fmt.allocPrint(ar, "{s}{s}", .{ if (std.mem.indexOf(u8, p, "/scenario/") != null) "scenario: " else "", stem });
+            try self.map_labels.append(self.gpa, label);
+        }
+        // Drop the placeholder from the path list too so indexes line up.
+        var i: usize = 0;
+        while (i < self.map_paths.items.len) {
+            if (std.mem.endsWith(u8, self.map_paths.items[i], "/nomap.zt2")) _ = self.map_paths.orderedRemove(i) else i += 1;
+        }
+    }
+
+    /// Lists the saves on disk.
+    fn buildSaveList(self: *App) void {
+        self.save_paths.clearRetainingCapacity();
+        self.save_labels.clearRetainingCapacity();
+        const ar = self.save_arena.allocator();
+        var dir = Io.Dir.cwd().openDir(self.io, self.opts.save_dir, .{ .iterate = true }) catch return;
+        defer dir.close(self.io);
+        var it = dir.iterate();
+        while (it.next(self.io) catch null) |e| {
+            if (e.kind != .file or !std.ascii.endsWithIgnoreCase(e.name, ".zt2")) continue;
+            const full = std.fs.path.join(ar, &.{ self.opts.save_dir, e.name }) catch continue;
+            const label = ar.dupe(u8, e.name[0 .. e.name.len - 4]) catch continue;
+            self.save_paths.append(self.gpa, full) catch continue;
+            self.save_labels.append(self.gpa, label) catch continue;
+        }
+    }
+
+    fn openMenu(self: *App, m: Menu) void {
+        self.menu = m;
+        self.menu_first = 0;
+        if (m == .saves) self.buildSaveList();
+        self.lmb = false;
+    }
+
+    fn menuAction(self: *App, a: MenuAction, ctx: *viewer.FrameCtx) void {
+        switch (a) {
+            .close_menu => self.openMenu(.none),
+            .save => {
+                self.saveWorld() catch |e| self.say("save failed: {s}", .{@errorName(e)});
+                self.openMenu(.none);
+            },
+            .open_saves => self.openMenu(.saves),
+            .open_maps => self.openMenu(.maps),
+            .open_settings => self.openMenu(.settings),
+            .back => self.openMenu(.pause),
+            .quit => ctx.quit = true,
+            .toggle_help => self.show_help = !self.show_help,
+            .toggle_arrivals => {
+                self.arrivals_on = !self.arrivals_on;
+                self.updateGuestCap();
+            },
+            .toggle_clock => self.tod_auto = !self.tod_auto,
+            .speed_up => self.speed = @min(self.speed * 2, 16),
+            .speed_down => self.speed = @max(self.speed / 2, 0.25),
+            .delete_selected => self.deleteSelected(),
+            .refill_selected => self.refill(),
+        }
+    }
+
+    fn entryAction(self: *App, i: usize) void {
+        switch (self.menu) {
+            .maps => if (i < self.map_paths.items.len) {
+                self.loadPath(self.map_paths.items[i]) catch {};
+                self.openMenu(.none);
+            },
+            .saves => if (i < self.save_paths.items.len) {
+                self.loadPath(self.save_paths.items[i]) catch {};
+                self.openMenu(.none);
+            },
+            else => {},
+        }
+    }
+
+    /// Events while a menu is open: only the menu reacts.
+    fn menuEvent(self: *App, ev: platform.Event, ctx: *viewer.FrameCtx) void {
+        ctx.consumed = true;
+        switch (ev) {
+            .key_down => |k| if (!k.repeat and k.scancode == sc.esc) {
+                switch (self.menu) {
+                    .pause => self.openMenu(.none),
+                    else => self.openMenu(.pause),
+                }
+            },
+            .mouse_button => |b| if (b.button == 1 and b.down) {
+                const h = self.hitAt(toPixels(ctx, b.x, b.y)) orelse return;
+                switch (h.action) {
+                    .menu => |a| self.menuAction(a, ctx),
+                    .entry => |i| self.entryAction(i),
+                    else => {},
+                }
+            },
+            .mouse_wheel => |w| {
+                const n = switch (self.menu) {
+                    .maps => self.map_labels.items.len,
+                    .saves => self.save_labels.items.len,
+                    else => 0,
+                };
+                if (w.dy > 0 and self.menu_first > 0) self.menu_first -= 1;
+                if (w.dy < 0 and self.menu_first + self.menu_rows < n) self.menu_first += 1;
+            },
+            else => {},
+        }
+    }
+
+
+    fn menuButton(self: *App, ui: *viewer.Ui, y: f32, scale: f32, text: []const u8, action: @TypeOf(@as(Hit, undefined).action), on: bool) !f32 {
+        const width = 26 * 6 * scale;
+        const x = (ui.width - width) / 2;
+        const h = 7 * scale + 8 * scale;
+        try ui.rect(x, y, width, h, if (on) .{ 0.25, 0.35, 0.2, 0.9 } else .{ 0.05, 0.08, 0.12, 0.88 });
+        const tw = viewer.Ui.textWidth(text, scale);
+        _ = try ui.text(x + (width - tw) / 2 + scale / 2, y + 4 * scale, scale, text, .{ 1, 1, 1, 1 });
+        try self.hits.append(self.gpa, .{ .x = x, .y = y, .w = width, .h = h, .action = action });
+        return h + 3 * scale;
+    }
+
+    fn drawMenu(self: *App, ui: *viewer.Ui, base_scale: f32) !void {
+        const scale = base_scale * 1.5;
+        try ui.rect(0, 0, ui.width, ui.height, .{ 0, 0, 0, 0.55 });
+        const title: []const u8 = switch (self.menu) {
+            .pause => "PAUSED",
+            .maps => "CHOOSE A MAP",
+            .saves => "LOAD A SAVED ZOO",
+            .settings => "SETTINGS",
+            .none => "",
+        };
+        const tscale = scale * 1.6;
+        const tw = viewer.Ui.textWidth(title, tscale);
+        var y = ui.height * 0.12;
+        _ = try ui.text((ui.width - tw) / 2, y, tscale, title, .{ 1, 0.92, 0.5, 1 });
+        y += 7 * tscale + 14 * scale;
+        switch (self.menu) {
+            .pause => {
+                y += try self.menuButton(ui, y, scale, "RESUME", .{ .menu = .close_menu }, false);
+                y += try self.menuButton(ui, y, scale, "SAVE GAME", .{ .menu = .save }, false);
+                y += try self.menuButton(ui, y, scale, "LOAD GAME", .{ .menu = .open_saves }, false);
+                y += try self.menuButton(ui, y, scale, "NEW MAP", .{ .menu = .open_maps }, false);
+                y += try self.menuButton(ui, y, scale, "SETTINGS", .{ .menu = .open_settings }, false);
+                y += try self.menuButton(ui, y, scale, "QUIT", .{ .menu = .quit }, false);
+            },
+            .maps, .saves => {
+                const labels = if (self.menu == .maps) self.map_labels.items else self.save_labels.items;
+                if (labels.len == 0) {
+                    const msg = if (self.menu == .maps) "NO MAPS FOUND" else "NO SAVED ZOOS YET";
+                    const mw = viewer.Ui.textWidth(msg, scale);
+                    _ = try ui.text((ui.width - mw) / 2, y, scale, msg, .{ 0.8, 0.85, 0.9, 1 });
+                    y += 14 * scale;
+                }
+                // As many rows as fit between the title and the Back button.
+                const row_h = 18 * scale * 0.8;
+                const room = ui.height - y - 40 * scale;
+                self.menu_rows = @max(3, @as(usize, @intFromFloat(@max(0, room / row_h))));
+                if (self.menu_first + self.menu_rows > labels.len) self.menu_first = labels.len -| self.menu_rows;
+                const first = self.menu_first;
+                const last = @min(labels.len, first + self.menu_rows);
+                var i = first;
+                while (i < last) : (i += 1) y += try self.menuButton(ui, y, scale * 0.8, labels[i], .{ .entry = i }, false);
+                if (labels.len > self.menu_rows) {
+                    var nb: [48]u8 = undefined;
+                    const note = std.fmt.bufPrint(&nb, "{d}-{d} OF {d}  (SCROLL WITH THE WHEEL)", .{ first + 1, last, labels.len }) catch "";
+                    const nw = viewer.Ui.textWidth(note, scale * 0.7);
+                    _ = try ui.text((ui.width - nw) / 2, y + 2 * scale, scale * 0.7, note, .{ 0.8, 0.85, 0.9, 1 });
+                    y += 12 * scale;
+                }
+                y += 6 * scale;
+                y += try self.menuButton(ui, y, scale, "BACK", .{ .menu = .back }, false);
+            },
+            .settings => {
+                var b: [48]u8 = undefined;
+                y += try self.menuButton(ui, y, scale, std.fmt.bufPrint(&b, "HELP TEXT: {s}", .{if (self.show_help) "ON" else "OFF"}) catch "", .{ .menu = .toggle_help }, self.show_help);
+                y += try self.menuButton(ui, y, scale, std.fmt.bufPrint(&b, "GUEST ARRIVALS: {s}", .{if (self.arrivals_on) "ON" else "OFF"}) catch "", .{ .menu = .toggle_arrivals }, self.arrivals_on);
+                y += try self.menuButton(ui, y, scale, std.fmt.bufPrint(&b, "DAY/NIGHT CLOCK: {s}", .{if (self.tod_auto) "RUNNING" else "STOPPED"}) catch "", .{ .menu = .toggle_clock }, self.tod_auto);
+                y += try self.menuButton(ui, y, scale, std.fmt.bufPrint(&b, "SIM SPEED: X{d:.2}  (CLICK: FASTER)", .{self.speed}) catch "", .{ .menu = .speed_up }, false);
+                y += try self.menuButton(ui, y, scale, "SIM SPEED: SLOWER", .{ .menu = .speed_down }, false);
+                y += 6 * scale;
+                y += try self.menuButton(ui, y, scale, "BACK", .{ .menu = .back }, false);
+            },
+            .none => {},
+        }
+    }
+
     /// Pixel position of a window-coordinate mouse position.
     fn toPixels(ctx: *const viewer.FrameCtx, x: f32, y: f32) [2]f32 {
         const sx = @as(f32, @floatFromInt(ctx.width)) / @as(f32, @floatFromInt(@max(ctx.win_width, 1)));
@@ -1341,7 +1616,7 @@ pub const App = struct {
     }
 
     /// Handles a click on the interface; true if it hit a button or the list.
-    fn uiClick(self: *App, x: f32, y: f32, ctx: *const viewer.FrameCtx) bool {
+    fn uiClick(self: *App, x: f32, y: f32, ctx: *viewer.FrameCtx) bool {
         const h = self.hitAt(toPixels(ctx, x, y)) orelse return false;
         switch (h.action) {
             .tool => |t| {
@@ -1350,7 +1625,8 @@ pub const App = struct {
                 self.title_dirty = true;
             },
             .pick => |i| self.pickItem(i),
-            .none => {},
+            .menu => |a| self.menuAction(a, ctx),
+            .entry, .none => {},
         }
         return true;
     }
@@ -1574,6 +1850,12 @@ pub const App = struct {
         const grey = [4]f32{ 0.8, 0.85, 0.9, 1 };
         var buf: [256]u8 = undefined;
         var y = pad;
+        // A menu replaces the normal display.
+        self.hits.clearRetainingCapacity();
+        if (self.menu != .none) {
+            try self.drawMenu(ui, scale);
+            return;
+        }
 
         // Top left: what the tool is doing.
         var detail: []const u8 = "";
@@ -1627,13 +1909,15 @@ pub const App = struct {
         try ui.label(ui.width - sw - pad, pad, scale, status, white);
 
         // Clickable interface.
-        self.hits.clearRetainingCapacity();
         if (self.opts.tools) try self.drawControls(ui, scale, pad, line);
 
         // Zoo statistics: guests, takings, how happy they are.
         const stats = self.statsText(&buf);
         const stw = viewer.Ui.textWidth(stats, scale);
         try ui.label(ui.width - stw - pad, pad + line + 2 * scale, scale, stats, white);
+
+        // Details panel (the item list uses the same corner).
+        if (self.opts.tools and self.itemCount() == 0) try self.drawInfoPanel(ui, scale, pad, line, pad + 3.2 * (line + 2 * scale));
 
         // Selection.
         if (self.selected) |sel| {
@@ -1667,6 +1951,91 @@ pub const App = struct {
             }
         }
         _ = ctx;
+    }
+
+    fn bar(ui: *viewer.Ui, x: f32, y: f32, w: f32, h: f32, frac: f32, color: [4]f32) !void {
+        try ui.rect(x, y, w, h, .{ 0.1, 0.1, 0.12, 0.9 });
+        try ui.rect(x, y, w * std.math.clamp(frac, 0, 1), h, color);
+    }
+
+    /// Needs go from green (satisfied) to red (urgent).
+    fn needColor(need: f32) [4]f32 {
+        const t = std.math.clamp(need / 100.0, 0, 1);
+        return .{ 0.3 + 0.7 * t, 0.85 - 0.6 * t, 0.25, 1 };
+    }
+
+    /// Details of the selected thing, with buttons for what can be done to it.
+    fn drawInfoPanel(self: *App, ui: *viewer.Ui, scale: f32, pad: f32, line: f32, top: f32) !void {
+        const sel = self.selected orelse return;
+        const white = [4]f32{ 1, 1, 1, 1 };
+        const grey = [4]f32{ 0.8, 0.85, 0.9, 1 };
+        const panel_w: f32 = 34 * 6 * scale;
+        const x = ui.width - panel_w - pad;
+        var rows: std.ArrayList(struct { text: []const u8, frac: f32, color: [4]f32, is_bar: bool }) = .empty;
+        defer rows.deinit(self.gpa);
+        var arena: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var title: []const u8 = "";
+        var can_refill = false;
+        switch (sel.kind) {
+            .prop => for (self.world.props.items) |p| if (p.id == sel.id) {
+                title = if (p.binder.len > 0) p.binder else std.fs.path.basename(p.model);
+                for (self.sim.feeders.items) |f| if (f.prop_id == p.id) {
+                    can_refill = true;
+                    try rows.append(self.gpa, .{ .text = try std.fmt.allocPrint(a, "FOOD {d:.0}%", .{f.food}), .frac = f.food / 100.0, .color = .{ 0.4, 0.7, 0.9, 1 }, .is_bar = true });
+                };
+            },
+            .fence => for (self.world.fences.items) |f| if (f.id == sel.id) {
+                title = f.kind;
+            },
+            .path => title = "PATH TILE",
+            .actor => for (self.world.actors.items) |act| if (act.id == sel.id) {
+                title = act.binder;
+                if (self.sim.agentFor(act.id)) |ag| {
+                    if (ag.is_guest) {
+                        try rows.append(self.gpa, .{ .text = try std.fmt.allocPrint(a, "HAPPY {d:.0}", .{ag.happiness}), .frac = ag.happiness / 100.0, .color = .{ 0.4, 0.85, 0.4, 1 }, .is_bar = true });
+                        const goal = switch (ag.goal) {
+                            .view => "WATCHING ANIMALS",
+                            .leave => "HEADING HOME",
+                            .wander => "STROLLING",
+                            .none => "LOOKING AROUND",
+                        };
+                        try rows.append(self.gpa, .{ .text = goal, .frac = 0, .color = grey, .is_bar = false });
+                        if (std.math.isFinite(ag.tour_left)) try rows.append(self.gpa, .{ .text = try std.fmt.allocPrint(a, "LEAVES IN {d:.0}S", .{@max(ag.tour_left, 0)}), .frac = 0, .color = grey, .is_bar = false });
+                    } else if (ag.brain) |b| {
+                        const shown = [_]usize{ 5, 6, 0, 1, 2, 3, 4 };
+                        for (shown) |i| {
+                            try rows.append(self.gpa, .{
+                                .text = try std.fmt.allocPrint(a, "{s}", .{ai.need_names[i]}),
+                                .frac = b.needs[i] / 100.0,
+                                .color = needColor(b.needs[i]),
+                                .is_bar = true,
+                            });
+                        }
+                        try rows.append(self.gpa, .{ .text = try std.fmt.allocPrint(a, "DOING {s}", .{ag.anim_name}), .frac = 0, .color = grey, .is_bar = false });
+                        try rows.append(self.gpa, .{ .text = try std.fmt.allocPrint(a, "WELFARE {d:.0}", .{100 - @max(b.needs[5], b.needs[6])}), .frac = 0, .color = grey, .is_bar = false });
+                    }
+                }
+            },
+        }
+        const row_h = line + scale;
+        const btn_h = 7 * scale + 4 * scale;
+        const height = (line + 2 * scale) + row_h * @as(f32, @floatFromInt(rows.items.len)) + btn_h + 6 * scale;
+        try ui.rect(x - 3 * scale, top - 3 * scale, panel_w + 6 * scale, height + 3 * scale, .{ 0, 0, 0, 0.6 });
+        _ = try ui.text(x, top, scale, title[0..@min(title.len, 34)], .{ 1, 0.92, 0.5, 1 });
+        var y = top + line + 2 * scale;
+        for (rows.items) |r| {
+            if (r.is_bar) {
+                _ = try ui.text(x, y, scale, r.text[0..@min(r.text.len, 11)], white);
+                try bar(ui, x + 12 * 6 * scale, y, panel_w - 12 * 6 * scale, 7 * scale, r.frac, r.color);
+            } else _ = try ui.text(x, y, scale, r.text[0..@min(r.text.len, 34)], r.color);
+            y += row_h;
+        }
+        y += 2 * scale;
+        _ = try self.drawButton(ui, x + 2 * scale, y + 2 * scale, scale, "DELETE", .{ 1, 0.6, 0.6, 1 }, .{ .menu = .delete_selected });
+        const bx = x + viewer.Ui.textWidth("DELETE", scale) + 8 * scale;
+        if (can_refill) _ = try self.drawButton(ui, bx, y + 2 * scale, scale, "REFILL", .{ 0.6, 0.85, 1, 1 }, .{ .menu = .refill_selected });
     }
 
     fn drawButton(self: *App, ui: *viewer.Ui, x: f32, y: f32, scale: f32, text: []const u8, color: [4]f32, action: @TypeOf(@as(Hit, undefined).action)) !f32 {
@@ -1780,6 +2149,17 @@ pub const App = struct {
 
     pub fn frame(self: *App, ctx: *viewer.FrameCtx) !void {
         self.playInput(ctx);
+        if (self.reset_camera) {
+            // A different map was loaded: look at its middle.
+            const t = &self.world.terrain;
+            const cx = t.world_width / 2;
+            const cy = t.world_height / 2;
+            ctx.cam.center = .{ cx, cy, t.zAt(cx, cy) };
+            ctx.cam.radius = @max(t.world_width, t.world_height) / 2;
+            ctx.cam.dist = ctx.cam.radius * 1.3;
+            ctx.snap_camera = true;
+            self.reset_camera = false;
+        }
         if (self.tod_auto) {
             self.tod += ctx.dt * (if (self.paused) 0 else self.speed) / self.day_len;
             self.tod -= @floor(self.tod);
@@ -1790,7 +2170,7 @@ pub const App = struct {
 
         // Hover point under the mouse.
         if (self.opts.tools) {
-            self.over_ui = self.hitAt(toPixels(ctx, ctx.mouse[0], ctx.mouse[1])) != null;
+            self.over_ui = self.menu != .none or self.hitAt(toPixels(ctx, ctx.mouse[0], ctx.mouse[1])) != null;
             const r = ctx.cam.ray(ctx.mouse[0], ctx.mouse[1], @floatFromInt(ctx.win_width), @floatFromInt(ctx.win_height));
             self.hover = if (self.over_ui) null else terrainHit(&self.world.terrain, r.origin, r.dir);
             if (self.lmb and self.hover != null) switch (self.tool) {
@@ -1814,7 +2194,7 @@ pub const App = struct {
         // Simulation.
         if (self.opts.sim) {
             self.updateGuestCap();
-            if (!self.paused) self.sim.advance(&self.world, ctx.dt * self.speed);
+            if (!self.paused and self.menu == .none) self.sim.advance(&self.world, ctx.dt * self.speed);
             for (self.actor_ids.items, 0..) |id, i| {
                 const ag = self.sim.agentFor(id) orelse continue;
                 const root = self.modelMatrixAt(ag.pos, ag.yaw, self.actor_scales.items[i]);
@@ -1914,6 +2294,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, vfs: *vfs_mod.Vfs, path: []const u8, 
         .tod_auto = opts.tod_auto,
         .opts = opts,
         .catalog_arena = .init(gpa),
+        .save_arena = .init(gpa),
     };
     defer app.deinit();
     app.sim.zoo.income = app.world.income;
@@ -1921,6 +2302,8 @@ pub fn run(gpa: std.mem.Allocator, io: Io, vfs: *vfs_mod.Vfs, path: []const u8, 
     app.sim.zoo.views = app.world.views;
     app.loadGuestConfig();
     app.installHooks();
+    try app.buildMapList();
+    if (opts.pick_map) app.openMenu(.maps);
     try app.buildCatalogs();
     app.runScript(opts.script);
     try app.splitInput(opts.input);

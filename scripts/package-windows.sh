@@ -15,7 +15,7 @@ rem Starts the zoo on the small alpine map. The game data is found in the usual
 rem Windows install location; if yours is elsewhere, edit the line below and add:
 rem   --data "D:\Games\Zoo Tycoon 2"
 cd /d "%~dp0"
-zootycon2.exe play maps/default/alpinesml.zt2
+zootycon2.exe play
 pause
 EOF
 cat > "$dest/README.txt" <<'EOF'
