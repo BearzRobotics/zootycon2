@@ -105,7 +105,7 @@ fn kindOf(tag: []const u8) Kind {
     if (std.ascii.eqlIgnoreCase(tag, "UIStatic")) return .static;
     if (std.ascii.eqlIgnoreCase(tag, "UIText") or std.ascii.eqlIgnoreCase(tag, "ZTMoneyText")) return .text;
     if (std.ascii.eqlIgnoreCase(tag, "UIToggleButton")) return .toggle;
-    if (std.ascii.eqlIgnoreCase(tag, "UIButton") or std.ascii.eqlIgnoreCase(tag, "UIPushButton")) return .button;
+    if (std.ascii.eqlIgnoreCase(tag, "UIButton") or std.ascii.eqlIgnoreCase(tag, "UIPushButton") or std.ascii.eqlIgnoreCase(tag, "UIHoverButton")) return .button;
     return .other;
 }
 

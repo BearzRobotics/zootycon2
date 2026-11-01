@@ -107,7 +107,7 @@ const Alert = struct {
 pub const BuyTab = enum { fence, path, building, scenery, animal, food, staff, deform };
 
 /// Which full-screen menu is open (if any).
-const Menu = enum { none, pause, maps, saves, settings, finances, new_zoo, save_as };
+const Menu = enum { none, pause, maps, saves, settings, finances, new_zoo, save_as, main };
 
 const MenuAction = enum {
     close_menu,
@@ -126,6 +126,7 @@ const MenuAction = enum {
     toggle_hud,
     open_new_zoo,
     open_save_as,
+    open_main,
     price_up,
     price_down,
     open_status,
@@ -312,7 +313,7 @@ pub const App = struct {
     audio: ?audio_mod.Engine = null,
     audio_biome_dirty: bool = true,
     /// The game's own HUD, drawn from its layout files.
-    hud: ?struct { shell: uilayout.Layout, bucks: ?uilayout.Layout, info: ?uilayout.Layout = null, status: ?uilayout.Layout = null } = null,
+    hud: ?struct { shell: uilayout.Layout, bucks: ?uilayout.Layout, info: ?uilayout.Layout = null, status: ?uilayout.Layout = null, mainmenu: ?uilayout.Layout = null } = null,
     hud_on: bool = true,
     /// A name the player gave the zoo's save (empty: derived from the map).
     custom_name: [48]u8 = undefined,
@@ -322,6 +323,9 @@ pub const App = struct {
     name_len: usize = 0,
     blink: u32 = 0,
     status_tab: u8 = 1,
+    /// The menus were opened from the main menu, so Back returns to it.
+    in_main: bool = false,
+    main_hover: []const u8 = "",
     app_time: f64 = 0,
     alerts: [4]Alert = @splat(.{}),
     alert_cool: [8]f64 = @splat(-1000),
@@ -360,6 +364,7 @@ pub const App = struct {
             if (h.bucks) |*b| b.deinit();
             if (h.info) |*b| b.deinit();
             if (h.status) |*b| b.deinit();
+            if (h.mainmenu) |*b| b.deinit();
         }
         for (self.undo.items) |op| if (op == .added) self.gpa.free(op.added.ids);
         self.undo.deinit(self.gpa);
@@ -1925,6 +1930,8 @@ pub const App = struct {
     }
 
     fn openMenu(self: *App, m: Menu) void {
+        if (m == .main) self.in_main = true;
+        if (m == .none or m == .pause) self.in_main = false;
         self.menu = m;
         self.menu_first = 0;
         if (m == .saves) self.buildSaveList();
@@ -1947,6 +1954,7 @@ pub const App = struct {
                 self.sim.child_price = @round(self.sim.adult_price / 2);
             },
             .open_status => self.openMenu(.finances),
+            .open_main => self.openMenu(.main),
             .open_save_as => {
                 var nb: [64]u8 = undefined;
                 const cur = self.saveName(&nb);
@@ -2020,7 +2028,7 @@ pub const App = struct {
                 self.hud_on = !self.hud_on;
                 self.show_help = !self.hud_on;
             },
-            .back => self.openMenu(.pause),
+            .back => self.openMenu(if (self.in_main) .main else .pause),
             .quit => ctx.quit = true,
             .toggle_help => self.show_help = !self.show_help,
             .toggle_arrivals => {
@@ -2078,12 +2086,14 @@ pub const App = struct {
                 if (!k.repeat and k.scancode == sc.esc) {
                     switch (self.menu) {
                         .pause => self.openMenu(.none),
-                        else => self.openMenu(.pause),
+                        .main => {},
+                        else => self.openMenu(if (self.in_main) .main else .pause),
                     }
                 }
             },
             .mouse_button => |b| if (b.button == 1 and b.down) {
                 const h = self.hitAt(toPixels(ctx, b.x, b.y)) orelse return;
+                self.sfx("uiclick");
                 switch (h.action) {
                     .menu => |a| self.menuAction(a, ctx),
                     .entry => |i| self.entryAction(i),
@@ -2127,9 +2137,11 @@ pub const App = struct {
             .finances => "FINANCES",
             .new_zoo => "NEW BLANK ZOO",
             .save_as => "SAVE YOUR ZOO",
+            .main => "ZOOTYCON2",
             .none => "",
         };
         if (self.menu == .finances) return self.drawFinances(ui, scale);
+        if (self.menu == .main and self.hud != null) return self.drawMainMenu(ui);
         const tscale = scale * 1.6;
         const tw = viewer.Ui.textWidth(title, tscale);
         var y = ui.height * 0.12;
@@ -2141,6 +2153,7 @@ pub const App = struct {
                 y += try self.menuButton(ui, y, scale, "SAVE GAME...", .{ .menu = .open_save_as }, false);
                 y += try self.menuButton(ui, y, scale, "LOAD GAME", .{ .menu = .open_saves }, false);
                 y += try self.menuButton(ui, y, scale, "NEW MAP", .{ .menu = .open_maps }, false);
+                y += try self.menuButton(ui, y, scale, "MAIN MENU", .{ .menu = .open_main }, false);
                 y += try self.menuButton(ui, y, scale, "SETTINGS", .{ .menu = .open_settings }, false);
                 y += try self.menuButton(ui, y, scale, "QUIT", .{ .menu = .quit }, false);
             },
@@ -2240,6 +2253,12 @@ pub const App = struct {
                 y += 4 * scale;
                 y += try self.menuButton(ui, y, scale, "SAVE", .{ .menu = .confirm_save_as }, true);
                 y += try self.menuButton(ui, y, scale, "CANCEL", .{ .menu = .back }, false);
+            },
+            .main => {
+                y += try self.menuButton(ui, y, scale, "PLAY A FREEFORM ZOO", .{ .menu = .open_maps }, true);
+                y += try self.menuButton(ui, y, scale, "LOAD A SAVED ZOO", .{ .menu = .open_saves }, false);
+                y += try self.menuButton(ui, y, scale, "OPTIONS", .{ .menu = .open_settings }, false);
+                y += try self.menuButton(ui, y, scale, "QUIT", .{ .menu = .quit }, false);
             },
             .finances, .none => {},
         }
@@ -2797,7 +2816,12 @@ pub const App = struct {
             defer self.gpa.free(zb);
             status = uilayout.parse(self.gpa, zb) catch null;
         } else |_| {}
-        self.hud = .{ .shell = shell, .bucks = bucks, .info = info, .status = status };
+        var mainmenu: ?uilayout.Layout = null;
+        if (self.vfs.read(self.gpa, "ui/layout/mainmenu.xml")) |mb| {
+            defer self.gpa.free(mb);
+            mainmenu = uilayout.parse(self.gpa, mb) catch null;
+        } else |_| {}
+        self.hud = .{ .shell = shell, .bucks = bucks, .info = info, .status = status, .mainmenu = mainmenu };
         _ = &shell;
         self.show_help = false;
     }
@@ -2813,6 +2837,10 @@ pub const App = struct {
         if (eq(name, "terraform")) return .{ .buy_cat = 2 };
         if (eq(name, "staff")) return .{ .buy_cat = 3 };
         if (buyTabFor(name)) |t| return .{ .buy_tab = t };
+        if (eq(name, "Freeform Button")) return .{ .menu = .open_maps };
+        if (eq(name, "Load Save Game Button")) return .{ .menu = .open_saves };
+        if (eq(name, "Game Options Button")) return .{ .menu = .open_settings };
+        if (eq(name, "Exit Game Button")) return .{ .menu = .quit };
         if (eq(name, "close")) return .{ .menu = .close_selection };
         if (eq(name, "track camera button")) return .{ .menu = .track_camera };
         if (eq(name, "Animal Info Status Tab") or eq(name, "Guest Info Button")) return .{ .info_tab = 0 };
@@ -2841,6 +2869,10 @@ pub const App = struct {
         const eq = std.ascii.eqlIgnoreCase;
         var info: uilayout.Info = .{};
         if (eq(n.name, "minimize") or eq(n.name, "maximize")) info.visible = false;
+        if (self.menu == .main and std.mem.endsWith(u8, n.name, "Pointer") and n.kind == .layout) {
+            // The paw pointer that goes with the hovered button.
+            info.visible = self.main_hover.len > 0 and std.ascii.eqlIgnoreCase(std.mem.trim(u8, n.name, " "), self.main_hover);
+        }
         if (eq(n.name, "famestars")) {
             info.visible = true;
             info.percent = self.stars() / 5.0 * 100.0;
@@ -2895,6 +2927,61 @@ pub const App = struct {
         if (h.bucks) |*b| if (b.find("zoo_bucks")) |n| uilayout.drawTop(&d, n);
         self.drawBuyPanel(ui, &d, &h.shell);
         if (h.info) |*il| self.drawEntityInfo(ui, &d, il) else self.info_drawn = false;
+    }
+
+    /// The game's launcher screen from `ui/layout/mainmenu.xml`: logo, paw
+    /// buttons and their pointers. Freeform, Load, Options and Exit work;
+    /// the rest are shown greyed out.
+    fn drawMainMenu(self: *App, ui: *viewer.Ui) !void {
+        const hud = &(self.hud orelse return);
+        const lay = &(hud.mainmenu orelse return);
+        const ctx = self.cur_ctx orelse return;
+        var c = uilayout.Canvas.fit(ui.width, ui.height);
+        c.scale *= self.ui_zoom;
+        const s = c.scale;
+        const ox = (ui.width - 1024 * s) / 2;
+        const oy = (ui.height - 768 * s) / 2;
+        const mouse = toPixels(ctx, ctx.mouse[0], ctx.mouse[1]);
+        var d: uilayout.Draw = .{
+            .ui = ui,
+            .canvas = .{ .scale = s, .off_x = ox, .off_y = oy },
+            .hooks = .{ .ctx = self, .info = hudInfo, .button = hudButton },
+            .mouse = mouse,
+            .pressed = self.lmb,
+        };
+        // Which paw button is under the pointer decides which pointer shows.
+        self.main_hover = "";
+        const buttons = [_]struct { node: []const u8, pointer: []const u8, label: []const u8 }{
+            .{ .node = "Freeform Button", .pointer = "Freeform Pointer", .label = "PLAY A FREEFORM ZOO" },
+            .{ .node = "Load Save Game Button", .pointer = "Load Save Game Pointer", .label = "LOAD A SAVED ZOO" },
+            .{ .node = "Game Options Button", .pointer = "Game Options Pointer", .label = "GAME OPTIONS" },
+            .{ .node = "Exit Game Button", .pointer = "Exit Game Pointer", .label = "QUIT" },
+            .{ .node = "Campaign Game Button", .pointer = "Campaign Game Pointer", .label = "CAMPAIGN: COMING SOON" },
+            .{ .node = "Challenge Button", .pointer = "Challenge Pointer", .label = "CHALLENGES: COMING SOON" },
+            .{ .node = "Downloads Button", .pointer = "Downloads Pointer", .label = "DOWNLOADS: NOT AVAILABLE" },
+        };
+        var hover_label: []const u8 = "";
+        for (buttons) |b| if (lay.find(b.node)) |n| {
+            const bx = ox + n.x * s;
+            const by = oy + n.y * s;
+            if (mouse[0] >= bx and mouse[0] < bx + n.w * s and mouse[1] >= by and mouse[1] < by + n.h * s) {
+                self.main_hover = b.pointer;
+                hover_label = b.label;
+            }
+        };
+        const draw_names = [_][]const u8{ "Ui back ground pieces", "Ui logo and message bar ", "Freeform Pointer", "Load Save Game Pointer", "Game Options Pointer", "Exit Game Pointer", "Campaign Game Pointer", "Challenge Pointer", "Downloads Pointer", "Freeform Button", "Challenge Button", "Campaign Game Button", "Game Options Button", "Downloads Button", "Load Save Game Button", "Exit Game Button" };
+        for (draw_names) |nm| if (lay.find(nm)) |n| {
+            uilayout.drawAt(&d, n, .{ ox + n.x * s, oy + n.y * s, n.w * s, n.h * s });
+        };
+        // The hovered button's name goes in the logo's text bar.
+        var ts: f32 = @max(1, @round(s * 1.6));
+        const label = if (hover_label.len > 0) hover_label else "ZOOTYCON2";
+        if (viewer.Ui.textWidth(label, ts) > 240 * s) ts = @max(1, ts - 1);
+        const lw = viewer.Ui.textWidth(label, ts);
+        _ = try ui.text(ui.width / 2 - lw / 2, oy + 330 * s - 3.5 * ts, ts, label, .{ 1, 0.92, 0.5, 1 });
+        const note = "AN OPEN-SOURCE ENGINE FOR ZOO TYCOON 2";
+        const nw = viewer.Ui.textWidth(note, @max(1, ts * 0.5));
+        _ = try ui.text(ui.width / 2 - nw / 2, oy + 700 * s, @max(1, ts * 0.5), note, .{ 0.85, 0.9, 0.95, 1 });
     }
 
     /// The zoo status screen on the game's own frame (`ui/layout/zoostatus.xml`):
@@ -3904,7 +3991,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, vfs: *vfs_mod.Vfs, path: []const u8, 
     app.loadGuestConfig();
     app.installHooks();
     try app.buildMapList();
-    if (opts.pick_map) app.openMenu(.maps);
+    if (opts.pick_map) app.openMenu(.main);
     try app.buildCatalogs();
     app.runScript(opts.script);
     try app.splitInput(opts.input);
