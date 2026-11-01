@@ -35,6 +35,8 @@ pub const Hooks = struct {
     flag: *const fn (ctx: *anyopaque, binder: []const u8, name: []const u8) bool,
     /// If an entity is a feeder, the kind of container it is (`FoodDish`).
     feeder: *const fn (ctx: *anyopaque, binder: []const u8) ?[]const u8,
+    /// Monthly salary of a staff entity (0 for everyone else).
+    wage: ?*const fn (ctx: *anyopaque, binder: []const u8) f32 = null,
 };
 
 /// A food or water container placed in the world.
@@ -103,7 +105,13 @@ pub const Zoo = struct {
     income: f64 = 0,
     /// Times a guest has stopped to watch an animal.
     views: u32 = 0,
+    /// Feeders refilled by keepers, and salaries paid so far.
+    refills: u32 = 0,
+    wages_paid: f64 = 0,
 };
+
+/// What a keeper is doing about feeders.
+pub const Job = enum { none, go, work };
 
 pub const Agent = struct {
     /// Behaviour driven by game data (animals); null uses the built-in
@@ -126,6 +134,11 @@ pub const Agent = struct {
     /// 0..100, rises when watching animals.
     happiness: f32 = 50,
     leave_done: bool = false,
+    /// Keepers walk to low feeders and refill them.
+    is_keeper: bool = false,
+    wage: f32 = 0,
+    job: Job = .none,
+    job_feeder: u32 = 0,
     /// Animation the agent is playing, by manifest name.
     anim_name: []const u8 = "Stand_Idle",
     /// Id of the world actor this agent drives.
@@ -335,6 +348,12 @@ pub const Sim = struct {
     adult_price: f32 = 24,
     child_price: f32 = 12,
     spawn_timer: f32 = 3,
+    /// Seconds in a pay period ("month"), and cost of one refill.
+    month_secs: f32 = 300,
+    month_timer: f32 = 300,
+    refill_fee: f32 = 10,
+    /// A keeper tops a feeder up once it falls below this.
+    refill_below: f32 = 45,
     want_spawn: bool = false,
     entrance: ?[2]f32 = null,
     entrance_node: ?u32 = null,
@@ -466,7 +485,14 @@ pub const Sim = struct {
         };
         const guest = kind == .person and isGuest(a.binder);
         const rnd = self.rng.random();
+        const keeper = kind == .person and std.ascii.findIgnoreCase(a.binder, "keeper") != null;
+        var wage: f32 = 0;
+        if (kind == .person and !guest) if (self.hooks) |h| if (h.wage) |wf| {
+            wage = wf(h.ctx, a.binder);
+        };
         return .{
+            .is_keeper = keeper,
+            .wage = wage,
             .brain = brain,
             .binder = a.binder,
             .is_guest = guest,
@@ -571,6 +597,15 @@ pub const Sim = struct {
             self.spawn_timer = self.spawn_delay[0] + rnd.float(f32) * (self.spawn_delay[1] - self.spawn_delay[0]);
             if (self.entrance_node != null and self.guest_binders.len > 0 and self.liveGuests() < self.max_guests) self.want_spawn = true;
         }
+        // Pay day.
+        self.month_timer -= dt;
+        if (self.month_timer <= 0) {
+            self.month_timer += self.month_secs;
+            for (self.agents.items) |ag| if (ag.wage > 0) {
+                self.zoo.income -= ag.wage;
+                self.zoo.wages_paid += ag.wage;
+            };
+        }
         for (self.agents.items) |*ag| {
             ag.anim_time += dt;
             if (ag.brain != null and self.hooks != null) {
@@ -581,6 +616,10 @@ pub const Sim = struct {
                 self.guestStep(ag, w, dt);
                 continue;
             }
+            if (ag.is_keeper) {
+                self.keeperStep(ag, w, dt);
+                continue;
+            }
             switch (ag.state) {
                 .idle => {
                     ag.timer -= dt;
@@ -588,6 +627,80 @@ pub const Sim = struct {
                 },
                 .walk => self.walk(ag, w, dt),
             }
+        }
+    }
+
+    fn feederById(self: *Sim, id: u32) ?*Feeder {
+        for (self.feeders.items) |*f| if (f.prop_id == id) return f;
+        return null;
+    }
+
+    /// Keepers find the emptiest unattended feeder, walk to it and refill it.
+    fn keeperStep(self: *Sim, ag: *Agent, w: *const world_mod.World, dt: f32) void {
+        switch (ag.job) {
+            .none => {
+                ag.state = .idle;
+                ag.anim = .idle;
+                ag.anim_name = "Stand_Idle";
+                ag.timer -= dt;
+                if (ag.timer > 0) return;
+                ag.timer = 1.0;
+                var best: ?*Feeder = null;
+                var best_d: f32 = std.math.inf(f32);
+                for (self.feeders.items) |*f| {
+                    if (f.food >= self.refill_below) continue;
+                    var taken = false;
+                    for (self.agents.items) |o| if (o.is_keeper and o.job != .none and o.job_feeder == f.prop_id) {
+                        taken = true;
+                    };
+                    if (taken) continue;
+                    const dx = f.pos[0] - ag.pos[0];
+                    const dy = f.pos[1] - ag.pos[1];
+                    const d = dx * dx + dy * dy;
+                    if (d < best_d) {
+                        best_d = d;
+                        best = f;
+                    }
+                }
+                if (best) |f| {
+                    ag.job = .go;
+                    ag.job_feeder = f.prop_id;
+                    ag.target = f.pos;
+                    ag.state = .walk;
+                    ag.anim = .walk;
+                    ag.anim_name = "Walk_Ahead";
+                    ag.anim_time = 0;
+                }
+            },
+            .go => {
+                if (self.feederById(ag.job_feeder) == null) {
+                    ag.job = .none;
+                    return;
+                }
+                switch (self.moveToward(ag, w, dt, ag.speed * 1.4)) {
+                    .moving => {},
+                    .arrived => {
+                        ag.job = .work;
+                        ag.timer = 2.5;
+                        ag.state = .idle;
+                        ag.anim = .idle;
+                        ag.anim_name = "Stand_Idle";
+                        ag.anim_time = 0;
+                    },
+                    .blocked => ag.job = .none,
+                }
+            },
+            .work => {
+                ag.timer -= dt;
+                if (ag.timer > 0) return;
+                if (self.feederById(ag.job_feeder)) |f| {
+                    f.food = 100;
+                    self.zoo.income -= self.refill_fee;
+                    self.zoo.refills += 1;
+                }
+                ag.job = .none;
+                ag.timer = 0.5;
+            },
         }
     }
 

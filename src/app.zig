@@ -980,6 +980,9 @@ pub const App = struct {
             try self.placeFood(self.groundAt(x, y));
         } else if (std.mem.eql(u8, verb, "foodname")) {
             self.food_i = pickByName(self.food_names.items, it.rest()) orelse return error.NotFound;
+        } else if (std.mem.eql(u8, verb, "drain")) {
+            try self.sim.sync(&self.world);
+            for (self.sim.feeders.items) |*f| f.food = 20;
         } else if (std.mem.eql(u8, verb, "hungry")) {
             try self.sim.sync(&self.world);
             for (self.sim.agents.items) |*ag| if (ag.brain) |*b| {
@@ -1150,6 +1153,29 @@ pub const App = struct {
         return null;
     }
 
+    fn hookWage(ctx: *anyopaque, binder: []const u8) f32 {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        const b = self.reg.get(binder) orelse return 0;
+        const ch = self.reg.chain(self.gpa, b) catch return 0;
+        defer self.gpa.free(ch);
+        var i = ch.len;
+        while (i > 0) {
+            i -= 1;
+            if (findSalary(ch[i].root)) |v| return @floatCast(v);
+        }
+        return 0;
+    }
+
+    fn findSalary(e: *const xml.Element) ?f64 {
+        if (std.ascii.eqlIgnoreCase(e.name, "ZTTransaction")) {
+            if (e.attr("name")) |n| if (std.ascii.eqlIgnoreCase(n, "salary")) {
+                if (e.attr("cost")) |c| return std.fmt.parseFloat(f64, c) catch null;
+            };
+        }
+        for (e.children) |c| if (findSalary(c)) |v| return v;
+        return null;
+    }
+
     fn hookFeeder(ctx: *anyopaque, binder: []const u8) ?[]const u8 {
         const self: *App = @ptrCast(@alignCast(ctx));
         return self.feederKind(binder);
@@ -1182,7 +1208,7 @@ pub const App = struct {
     }
 
     fn installHooks(self: *App) void {
-        self.sim.hooks = .{ .ctx = self, .brain = hookBrain, .anim_len = hookAnimLen, .flag = hookFlag, .feeder = hookFeeder };
+        self.sim.hooks = .{ .ctx = self, .brain = hookBrain, .anim_len = hookAnimLen, .flag = hookFlag, .feeder = hookFeeder, .wage = hookWage };
         self.sim.guest_binders = self.guest_names.items;
         self.updateGuestCap();
     }
