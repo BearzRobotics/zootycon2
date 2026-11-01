@@ -20,6 +20,15 @@ pub const Object = struct {
     rotation: [9]f32,
 };
 
+/// One straight 3-unit fence (or curb) segment on a tile edge. `kind` names
+/// an entity (`zoowall`, `chainlink`, `curb_jungle`, ...). The segment runs
+/// from `position` in the direction given by `rotation` (radians about z).
+pub const Fence = struct {
+    kind: []const u8,
+    rotation: f32,
+    position: [3]f32,
+};
+
 pub const Map = struct {
     arena: std.heap.ArenaAllocator,
     name: []const u8,
@@ -28,6 +37,7 @@ pub const Map = struct {
     environment: []const u8,
     camera: ?[3]f32,
     objects: []const Object,
+    fences: []const Fence,
 
     pub fn deinit(self: *Map) void {
         self.arena.deinit();
@@ -50,13 +60,34 @@ fn vec3(e: *const xml.Element) [3]f32 {
 const Collector = struct {
     a: std.mem.Allocator,
     list: std.ArrayList(Object) = .empty,
+    fences: std.ArrayList(Fence) = .empty,
 
     fn visit(self: *Collector, e: *const xml.Element) Error!void {
+        if (std.ascii.eqlIgnoreCase(e.name, "ZTFenceEntity")) {
+            try self.fence(e);
+            return;
+        }
         if (std.ascii.eqlIgnoreCase(e.name, "BFPhysObj")) {
             try self.physObj(e);
             return;
         }
         for (e.children) |c| try self.visit(c);
+    }
+
+    fn fence(self: *Collector, e: *const xml.Element) Error!void {
+        const kind = e.attr("ZTFenceType") orelse return;
+        const pos_text = e.attr("position") orelse return;
+        var pos: [3]f32 = .{ 0, 0, 0 };
+        var it = std.mem.tokenizeScalar(u8, pos_text, ' ');
+        for (&pos) |*v| {
+            const tok = it.next() orelse break;
+            v.* = std.fmt.parseFloat(f32, tok) catch 0;
+        }
+        try self.fences.append(self.a, .{
+            .kind = kind,
+            .rotation = attrFloat(e, "rotation", 0),
+            .position = pos,
+        });
     }
 
     fn physObj(self: *Collector, e: *const xml.Element) Error!void {
@@ -116,6 +147,7 @@ pub fn parse(gpa: std.mem.Allocator, data: []const u8) Error!Map {
         .environment = world.attr("environment") orelse "",
         .camera = cam,
         .objects = try col.list.toOwnedSlice(a),
+        .fences = try col.fences.toOwnedSlice(a),
     };
 }
 
@@ -131,6 +163,7 @@ test "parses a synthetic map" {
         \\      <rotation><row0 x="0" y="1" z="0"/><row1 x="-1" y="0" z="0"/><row2 x="0" y="0" z="1"/></rotation>
         \\    </BFPhysObj>
         \\    <BFPhysObj><BFMovingBlobShadowComponent /><position x="0" y="0" z="0" /></BFPhysObj>
+        \\    <ZTFenceEntity ZTFenceType="zoowall" rotation="1.5" position="6 9 0" />
         \\  </subComponents></BFGEntity></entityList></BFGManager>
         \\</BFContext>
     ;
@@ -142,4 +175,7 @@ test "parses a synthetic map" {
     try std.testing.expectEqual(@as(f32, 30), m.objects[0].position[2]);
     try std.testing.expectEqual(@as(f32, 1), m.objects[0].rotation[1]);
     try std.testing.expectEqual(@as(f32, 3), m.camera.?[2]);
+    try std.testing.expectEqual(@as(usize, 1), m.fences.len);
+    try std.testing.expectEqualStrings("zoowall", m.fences[0].kind);
+    try std.testing.expectEqual(@as(f32, 9), m.fences[0].position[1]);
 }

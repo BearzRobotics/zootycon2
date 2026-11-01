@@ -206,6 +206,11 @@ fn makeProgram(g: *const Gl) !gl.Uint {
 
 const max_bones = 96;
 
+const FencePieces = struct {
+    post: ?[]const Draw = null,
+    segment: ?[]const Draw = null,
+};
+
 const Skin = struct {
     /// NIF block index of each bone node.
     bones: []const u32,
@@ -251,6 +256,7 @@ pub const Scene = struct {
     interactive: bool = true,
     /// Loaded models by lowercase path, as draws relative to the model origin.
     models: std.StringHashMapUnmanaged(?[]const Draw) = .empty,
+    fence_cache: std.StringHashMapUnmanaged(FencePieces) = .empty,
 
     const Index = struct {
         scene: *Scene,
@@ -294,6 +300,9 @@ pub const Scene = struct {
             if (e.value_ptr.*) |d| self.gpa.free(d);
         }
         self.models.deinit(self.gpa);
+        var fit = self.fence_cache.keyIterator();
+        while (fit.next()) |k| self.gpa.free(k.*);
+        self.fence_cache.deinit(self.gpa);
         var it = self.textures.keyIterator();
         while (it.next()) |k| self.gpa.free(k.*);
         self.textures.deinit(self.gpa);
@@ -651,6 +660,46 @@ pub const Scene = struct {
         defer self.gpa.free(data);
         mf.* = model.parseManifest(self.gpa, data) catch return false;
         return true;
+    }
+
+    /// Model pieces for a fence type: its post and its straight segment.
+    /// Looked up in the type's entity file under `fences/ai` or `paths/ai`.
+    pub fn fenceModels(self: *Scene, kind: []const u8) !FencePieces {
+        var key_buf: [128]u8 = undefined;
+        if (kind.len == 0 or kind.len > key_buf.len) return .{};
+        const key = std.ascii.lowerString(&key_buf, kind);
+        if (self.fence_cache.get(key)) |c| return c;
+        const owned = try self.gpa.dupe(u8, key);
+        errdefer self.gpa.free(owned);
+        const pieces = try self.buildFence(key);
+        try self.fence_cache.put(self.gpa, owned, pieces);
+        return pieces;
+    }
+
+    fn buildFence(self: *Scene, kind: []const u8) !FencePieces {
+        const dirs = [_][]const u8{ "entities/objects/fences/ai", "entities/objects/paths/ai" };
+        for (dirs) |dir| {
+            var path_buf: [256]u8 = undefined;
+            const path = std.fmt.bufPrint(&path_buf, "{s}/{s}.xml", .{ dir, kind }) catch continue;
+            const bytes = self.vfs.read(self.gpa, path) catch continue;
+            defer self.gpa.free(bytes);
+            var arena: std.heap.ArenaAllocator = .init(self.gpa);
+            defer arena.deinit();
+            const root = @import("xml.zig").parse(arena.allocator(), bytes, null) catch continue;
+            const binder = root.child("binder") orelse continue;
+            var out: FencePieces = .{};
+            for (binder.children) |nb| {
+                const bname = nb.attr("binderName") orelse continue;
+                const inst = nb.child("instance") orelse continue;
+                const phys = inst.child("BFPhysObj") orelse continue;
+                const comp = phys.child("BFSceneGraphComponent") orelse phys.child("BFSimpleLODComponent") orelse continue;
+                const mf = comp.attr("modelfile") orelse continue;
+                if (std.ascii.eqlIgnoreCase(bname, "start_post")) out.post = try self.loadModel(mf);
+                if (std.ascii.eqlIgnoreCase(bname, "fence90")) out.segment = try self.loadModel(mf);
+            }
+            return out;
+        }
+        return .{};
     }
 
     /// Adds fixed copies of a model's draws, moved by `m`.
@@ -1059,6 +1108,22 @@ pub fn runMap(gpa: std.mem.Allocator, vfs: *vfs_mod.Vfs, path: []const u8, opts:
         try scene.place(draws, m);
         placed += 1;
     }
+    var fences_placed: usize = 0;
+    for (mp.fences) |f| {
+        const pieces = try scene.fenceModels(f.kind);
+        if (pieces.segment == null and pieces.post == null) continue;
+        const x = f.position[0];
+        const y = f.position[1];
+        const z = terr.zAt(x, y);
+        const c = @cos(f.rotation);
+        const sn = @sin(f.rotation);
+        const rot = [9]f32{ c, -sn, 0, sn, c, 0, 0, 0, 1 };
+        const m = fromTransform(.{ .translation = .{ x, y, z }, .rotation = rot, .scale = 1 });
+        if (pieces.segment) |d| try scene.place(d, m);
+        if (pieces.post) |d| try scene.place(d, m);
+        fences_placed += 1;
+    }
+    std.debug.print("{d} of {d} fence segments placed\n", .{ fences_placed, mp.fences.len });
     std.debug.print("{s}: {d}x{d} terrain, {d} objects placed, {d} without a model, {d} textures missing\n", .{
         path, terr.width, terr.height, placed, missing, scene.missing_textures,
     });
