@@ -280,7 +280,10 @@ const Skin = struct {
     offsets: []const Mat4,
 };
 
-const Draw = struct {
+pub const Draw = struct {
+    /// Vertex and index buffers this draw owns (deleted when it is dropped);
+    /// zero for draws that share a cached model's buffers.
+    owned: [2]gl.Uint = .{ 0, 0 },
     /// Decal layer texture (0 = none) and which UV set it uses (1 or 2).
     decal: gl.Uint = 0,
     decal_mode: i32 = 0,
@@ -350,6 +353,16 @@ pub const Scene = struct {
     dynamic_draws: bool = true,
     /// Animated figures placed in a map, each with its own skeleton pose.
     instances: std.ArrayList(Instance) = .empty,
+    /// Terrain mesh, drawn first and rebuilt when heights change.
+    terrain: ?Draw = null,
+    /// Draws of animated figures (each refers to an entry of `instances`).
+    actor_draws: std.ArrayList(Draw) = .empty,
+    /// Translucent extras drawn last: previews, highlights.
+    overlay: std.ArrayList(Draw) = .empty,
+    /// Per model path: horizontal radius and height from its vertices.
+    model_bounds: std.StringHashMapUnmanaged([2]f32) = .empty,
+    build_r: f32 = 0,
+    build_h: f32 = 0,
     actor_models: std.StringHashMapUnmanaged(?*ActorTemplate) = .empty,
     anim_cache: std.StringHashMapUnmanaged(?*bf.Animation) = .empty,
     /// Loaded models by lowercase path, as draws relative to the model origin.
@@ -391,6 +404,11 @@ pub const Scene = struct {
     pub fn deinit(self: *Scene) void {
         self.draws.deinit(self.gpa);
         self.gpa.free(self.world);
+        self.actor_draws.deinit(self.gpa);
+        self.overlay.deinit(self.gpa);
+        var bit = self.model_bounds.keyIterator();
+        while (bit.next()) |k| self.gpa.free(k.*);
+        self.model_bounds.deinit(self.gpa);
         for (self.instances.items) |i| self.gpa.free(i.world);
         self.instances.deinit(self.gpa);
         var ait = self.actor_models.iterator();
@@ -603,13 +621,15 @@ pub const Scene = struct {
             const uv2: [2]f32 = if (have_uv2) md.uv_sets[1][i] else uv;
             buf[i * vf + 16] = uv2[0];
             buf[i * vf + 17] = uv2[1];
+            const wp = transformPoint(world, v);
             if (self.interactive) {
-                const wp = transformPoint(world, v);
                 for (0..3) |k| {
                     self.min[k] = @min(self.min[k], wp[k]);
                     self.max[k] = @max(self.max[k], wp[k]);
                 }
             }
+            self.build_r = @max(self.build_r, @sqrt(wp[0] * wp[0] + wp[1] * wp[1]));
+            self.build_h = @max(self.build_h, wp[2]);
         }
 
         const skin = if (self.want_skin) try self.buildSkin(nf, geo, buf, n) else null;
@@ -663,6 +683,10 @@ pub const Scene = struct {
     /// Uploads interleaved vertices (16 floats each: position, normal, uv,
     /// bone indices, bone weights) and an index buffer; returns the vertex array.
     fn uploadMesh(self: *Scene, buf: []const f32, indices: *const anyopaque, index_bytes: usize) gl.Uint {
+        return self.uploadMeshOwned(buf, indices, index_bytes).vao;
+    }
+
+    fn uploadMeshOwned(self: *Scene, buf: []const f32, indices: *const anyopaque, index_bytes: usize) struct { vao: gl.Uint, bufs: [2]gl.Uint } {
         const g = self.g;
         var vao: gl.Uint = 0;
         var bufs: [2]gl.Uint = undefined;
@@ -687,7 +711,42 @@ pub const Scene = struct {
         g.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, bufs[1]);
         g.bufferData(gl.ELEMENT_ARRAY_BUFFER, @intCast(index_bytes), indices, gl.STATIC_DRAW);
         g.bindVertexArray(0);
-        return vao;
+        return .{ .vao = vao, .bufs = bufs };
+    }
+
+    fn freeDraw(self: *Scene, d: Draw) void {
+        if (d.owned[0] == 0) return;
+        self.g.deleteBuffers(2, &d.owned);
+        self.g.deleteVertexArrays(1, @ptrCast(&d.vao));
+    }
+
+    /// Drops every static draw (props, fences, paths), keeping the terrain,
+    /// the animated figures and all cached models.
+    pub fn clearStatic(self: *Scene) void {
+        for (self.draws.items) |d| self.freeDraw(d);
+        self.draws.clearRetainingCapacity();
+    }
+
+    /// Drops every animated figure.
+    pub fn clearActors(self: *Scene) void {
+        for (self.instances.items) |i| self.gpa.free(i.world);
+        self.instances.clearRetainingCapacity();
+        self.actor_draws.clearRetainingCapacity();
+    }
+
+    /// Copies a model's draws into the overlay, moved by `m` and tinted
+    /// (used for placement previews and selection highlights).
+    pub fn addOverlay(self: *Scene, draws: []const Draw, m: Mat4, tint: [4]f32) !void {
+        for (draws) |d| {
+            var c = d;
+            c.world = mul(m, d.world);
+            c.dynamic = false;
+            c.skin = null;
+            c.tint = .{ d.tint[0] * tint[0], d.tint[1] * tint[1], d.tint[2] * tint[2], tint[3] };
+            c.blend = true;
+            c.depth_write = false;
+            try self.overlay.append(self.gpa, c);
+        }
     }
 
     /// Adds a terrain mesh: one vertex per grid point, shaded by normals.
@@ -732,13 +791,15 @@ pub const Scene = struct {
             idx[k..][0..6].* = .{ a, b, d, a, d, c };
             k += 6;
         };
-        const vao = self.uploadMesh(buf, idx.ptr, idx.len * 4);
-        try self.draws.append(self.gpa, .{
+        const up = self.uploadMeshOwned(buf, idx.ptr, idx.len * 4);
+        if (self.terrain) |old| self.freeDraw(old);
+        self.terrain = .{
+            .owned = up.bufs,
             .dynamic = false,
             .index_type = gl.UNSIGNED_INT,
             .block = 0,
             .skin = null,
-            .vao = vao,
+            .vao = up.vao,
             .index_count = @intCast(idx.len),
             .world = identity,
             .texture = flat_tex[0],
@@ -747,7 +808,7 @@ pub const Scene = struct {
             .tint = tint,
             .blend = false,
             .alpha_cut = 0,
-        });
+        };
     }
 
     /// Drapes path tiles over the terrain: one blended mesh per texture.
@@ -791,8 +852,10 @@ pub const Scene = struct {
                 };
             }
             const tex = self.loadTexturePath(first.texture);
-            const vao = self.uploadMesh(verts.items, idx.items.ptr, idx.items.len * 4);
+            const up = self.uploadMeshOwned(verts.items, idx.items.ptr, idx.items.len * 4);
+            const vao = up.vao;
             try self.draws.append(self.gpa, .{
+                .owned = up.bufs,
                 .depth_write = false,
                 .dynamic = false,
                 .index_type = gl.UNSIGNED_INT,
@@ -830,9 +893,24 @@ pub const Scene = struct {
 
         const owned_key = try self.gpa.dupe(u8, key);
         errdefer self.gpa.free(owned_key);
+        self.build_r = 0;
+        self.build_h = 0;
         const result = try self.buildModel(key);
         try self.models.put(self.gpa, owned_key, result);
+        if (result != null) {
+            const bkey = try self.gpa.dupe(u8, key);
+            errdefer self.gpa.free(bkey);
+            try self.model_bounds.put(self.gpa, bkey, .{ self.build_r, self.build_h });
+        }
         return result;
+    }
+
+    /// Horizontal radius and height of a loaded model.
+    pub fn modelBounds(self: *Scene, path: []const u8) ?[2]f32 {
+        var key_buf: [512]u8 = undefined;
+        if (path.len == 0 or path.len > key_buf.len) return null;
+        for (path, 0..) |ch, i| key_buf[i] = if (ch == '\\') '/' else std.ascii.toLower(ch);
+        return self.model_bounds.get(key_buf[0..path.len]);
     }
 
     fn buildModel(self: *Scene, key: []const u8) !?[]const Draw {
@@ -981,7 +1059,7 @@ pub const Scene = struct {
             var c = d;
             c.inst = idx;
             self.applySwaps(&c, swaps);
-            try self.draws.append(self.gpa, c);
+            try self.actor_draws.append(self.gpa, c);
         }
         return true;
     }
@@ -1100,6 +1178,8 @@ pub const Options = struct {
     /// Initial camera yaw and pitch in radians, if given.
     yaw: ?f32 = null,
     pitch: ?f32 = null,
+    /// Mouse button that orbits the camera (1 left, 3 right).
+    orbit_button: u8 = 1,
     /// Map position to look at (x, y), instead of the map centre.
     focus: ?[2]f32 = null,
     /// Camera distance as a multiple of the default.
@@ -1191,15 +1271,102 @@ const Playback = struct {
     anim: *const bf.Animation,
 };
 
-const Camera = struct {
+pub const Camera = struct {
     center: [3]f32,
     radius: f32,
     yaw: f32 = -0.8,
     pitch: f32 = 0.45,
     dist: f32,
+
+    pub const fov_y: f32 = 0.8;
+
+    pub fn eye(self: Camera) [3]f32 {
+        return .{
+            self.center[0] + self.dist * @cos(self.pitch) * @cos(self.yaw),
+            self.center[1] + self.dist * @cos(self.pitch) * @sin(self.yaw),
+            self.center[2] + self.dist * @sin(self.pitch),
+        };
+    }
+
+    /// World-space ray through window position (mx, my) in a viewport of
+    /// the given size.
+    pub fn ray(self: Camera, mx: f32, my: f32, width: f32, height: f32) struct { origin: [3]f32, dir: [3]f32 } {
+        const e = self.eye();
+        const f = normalize3(.{ self.center[0] - e[0], self.center[1] - e[1], self.center[2] - e[2] });
+        const right = normalize3(cross(f, .{ 0, 0, 1 }));
+        const up = cross(right, f);
+        const t = @tan(fov_y / 2);
+        const nx = (2 * mx / width - 1) * t * (width / height);
+        const ny = (1 - 2 * my / height) * t;
+        return .{
+            .origin = e,
+            .dir = normalize3(.{
+                f[0] + right[0] * nx + up[0] * ny,
+                f[1] + right[1] * nx + up[1] * ny,
+                f[2] + right[2] * nx + up[2] * ny,
+            }),
+        };
+    }
 };
 
+/// What hooks see each frame and on each event.
+pub const FrameCtx = struct {
+    cam: *Camera,
+    win: platform.Window,
+    width: u32,
+    height: u32,
+    /// Seconds since the loop started, and since the previous frame.
+    secs: f32 = 0,
+    dt: f32 = 0,
+    /// Last known mouse position in window coordinates.
+    mouse: [2]f32 = .{ 0, 0 },
+    /// Set by a hook to end the loop.
+    quit: bool = false,
+};
+
+const NoHooks = struct {
+    pub fn event(_: *NoHooks, _: platform.Event, _: *FrameCtx) void {}
+    pub fn frame(_: *NoHooks, _: *FrameCtx) !void {}
+};
+
+fn drawItem(gfx: *Gfx, scene: *Scene, d: Draw) void {
+    const g = &gfx.g;
+    g.activeTexture(gl.TEXTURE0 + 1);
+    g.bindTexture(gl.TEXTURE_2D, d.texture2);
+    g.uniform1i(gfx.u_terrain, if (d.texture2 != 0) 1 else 0);
+    if (d.texture2 != 0) for (d.flat_extra, 0..) |tx, i| {
+        g.activeTexture(gl.TEXTURE0 + 3 + @as(gl.Enum, @intCast(i)));
+        g.bindTexture(gl.TEXTURE_2D, tx);
+    };
+    g.activeTexture(gl.TEXTURE0 + 2);
+    g.bindTexture(gl.TEXTURE_2D, d.decal);
+    g.uniform1i(gfx.u_decal_mode, if (d.decal != 0) d.decal_mode else 0);
+    g.activeTexture(gl.TEXTURE0);
+    const wl: []const Mat4 = if (d.inst) |i| scene.instances.items[i].world else scene.world;
+    if (d.skin) |sk| {
+        var mats: [max_bones]Mat4 = undefined;
+        for (sk.bones, sk.offsets, 0..) |bn, off, i| mats[i] = mul(wl[bn], off);
+        g.uniform1i(gfx.u_skinned, 1);
+        g.uniformMatrix4fv(gfx.u_bones, @intCast(sk.bones.len), 0, @ptrCast(&mats));
+    } else {
+        g.uniform1i(gfx.u_skinned, 0);
+        g.uniformMatrix4fv(gfx.u_model, 1, 0, if (d.dynamic) &wl[d.block] else &d.world);
+    }
+    g.uniform4f(gfx.u_tint, d.tint[0], d.tint[1], d.tint[2], d.tint[3]);
+    g.uniform1f(gfx.u_cut, d.alpha_cut);
+    g.bindTexture(gl.TEXTURE_2D, d.texture);
+    if (d.blend) g.enable(gl.BLEND) else g.disable(gl.BLEND);
+    g.depthMask(if (d.depth_write) 1 else 0);
+    g.bindVertexArray(d.vao);
+    g.drawElements(gl.TRIANGLES, d.index_count, d.index_type, null);
+}
+
 fn loop(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Camera, play: ?Playback, opts: Options) !void {
+    var hooks: NoHooks = .{};
+    return loopWith(gpa, gfx, scene, cam_init, play, opts, &hooks);
+}
+
+pub fn loopWith(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Camera, play: ?Playback, opts: Options, hooks: anytype) !void {
     const g = &gfx.g;
     const plat = gfx.plat;
     var cam = cam_init;
@@ -1211,6 +1378,7 @@ fn loop(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Camera, play
     var last_y: f32 = 0;
     var size = gfx.win.pixelSize();
     var held = [4]bool{ false, false, false, false }; // w a s d
+    var ctx: FrameCtx = .{ .cam = &cam, .win = gfx.win, .width = size.width, .height = size.height };
 
     g.enable(gl.DEPTH_TEST);
     g.depthFunc(gl.LEQUAL);
@@ -1220,7 +1388,12 @@ fn loop(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Camera, play
     const start_ms = plat.ticksMs();
     var prev_ms = start_ms;
     main: while (true) {
-        while (plat.pollEvent()) |ev| switch (ev) {
+        while (plat.pollEvent()) |ev| {
+            ctx.width = size.width;
+            ctx.height = size.height;
+            hooks.event(ev, &ctx);
+            if (ctx.quit) break :main;
+            switch (ev) {
             .quit => break :main,
             .key_down => |k| switch (k.scancode) {
                 platform.scancode_escape => break :main,
@@ -1238,7 +1411,7 @@ fn loop(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Camera, play
                 else => {},
             },
             .resized => |r| size = .{ .width = @max(r.width, 1), .height = @max(r.height, 1) },
-            .mouse_button => |b| if (b.button == 1) {
+            .mouse_button => |b| if (b.button == opts.orbit_button) {
                 dragging = b.down;
                 last_x = b.x;
                 last_y = b.y;
@@ -1250,13 +1423,21 @@ fn loop(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Camera, play
                 }
                 last_x = m.x;
                 last_y = m.y;
+                ctx.mouse = .{ m.x, m.y };
             },
             .mouse_wheel => |w| cam.dist = std.math.clamp(cam.dist * std.math.pow(f32, 0.9, w.dy), cam.radius * 0.05, cam.radius * 20),
-        };
+            }
+        }
 
         const now_ms = plat.ticksMs();
         const dt = @as(f32, @floatFromInt(now_ms - prev_ms)) / 1000.0;
         prev_ms = now_ms;
+        ctx.dt = dt;
+        ctx.secs = @as(f32, @floatFromInt(now_ms - start_ms)) / 1000.0;
+        ctx.width = size.width;
+        ctx.height = size.height;
+        try hooks.frame(&ctx);
+        if (ctx.quit) break :main;
         // WASD pans the look-at point across the ground plane.
         const fwd = [2]f32{ -@cos(cam.yaw), -@sin(cam.yaw) };
         const right = [2]f32{ fwd[1], -fwd[0] };
@@ -1297,36 +1478,10 @@ fn loop(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Camera, play
         g.uniform1i(gfx.u_tex2, 1);
         g.uniform1i(gfx.u_decal, 2);
         for (gfx.u_flat, 0..) |loc, i| g.uniform1i(loc, @intCast(3 + i));
-        for (scene.draws.items) |d| {
-            g.activeTexture(gl.TEXTURE0 + 1);
-            g.bindTexture(gl.TEXTURE_2D, d.texture2);
-            g.uniform1i(gfx.u_terrain, if (d.texture2 != 0) 1 else 0);
-            if (d.texture2 != 0) for (d.flat_extra, 0..) |tx, i| {
-                g.activeTexture(gl.TEXTURE0 + 3 + @as(gl.Enum, @intCast(i)));
-                g.bindTexture(gl.TEXTURE_2D, tx);
-            };
-            g.activeTexture(gl.TEXTURE0 + 2);
-            g.bindTexture(gl.TEXTURE_2D, d.decal);
-            g.uniform1i(gfx.u_decal_mode, if (d.decal != 0) d.decal_mode else 0);
-            g.activeTexture(gl.TEXTURE0);
-            const wl: []const Mat4 = if (d.inst) |i| scene.instances.items[i].world else scene.world;
-            if (d.skin) |sk| {
-                var mats: [max_bones]Mat4 = undefined;
-                for (sk.bones, sk.offsets, 0..) |bn, off, i| mats[i] = mul(wl[bn], off);
-                g.uniform1i(gfx.u_skinned, 1);
-                g.uniformMatrix4fv(gfx.u_bones, @intCast(sk.bones.len), 0, @ptrCast(&mats));
-            } else {
-                g.uniform1i(gfx.u_skinned, 0);
-                g.uniformMatrix4fv(gfx.u_model, 1, 0, if (d.dynamic) &wl[d.block] else &d.world);
-            }
-            g.uniform4f(gfx.u_tint, d.tint[0], d.tint[1], d.tint[2], d.tint[3]);
-            g.uniform1f(gfx.u_cut, d.alpha_cut);
-            g.bindTexture(gl.TEXTURE_2D, d.texture);
-            if (d.blend) g.enable(gl.BLEND) else g.disable(gl.BLEND);
-            g.depthMask(if (d.depth_write) 1 else 0);
-            g.bindVertexArray(d.vao);
-            g.drawElements(gl.TRIANGLES, d.index_count, d.index_type, null);
-        }
+        if (scene.terrain) |t| drawItem(gfx, scene, t);
+        for (scene.draws.items) |d| drawItem(gfx, scene, d);
+        for (scene.actor_draws.items) |d| drawItem(gfx, scene, d);
+        for (scene.overlay.items) |d| drawItem(gfx, scene, d);
 
         frame += 1;
         if (opts.screenshot) |w| {

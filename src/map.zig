@@ -250,6 +250,10 @@ pub fn parse(gpa: std.mem.Allocator, data: []const u8) Error!Map {
     var col: Collector = .{ .a = a };
     try col.visit(root);
 
+    const objects = try col.list.toOwnedSlice(a);
+    const fences = try col.fences.toOwnedSlice(a);
+    const paths = try col.paths.toOwnedSlice(a);
+    const actors = try col.actors.toOwnedSlice(a);
     return .{
         .arena = arena,
         .name = if (map_data) |m| m.attr("name") orelse "" else "",
@@ -257,10 +261,10 @@ pub fn parse(gpa: std.mem.Allocator, data: []const u8) Error!Map {
         .terrain_file = world.attr("terrFile") orelse return error.BadMap,
         .environment = world.attr("environment") orelse "",
         .camera = cam,
-        .objects = try col.list.toOwnedSlice(a),
-        .fences = try col.fences.toOwnedSlice(a),
-        .paths = try col.paths.toOwnedSlice(a),
-        .actors = try col.actors.toOwnedSlice(a),
+        .objects = objects,
+        .fences = fences,
+        .paths = paths,
+        .actors = actors,
     };
 }
 

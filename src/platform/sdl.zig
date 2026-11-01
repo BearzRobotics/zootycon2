@@ -114,6 +114,10 @@ pub const Window = struct {
         return .{ .handle = w };
     }
 
+    pub fn setTitle(self: Window, title: [:0]const u8) void {
+        _ = c.SDL_SetWindowTitle(self.handle, title.ptr);
+    }
+
     /// Size of the drawable area in pixels (differs from window size on HiDPI).
     pub fn pixelSize(self: Window) struct { width: u32, height: u32 } {
         var w: c_int = 0;

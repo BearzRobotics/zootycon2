@@ -154,6 +154,8 @@ pub fn parse(gpa: std.mem.Allocator, data: []const u8) Error!Terrain {
         out.* = f32le(data, rec) + f32le(data, rec + 18);
         pt.* = @intCast(@min(u32le(data, rec + 8), 255));
     }
+    // Allocate everything before copying the arena into the result.
+    const raw = try a.dupe(u8, data);
     return .{
         .arena = arena,
         .width = w,
@@ -163,7 +165,7 @@ pub fn parse(gpa: std.mem.Allocator, data: []const u8) Error!Terrain {
         .biomes = names,
         .z = z,
         .paint = paint,
-        .raw = try a.dupe(u8, data),
+        .raw = raw,
         .first_record = pos,
         .stride = stride,
     };
