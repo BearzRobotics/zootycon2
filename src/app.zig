@@ -90,8 +90,11 @@ const Hit = struct {
     y: f32,
     w: f32,
     h: f32,
-    action: union(enum) { tool: Tool, pick: usize, none, menu: MenuAction, entry: usize },
+    action: union(enum) { tool: Tool, pick: usize, none, menu: MenuAction, entry: usize, buy_cat: u8, buy_tab: BuyTab, buy_item: usize },
 };
+
+/// Tabs of the buy panel, as in the game's own panel.
+pub const BuyTab = enum { fence, path, building, scenery, animal, food, staff, deform };
 
 /// Which full-screen menu is open (if any).
 const Menu = enum { none, pause, maps, saves, settings, finances };
@@ -286,9 +289,21 @@ pub const App = struct {
     hud: ?struct { shell: uilayout.Layout, bucks: ?uilayout.Layout } = null,
     hud_on: bool = true,
     hud_text: [64]u8 = undefined,
+    /// The buy panel: which main category is open (0 construction, 1 animals,
+    /// 2 terraform, 3 staff; null = closed), its tab, and scroll position.
+    buy_cat: ?u8 = null,
+    buy_tab: BuyTab = .fence,
+    buy_scroll: usize = 0,
+    buy_rect: [4]f32 = .{ 0, 0, 0, 0 },
+    buy_lists: [8]std.ArrayList(u32) = @splat(.empty),
+    /// Item icon files by name (`lion_adult_f` -> .../lion_adult_f_icon.dds).
+    icons: std.StringHashMapUnmanaged([]const u8) = .empty,
+    buy_hover: ?struct { tab: BuyTab, pos: usize } = null,
 
     pub fn deinit(self: *App) void {
         if (self.audio) |*a| a.deinit();
+        for (&self.buy_lists) |*l| l.deinit(self.gpa);
+        self.icons.deinit(self.gpa);
         if (self.hud) |*h| {
             h.shell.deinit();
             if (h.bucks) |*b| b.deinit();
@@ -352,6 +367,11 @@ pub const App = struct {
         fn add(self: Scan, path: []const u8) anyerror!void {
             const a = self.app;
             const ca = a.catalog_arena.allocator();
+            if (std.mem.startsWith(u8, path, "entities/") and std.mem.endsWith(u8, path, "_icon.dds")) {
+                const base = std.fs.path.basename(path);
+                try a.icons.put(a.gpa, try ca.dupe(u8, base[0 .. base.len - 9]), try ca.dupe(u8, path));
+                return;
+            }
             if (std.mem.startsWith(u8, path, "entities/objects/") and std.mem.endsWith(u8, path, ".nif")) {
                 const dirs = [_][]const u8{ "foliage/", "rocks/", "scenery/", "buildings/", "shelters/", "items/", "enrichment/", "props/" };
                 const rest = path["entities/objects/".len..];
@@ -419,6 +439,7 @@ pub const App = struct {
             try self.food_names.append(self.gpa, try ca.dupe(u8, bd.name));
         }
         std.mem.sort([]const u8, self.food_names.items, {}, lessStr);
+        self.buildBuyLists();
         // Start on a sensible default: the first path texture that is a concrete path.
         for (self.path_textures.items, 0..) |t, i| if (std.mem.indexOf(u8, t, "concrete") != null) {
             self.path_i = i;
@@ -1636,8 +1657,14 @@ pub const App = struct {
                 else => {},
             },
             .mouse_wheel => |w| if (self.opts.tools and self.over_ui and w.dy != 0) {
-                // Scrolling over the item list moves through the items.
-                self.stepItemBy(if (w.dy > 0) -1 else 1);
+                const mp = toPixels(ctx, ctx.mouse[0], ctx.mouse[1]);
+                const br = self.buy_rect;
+                if (self.hudActive() and self.buy_cat != null and mp[0] >= br[0] and mp[0] < br[0] + br[2] and mp[1] >= br[1] and mp[1] < br[1] + br[3]) {
+                    if (w.dy > 0) self.buy_scroll -|= 1 else self.buy_scroll += 1;
+                } else if (!self.hudActive()) {
+                    // Scrolling over the item list moves through the items.
+                    self.stepItemBy(if (w.dy > 0) -1 else 1);
+                }
                 ctx.consumed = true;
             },
             .mouse_button => |b| if (self.opts.tools and b.button == 1) {
@@ -1916,6 +1943,247 @@ pub const App = struct {
         return if (self.hudActive()) 58 * uilayout.Canvas.fit(ui.width, ui.height).scale else 0;
     }
 
+
+    // ------------------------------------------------------------ buy panel
+
+    fn buildBuyLists(self: *App) void {
+        for (&self.buy_lists) |*l| l.clearRetainingCapacity();
+        const add = struct {
+            fn f(a: *App, t: BuyTab, i: usize) void {
+                a.buy_lists[@intFromEnum(t)].append(a.gpa, @intCast(i)) catch {};
+            }
+        }.f;
+        for (0..self.fence_kinds.items.len) |i| add(self, .fence, i);
+        for (0..self.path_textures.items.len) |i| add(self, .path, i);
+        for (0..self.props.items.len) |i| add(self, .scenery, i);
+        for (self.food_names.items, 0..) |n, i| {
+            if (self.feederKind(n) != null) add(self, .food, i);
+            if (self.reg.get(n)) |b| if (venueNeed(b) != null) add(self, .building, i);
+        }
+        for (self.actor_names.items, 0..) |n, i| {
+            if (sim_mod.classify(n) == .animal) {
+                if (std.mem.indexOf(u8, n, "Adult") != null and std.mem.indexOf(u8, n, "uper") == null) add(self, .animal, i);
+            } else if (!sim_mod.isGuest(n)) add(self, .staff, i);
+        }
+    }
+
+    /// The icon file for an item of a tab, by the game's naming convention.
+    fn iconFor(self: *App, tab: BuyTab, idx: usize) ?[]const u8 {
+        var buf: [128]u8 = undefined;
+        var name: []const u8 = switch (tab) {
+            .fence => self.fence_kinds.items[idx],
+            .path => return self.path_textures.items[idx],
+            .scenery => std.fs.path.stem(self.props.items[idx]),
+            .building, .food => self.food_names.items[idx],
+            .animal, .staff => self.actor_names.items[idx],
+            .deform => return null,
+        };
+        // Try the full name, then without trailing parts (variant, sex, age).
+        var tries: usize = 0;
+        while (tries < 3 and name.len > 0) : (tries += 1) {
+            if (name.len > buf.len) return null;
+            if (self.icons.get(std.ascii.lowerString(&buf, name))) |p| return p;
+            const cut = std.mem.lastIndexOfScalar(u8, name, '_') orelse return null;
+            name = name[0..cut];
+        }
+        return null;
+    }
+
+    fn itemName(self: *const App, tab: BuyTab, idx: usize) []const u8 {
+        return switch (tab) {
+            .fence => self.fence_kinds.items[idx],
+            .path => std.fs.path.stem(self.path_textures.items[idx]),
+            .scenery => std.fs.path.stem(self.props.items[idx]),
+            .building, .food => self.food_names.items[idx],
+            .animal, .staff => self.actor_names.items[idx],
+            .deform => "",
+        };
+    }
+
+    fn itemPrice(self: *App, tab: BuyTab, idx: usize) f64 {
+        return switch (tab) {
+            .fence => self.costOf(self.fence_kinds.items[idx], 20),
+            .path => path_cost,
+            .scenery => prop_cost,
+            .building, .food => self.costOf(self.food_names.items[idx], 50),
+            .animal, .staff => self.costOf(self.actor_names.items[idx], 100),
+            .deform => 0,
+        };
+    }
+
+    fn tabTool(tab: BuyTab) Tool {
+        return switch (tab) {
+            .fence => .fence,
+            .path => .path,
+            .building, .food => .food,
+            .scenery => .prop,
+            .animal, .staff => .actor,
+            .deform => .raise,
+        };
+    }
+
+    fn openBuyCat(self: *App, cat: u8) void {
+        if (self.buy_cat != null and self.buy_cat.? == cat) {
+            self.buy_cat = null;
+            return;
+        }
+        self.buy_cat = cat;
+        self.buy_scroll = 0;
+        self.setBuyTab(switch (cat) {
+            0 => .fence,
+            1 => .animal,
+            2 => .deform,
+            else => .staff,
+        });
+    }
+
+    fn setBuyTab(self: *App, tab: BuyTab) void {
+        self.buy_tab = tab;
+        self.buy_scroll = 0;
+        self.tool = tabTool(tab);
+        self.fence_start = null;
+        self.title_dirty = true;
+    }
+
+    fn buyTabCat(tab: BuyTab) u8 {
+        return switch (tab) {
+            .fence, .path, .building, .scenery => 0,
+            .animal, .food => 1,
+            .deform => 2,
+            .staff => 3,
+        };
+    }
+
+    fn buyTabFor(name: []const u8) ?BuyTab {
+        const eq = std.ascii.eqlIgnoreCase;
+        if (eq(name, "Fence Tab")) return .fence;
+        if (eq(name, "Path Tab")) return .path;
+        if (eq(name, "Building Tab")) return .building;
+        if (eq(name, "Scenery Tab")) return .scenery;
+        if (eq(name, "Buy Animal Tab")) return .animal;
+        if (eq(name, "Animal Food Tab")) return .food;
+        if (eq(name, "Staff Tab")) return .staff;
+        if (eq(name, "Terrain Deformation Tab")) return .deform;
+        return null;
+    }
+
+    fn selectBuyItem(self: *App, pos: usize) void {
+        const list = self.buy_lists[@intFromEnum(self.buy_tab)].items;
+        if (pos >= list.len) return;
+        const idx: usize = list[pos];
+        self.tool = tabTool(self.buy_tab);
+        switch (self.buy_tab) {
+            .fence => self.fence_i = idx,
+            .path => self.path_i = idx,
+            .scenery => self.prop_i = idx,
+            .building, .food => self.food_i = idx,
+            .animal, .staff => {
+                if (self.actorDef(self.actor_names.items[idx]) == null) {
+                    self.say("{s} has no model", .{self.actor_names.items[idx]});
+                    return;
+                }
+                self.actor_i = idx;
+            },
+            .deform => {},
+        }
+        self.fence_start = null;
+        self.title_dirty = true;
+    }
+
+    /// Which item of the open tab is currently the placement choice.
+    fn currentBuyIndex(self: *const App) usize {
+        return switch (self.buy_tab) {
+            .fence => self.fence_i,
+            .path => self.path_i,
+            .scenery => self.prop_i,
+            .building, .food => self.food_i,
+            .animal, .staff => self.actor_i,
+            .deform => 0,
+        };
+    }
+
+    /// The game's buy panel: category tabs from its layout over its own panel
+    /// background, with a scrolling grid of item icons and prices.
+    fn drawBuyPanel(self: *App, ui: *viewer.Ui, d: *uilayout.Draw, shell: *const uilayout.Layout) void {
+        const cat = self.buy_cat orelse return;
+        const c = d.canvas;
+        const s = c.scale;
+        const ox = 278 * s;
+        const oy = c.off_y + 384 * s;
+        ui.template("buyandpgb", 276 * s, oy + 212 * s, 436 * s, 173 * s, s, 1);
+        const set_name = switch (cat) {
+            0 => "Construction ToggleSet",
+            1 => "Animal ToggleSet",
+            2 => "Terraform Toggleset",
+            else => "Staff ToggleSet",
+        };
+        if (shell.find(set_name)) |n| uilayout.drawAt(d, n, .{ ox, oy + 170 * s, 450 * s, 256 * s });
+        if (self.buy_tab == .deform) {
+            if (shell.find("Terrain Deformation Toggle Set")) |n| uilayout.drawAt(d, n, .{ ox, oy + 185 * s, 450 * s, 256 * s });
+            self.buy_rect = .{ 0, 0, 0, 0 };
+            return;
+        }
+        // Item grid inside the panel background.
+        const gx = 292 * s;
+        const gy = oy + 222 * s;
+        const cell_w = 58 * s;
+        const cell_h = 74 * s;
+        const cols: usize = @max(1, @as(usize, @intFromFloat(392 * s / cell_w)));
+        const rows: usize = 2;
+        self.buy_rect = .{ 276 * s, oy + 212 * s, 436 * s, 173 * s };
+        const list = self.buy_lists[@intFromEnum(self.buy_tab)].items;
+        const total_rows = (list.len + cols - 1) / cols;
+        if (total_rows > rows and self.buy_scroll > total_rows - rows) self.buy_scroll = total_rows - rows;
+        if (total_rows <= rows) self.buy_scroll = 0;
+        const first = self.buy_scroll * cols;
+        const ts: f32 = @max(1, @round(s));
+        const cur = self.currentBuyIndex();
+        self.buy_hover = null;
+        const mouse = d.mouse;
+        var k: usize = 0;
+        while (k < cols * rows) : (k += 1) {
+            const pos = first + k;
+            if (pos >= list.len) break;
+            const idx: usize = list[pos];
+            const x = gx + @as(f32, @floatFromInt(k % cols)) * cell_w;
+            const y = gy + @as(f32, @floatFromInt(k / cols)) * cell_h;
+            const hot = mouse[0] >= x and mouse[0] < x + cell_w and mouse[1] >= y and mouse[1] < y + cell_h;
+            if (hot) self.buy_hover = .{ .tab = self.buy_tab, .pos = pos };
+            if (idx == cur and tabTool(self.buy_tab) == self.tool) ui.rect(x, y, cell_w - 2 * s, cell_h - 2 * s, .{ 1, 0.9, 0.4, 0.35 }) catch {} else if (hot) ui.rect(x, y, cell_w - 2 * s, cell_h - 2 * s, .{ 1, 1, 1, 0.18 }) catch {};
+            const isz = 50 * s;
+            if (self.iconFor(self.buy_tab, idx)) |ip| if (ui.sprite(ip)) |spr| {
+                // Entity icons are 2x2 atlases of states (normal, lit, pressed, off).
+                const atlas = self.buy_tab != .path and spr.w >= 128;
+                const src: [4]f32 = if (atlas) .{ 0, 0, spr.w / 2, spr.h / 2 } else .{ 0, 0, spr.w, spr.h };
+                ui.image(spr, x + 2 * s, y + 2 * s, isz, isz, src, .{ 1, 1, 1, 1 }) catch {};
+            };
+            var pb: [24]u8 = undefined;
+            const price = std.fmt.bufPrint(&pb, "${d:.0}", .{self.itemPrice(self.buy_tab, idx)}) catch "";
+            const pw = viewer.Ui.textWidth(price, ts);
+            const afford = self.sim.zoo.income >= self.itemPrice(self.buy_tab, idx);
+            _ = ui.text(x + (cell_w - 2 * s - pw) / 2, y + 54 * s, ts, price, if (afford) .{ 0.55, 0.95, 0.55, 1 } else .{ 1, 0.5, 0.45, 1 }) catch {};
+            self.hits.append(self.gpa, .{ .x = x, .y = y, .w = cell_w - 2 * s, .h = cell_h - 2 * s, .action = .{ .buy_item = pos } }) catch {};
+        }
+        // Name of the hovered or chosen item.
+        var shown: usize = cur;
+        if (self.buy_hover) |hv| shown = self.buy_lists[@intFromEnum(hv.tab)].items[hv.pos];
+        if (shown < 100000) {
+            const nm = self.itemName(self.buy_tab, @min(shown, self.itemCountForTab(self.buy_tab) -| 1));
+            if (nm.len > 0) ui.label(gx, oy + 214 * s, ts, nm[0..@min(nm.len, 48)], .{ 1, 0.92, 0.5, 1 }) catch {};
+        }
+    }
+
+    fn itemCountForTab(self: *const App, tab: BuyTab) usize {
+        return switch (tab) {
+            .fence => self.fence_kinds.items.len,
+            .path => self.path_textures.items.len,
+            .scenery => self.props.items.len,
+            .building, .food => self.food_names.items.len,
+            .animal, .staff => self.actor_names.items.len,
+            .deform => 0,
+        };
+    }
+
     fn hudActive(self: *const App) bool {
         return self.hud != null and self.hud_on and self.opts.tools;
     }
@@ -1934,11 +2202,20 @@ pub const App = struct {
         self.show_help = false;
     }
 
+    fn buy_open_tab(self: *const App, t: BuyTab) bool {
+        return self.buy_tab == t;
+    }
+
     fn hudAction(name: []const u8) ?@TypeOf(@as(Hit, undefined).action) {
         const eq = std.ascii.eqlIgnoreCase;
-        if (eq(name, "construction")) return .{ .tool = .prop };
-        if (eq(name, "animals") or eq(name, "staff")) return .{ .tool = .actor };
-        if (eq(name, "terraform")) return .{ .tool = .raise };
+        if (eq(name, "construction")) return .{ .buy_cat = 0 };
+        if (eq(name, "animals")) return .{ .buy_cat = 1 };
+        if (eq(name, "terraform")) return .{ .buy_cat = 2 };
+        if (eq(name, "staff")) return .{ .buy_cat = 3 };
+        if (buyTabFor(name)) |t| return .{ .buy_tab = t };
+        if (eq(name, "hill")) return .{ .tool = .raise };
+        if (eq(name, "valley")) return .{ .tool = .lower };
+        if (eq(name, "flatten")) return .{ .tool = .flatten };
         if (eq(name, "Zoofinance")) return .{ .menu = .open_finances };
         if (eq(name, "undo")) return .{ .menu = .undo };
         if (eq(name, "delete")) return .{ .menu = .delete_selected };
@@ -1968,9 +2245,14 @@ pub const App = struct {
         }
         if (n.kind == .toggle or n.kind == .button) {
             info.enabled = hudAction(n.name) != null;
-            if (eq(n.name, "construction")) info.on = self.tool == .prop or self.tool == .fence or self.tool == .path or self.tool == .food;
-            if (eq(n.name, "animals") or eq(n.name, "staff")) info.on = self.tool == .actor;
-            if (eq(n.name, "terraform")) info.on = self.tool == .raise or self.tool == .lower or self.tool == .flatten;
+            if (eq(n.name, "construction")) info.on = self.buy_cat != null and self.buy_cat.? == 0;
+            if (eq(n.name, "animals")) info.on = self.buy_cat != null and self.buy_cat.? == 1;
+            if (eq(n.name, "terraform")) info.on = self.buy_cat != null and self.buy_cat.? == 2;
+            if (eq(n.name, "staff")) info.on = self.buy_cat != null and self.buy_cat.? == 3;
+            if (buyTabFor(n.name)) |t| info.on = self.buy_open_tab(t);
+            if (eq(n.name, "hill")) info.on = self.tool == .raise;
+            if (eq(n.name, "valley")) info.on = self.tool == .lower;
+            if (eq(n.name, "flatten")) info.on = self.tool == .flatten;
             if (eq(n.name, "pause")) info.on = self.paused;
         }
         return info;
@@ -1995,6 +2277,7 @@ pub const App = struct {
         const tops = [_][]const u8{ "famestarwells", "zoo fame stars", "CurrentDate Background", "Primary Game Button Panel" };
         for (tops) |name| if (h.shell.find(name)) |n| uilayout.drawTop(&d, n);
         if (h.bucks) |*b| if (b.find("zoo_bucks")) |n| uilayout.drawTop(&d, n);
+        self.drawBuyPanel(ui, &d, &h.shell);
     }
 
     fn money(buf: []u8, v: f64) []const u8 {
@@ -2107,6 +2390,13 @@ pub const App = struct {
                 self.title_dirty = true;
             },
             .pick => |i| self.pickItem(i),
+            .buy_cat => |cat| self.openBuyCat(cat),
+            .buy_tab => |t| {
+                // Tabs belong to the open category.
+                if (self.buy_cat == null or self.buy_cat.? != buyTabCat(t)) self.buy_cat = buyTabCat(t);
+                self.setBuyTab(t);
+            },
+            .buy_item => |pos| self.selectBuyItem(pos),
             .menu => |a| self.menuAction(a, ctx),
             .entry, .none => {},
         }
@@ -2594,7 +2884,9 @@ pub const App = struct {
             _ = try self.drawButton(ui, pad + 2 * scale, y, scale, "B FINANCES", white, .{ .menu = .open_finances });
         }
 
-        // The item list for tools that choose from a catalog.
+        // The item list for tools that choose from a catalog (the game's buy
+        // panel replaces it when the real HUD is on).
+        if (self.hudActive()) return;
         const n = self.itemCount();
         if (n == 0) return;
         const rows: usize = 16;

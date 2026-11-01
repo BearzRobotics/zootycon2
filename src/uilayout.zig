@@ -230,6 +230,11 @@ pub fn drawTop(d: *Draw, n: *const Node) void {
     drawNode(d, n, .{ ox + n.x * c.scale, oy + n.y * c.scale, n.w * c.scale, n.h * c.scale });
 }
 
+/// Draws a node into an explicit pixel box (for pieces of a larger layout).
+pub fn drawAt(d: *Draw, n: *const Node, box: [4]f32) void {
+    drawNode(d, n, box);
+}
+
 fn drawNode(d: *Draw, n: *const Node, box: [4]f32) void {
     const info = d.hooks.info(d.hooks.ctx, n);
     const hidden = if (info.visible) |v| !v else n.hidden;
