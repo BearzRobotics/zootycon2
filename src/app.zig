@@ -90,7 +90,7 @@ const Hit = struct {
     y: f32,
     w: f32,
     h: f32,
-    action: union(enum) { tool: Tool, pick: usize, none, menu: MenuAction, entry: usize, buy_cat: u8, buy_tab: BuyTab, buy_item: usize, info_tab: u8 },
+    action: union(enum) { tool: Tool, pick: usize, none, menu: MenuAction, entry: usize, buy_cat: u8, buy_tab: BuyTab, buy_item: usize, info_tab: u8, del_save: usize },
 };
 
 /// Tabs of the buy panel, as in the game's own panel.
@@ -253,6 +253,9 @@ pub const App = struct {
     map_labels: std.ArrayList([]const u8) = .empty,
     /// Saves found on disk (full paths) and their names.
     save_paths: std.ArrayList([]const u8) = .empty,
+    /// "3 HOURS AGO  1.2 MB" for each save, and the save awaiting delete confirmation.
+    save_info: std.ArrayList([]const u8) = .empty,
+    confirm_delete: ?usize = null,
     save_labels: std.ArrayList([]const u8) = .empty,
     save_arena: std.heap.ArenaAllocator,
     reset_camera: bool = false,
@@ -343,6 +346,7 @@ pub const App = struct {
         self.map_paths.deinit(self.gpa);
         self.map_labels.deinit(self.gpa);
         self.save_paths.deinit(self.gpa);
+        self.save_info.deinit(self.gpa);
         self.save_labels.deinit(self.gpa);
         self.save_arena.deinit();
         self.props.deinit(self.gpa);
@@ -1818,7 +1822,10 @@ pub const App = struct {
     fn buildSaveList(self: *App) void {
         self.save_paths.clearRetainingCapacity();
         self.save_labels.clearRetainingCapacity();
+        self.save_info.clearRetainingCapacity();
+        self.confirm_delete = null;
         const ar = self.save_arena.allocator();
+        const now = Io.Timestamp.now(self.io, .real);
         var dir = Io.Dir.cwd().openDir(self.io, self.opts.save_dir, .{ .iterate = true }) catch return;
         defer dir.close(self.io);
         var it = dir.iterate();
@@ -1826,8 +1833,35 @@ pub const App = struct {
             if (e.kind != .file or !std.ascii.endsWithIgnoreCase(e.name, ".zt2")) continue;
             const full = std.fs.path.join(ar, &.{ self.opts.save_dir, e.name }) catch continue;
             const label = ar.dupe(u8, e.name[0 .. e.name.len - 4]) catch continue;
+            // When it was saved and how big it is (the terrain file included).
+            var info: []const u8 = "";
+            if (Io.Dir.cwd().statFile(self.io, full, .{})) |st| {
+                const age_s: i64 = @intCast(@divTrunc(now.nanoseconds - st.mtime.nanoseconds, std.time.ns_per_s));
+                var size: u64 = st.size;
+                var dat_buf: [512]u8 = undefined;
+                if (std.fmt.bufPrint(&dat_buf, "{s}.dat", .{full[0 .. full.len - 4]})) |dp| {
+                    if (Io.Dir.cwd().statFile(self.io, dp, .{})) |ds| size += ds.size else |_| {}
+                } else |_| {}
+                var tb: [64]u8 = undefined;
+                const when: []const u8 = if (age_s < 90)
+                    "JUST NOW"
+                else if (age_s < 3600)
+                    std.fmt.bufPrint(&tb, "{d} MIN AGO", .{@divTrunc(age_s, 60)}) catch ""
+                else if (age_s < 172800)
+                    std.fmt.bufPrint(&tb, "{d} HOURS AGO", .{@divTrunc(age_s, 3600)}) catch ""
+                else
+                    std.fmt.bufPrint(&tb, "{d} DAYS AGO", .{@divTrunc(age_s, 86400)}) catch "";
+                var ib: [96]u8 = undefined;
+                const mb = @as(f64, @floatFromInt(size)) / (1024.0 * 1024.0);
+                info = ar.dupe(u8, std.fmt.bufPrint(&ib, "{s}  {d:.1} MB", .{ when, mb }) catch "") catch "";
+            } else |_| {}
             self.save_paths.append(self.gpa, full) catch continue;
             self.save_labels.append(self.gpa, label) catch continue;
+            self.save_info.append(self.gpa, info) catch {
+                _ = self.save_paths.pop();
+                _ = self.save_labels.pop();
+                continue;
+            };
         }
         // Alphabetical, keeping paths and labels together.
         const n = self.save_labels.items.len;
@@ -1837,8 +1871,28 @@ pub const App = struct {
             while (j > 0 and std.ascii.lessThanIgnoreCase(self.save_labels.items[j], self.save_labels.items[j - 1])) : (j -= 1) {
                 std.mem.swap([]const u8, &self.save_labels.items[j], &self.save_labels.items[j - 1]);
                 std.mem.swap([]const u8, &self.save_paths.items[j], &self.save_paths.items[j - 1]);
+                std.mem.swap([]const u8, &self.save_info.items[j], &self.save_info.items[j - 1]);
             }
         }
+    }
+
+    /// Removes a save (its zoo file and terrain file) after a second click.
+    fn deleteSave(self: *App, i: usize) void {
+        if (i >= self.save_paths.items.len) return;
+        if (self.confirm_delete == null or self.confirm_delete.? != i) {
+            self.confirm_delete = i;
+            return;
+        }
+        const path = self.save_paths.items[i];
+        const cwd = Io.Dir.cwd();
+        cwd.deleteFile(self.io, path) catch |e| {
+            self.say("could not delete ({s})", .{@errorName(e)});
+            return;
+        };
+        var dat_buf: [512]u8 = undefined;
+        if (std.fmt.bufPrint(&dat_buf, "{s}.dat", .{path[0 .. path.len - 4]})) |dp| cwd.deleteFile(self.io, dp) catch {} else |_| {}
+        self.say("deleted save {s}", .{self.save_labels.items[i]});
+        self.buildSaveList();
     }
 
     fn openMenu(self: *App, m: Menu) void {
@@ -1992,6 +2046,7 @@ pub const App = struct {
                 switch (h.action) {
                     .menu => |a| self.menuAction(a, ctx),
                     .entry => |i| self.entryAction(i),
+                    .del_save => |i| self.deleteSave(i),
                     else => {},
                 }
             },
@@ -2065,7 +2120,24 @@ pub const App = struct {
                 const first = self.menu_first;
                 const last = @min(labels.len, first + self.menu_rows);
                 var i = first;
-                while (i < last) : (i += 1) y += try self.menuButton(ui, y, scale * 0.8, labels[i], .{ .entry = i }, false);
+                while (i < last) : (i += 1) {
+                    const rs = scale * 0.8;
+                    const h = try self.menuButton(ui, y, rs, labels[i], .{ .entry = i }, false);
+                    if (self.menu == .saves and i < self.save_info.items.len) {
+                        const bw = 26 * 6 * rs;
+                        const bx = (ui.width - bw) / 2;
+                        const ts = rs * 0.75;
+                        _ = try ui.text(bx + bw + 8 * rs, y + (h - 7 * ts) / 2 - rs, ts, self.save_info.items[i], .{ 0.8, 0.85, 0.9, 1 });
+                        const confirming = self.confirm_delete != null and self.confirm_delete.? == i;
+                        const dl: []const u8 = if (confirming) "SURE?" else "DELETE";
+                        const dw = 8 * 6 * ts;
+                        const dx = bx - dw - 8 * rs;
+                        ui.template("buttonbar", dx, y, dw, h - 3 * rs, rs / 2, 1);
+                        _ = try ui.text(dx + (dw - viewer.Ui.textWidth(dl, ts)) / 2, y + (h - 3 * rs - 7 * ts) / 2, ts, dl, if (confirming) .{ 1, 0.5, 0.45, 1 } else .{ 1, 0.75, 0.7, 1 });
+                        try self.hits.append(self.gpa, .{ .x = dx, .y = y, .w = dw, .h = h - 3 * rs, .action = .{ .del_save = i } });
+                    }
+                    y += h;
+                }
                 if (labels.len > self.menu_rows) {
                     var nb: [48]u8 = undefined;
                     const note = std.fmt.bufPrint(&nb, "{d}-{d} OF {d}  (SCROLL WITH THE WHEEL)", .{ first + 1, last, labels.len }) catch "";
@@ -2804,7 +2876,7 @@ pub const App = struct {
             .buy_item => |pos| self.selectBuyItem(pos),
             .info_tab => |t| self.info_tab = t,
             .menu => |a| self.menuAction(a, ctx),
-            .entry, .none => {},
+            .entry, .none, .del_save => {},
         }
         return true;
     }
