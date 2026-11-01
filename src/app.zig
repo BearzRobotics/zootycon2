@@ -1723,7 +1723,7 @@ pub const App = struct {
         const width = 26 * 6 * scale;
         const x = (ui.width - width) / 2;
         const h = 7 * scale + 8 * scale;
-        try ui.rect(x, y, width, h, if (on) .{ 0.25, 0.35, 0.2, 0.9 } else .{ 0.05, 0.08, 0.12, 0.88 });
+        ui.template(if (on) "header" else "buttonbar", x, y, width, h, scale / 2, 1);
         const tw = viewer.Ui.textWidth(text, scale);
         _ = try ui.text(x + (width - tw) / 2 + scale / 2, y + 4 * scale, scale, text, .{ 1, 1, 1, 1 });
         try self.hits.append(self.gpa, .{ .x = x, .y = y, .w = width, .h = h, .action = action });
@@ -2233,13 +2233,19 @@ pub const App = struct {
         const row_h = line + scale;
         const btn_h = 7 * scale + 4 * scale;
         const height = (line + 2 * scale) + row_h * @as(f32, @floatFromInt(rows.items.len)) + btn_h + 6 * scale;
-        try ui.rect(x - 3 * scale, top - 3 * scale, panel_w + 6 * scale, height + 3 * scale, .{ 0, 0, 0, 0.6 });
+        ui.template("blank", x - 6 * scale, top - 6 * scale, panel_w + 12 * scale, height + 9 * scale, scale / 2, 1.5);
         _ = try ui.text(x, top, scale, title[0..@min(title.len, 34)], .{ 1, 0.92, 0.5, 1 });
         var y = top + line + 2 * scale;
         for (rows.items) |r| {
             if (r.is_bar) {
-                _ = try ui.text(x, y, scale, r.text[0..@min(r.text.len, 11)], white);
-                try bar(ui, x + 12 * 6 * scale, y, panel_w - 12 * 6 * scale, 7 * scale, r.frac, r.color);
+                var tx = x;
+                if (needIcon(r.text)) |path| if (ui.sprite(path)) |spr| {
+                    try ui.image(spr, x, y - 1.5 * scale, 10 * scale, 10 * scale, .{ 0, 0, spr.w, spr.h }, .{ 1, 1, 1, 1 });
+                    tx = x + 12 * scale;
+                };
+                _ = try ui.text(tx, y, scale, r.text[0..@min(r.text.len, 11)], white);
+                const bx0 = x + 12 * scale + 12 * 6 * scale;
+                try bar(ui, bx0, y, panel_w - (bx0 - x), 7 * scale, r.frac, r.color);
             } else _ = try ui.text(x, y, scale, r.text[0..@min(r.text.len, 34)], r.color);
             y += row_h;
         }
@@ -2249,11 +2255,29 @@ pub const App = struct {
         if (can_refill) _ = try self.drawButton(ui, bx, y + 2 * scale, scale, "REFILL", .{ 0.6, 0.85, 1, 1 }, .{ .menu = .refill_selected });
     }
 
+    /// The game's icon for a need or status bar, by its label.
+    fn needIcon(label: []const u8) ?[]const u8 {
+        const map = [_]struct { []const u8, []const u8 }{
+            .{ "HUNGER", "ui/icon_needs/all_hunger.dds" },
+            .{ "THIRST", "ui/icon_needs/all_thirst.dds" },
+            .{ "REST", "ui/icon_needs/animal_rest.dds" },
+            .{ "EXERCISE", "ui/icon_needs/animal_exercise.dds" },
+            .{ "SOCIAL", "ui/icon_needs/animal_social.dds" },
+            .{ "STIMULATION", "ui/icon_needs/animal_stimulation.dds" },
+            .{ "HYGIENE", "ui/icon_needs/animal_hygiene.dds" },
+            .{ "HABITAT", "ui/icon_needs/animal_biome.dds" },
+            .{ "BIOME FIT", "ui/icon_needs/animal_biome.dds" },
+            .{ "BATHROOM", "ui/icon_needs/guest_bathroom.dds" },
+        };
+        for (map) |m| if (std.ascii.eqlIgnoreCase(m[0], label)) return m[1];
+        return null;
+    }
+
     fn drawButton(self: *App, ui: *viewer.Ui, x: f32, y: f32, scale: f32, text: []const u8, color: [4]f32, action: @TypeOf(@as(Hit, undefined).action)) !f32 {
         const pad = 2 * scale;
         const w = viewer.Ui.textWidth(text, scale) + pad * 2 - scale;
         const h = 7 * scale + pad * 2;
-        try ui.rect(x - pad, y - pad, w, h, .{ 0, 0, 0, 0.6 });
+        ui.template("buttonbar", x - pad, y - pad, w, h, scale / 3, 1);
         _ = try ui.text(x, y, scale, text, color);
         try self.hits.append(self.gpa, .{ .x = x - pad, .y = y - pad, .w = w, .h = h, .action = action });
         return h;
@@ -2293,7 +2317,7 @@ pub const App = struct {
         const top = pad + line * 4.2;
         var title_buf: [48]u8 = undefined;
         const title = std.fmt.bufPrint(&title_buf, "{s} {d}/{d}", .{ self.tool.label(), cur + 1, n }) catch "";
-        try ui.rect(x - 2 * scale, top - 2 * scale, panel_w + 4 * scale, line * @as(f32, @floatFromInt(shown + 1)) + 4 * scale, .{ 0, 0, 0, 0.55 });
+        ui.template("blank", x - 6 * scale, top - 6 * scale, panel_w + 12 * scale, line * @as(f32, @floatFromInt(shown + 1)) + 10 * scale, scale / 2, 1.5);
         _ = try ui.text(x, top, scale, title, white);
         // The whole panel is one hit area so the wheel scrolls it; rows override it.
         try self.hits.append(self.gpa, .{

@@ -7,6 +7,7 @@ const Gl = @import("gl.zig").Gl;
 const gl = @import("gl.zig");
 const nif = @import("nif.zig");
 const dds = @import("dds.zig");
+const uiskin = @import("uiskin.zig");
 const model = @import("model.zig");
 const terrain_mod = @import("terrain.zig");
 const map_mod = @import("map.zig");
@@ -604,14 +605,21 @@ const ui_fs: [:0]const u8 =
     \\in vec2 vUv;
     \\in vec4 vColor;
     \\uniform sampler2D uAtlas;
+    \\uniform int uSprite;
     \\out vec4 outColor;
     \\void main() {
-    \\  outColor = vec4(vColor.rgb, vColor.a * texture(uAtlas, vUv).a);
+    \\  vec4 t = texture(uAtlas, vUv);
+    \\  outColor = uSprite == 1 ? t * vColor : vec4(vColor.rgb, vColor.a * t.a);
     \\}
 ;
 
 /// Builds a frame's 2D overlay: rectangles and text in pixel coordinates
 /// (origin top-left). Filled by a hook's `overlay`, drawn after the scene.
+const UiCmd = struct { tex: gl.Uint, start: u32 };
+
+/// A texture loaded for the overlay, with its size in texels.
+pub const Sprite = struct { tex: gl.Uint, w: f32, h: f32 };
+
 pub const Ui = struct {
     gpa: std.mem.Allocator,
     /// Per vertex: x, y, u, v, r, g, b, a.
@@ -619,9 +627,55 @@ pub const Ui = struct {
     /// Pixel size of the viewport.
     width: f32 = 1,
     height: f32 = 1,
+    /// Runs of vertices drawn with one texture (0 = the built-in font atlas).
+    cmds: std.ArrayList(UiCmd) = .empty,
+    cur_tex: gl.Uint = 0,
+    /// Where sprites and templates are loaded from.
+    scene: ?*Scene = null,
 
     pub fn deinit(self: *Ui) void {
         self.verts.deinit(self.gpa);
+        self.cmds.deinit(self.gpa);
+    }
+
+    /// Starts a new frame's overlay.
+    pub fn reset(self: *Ui) void {
+        self.verts.clearRetainingCapacity();
+        self.cmds.clearRetainingCapacity();
+        self.cur_tex = 0;
+    }
+
+    fn useTex(self: *Ui, tex: gl.Uint) !void {
+        const start: u32 = @intCast(self.verts.items.len / 8);
+        if (self.cmds.items.len == 0 or self.cur_tex != tex) {
+            try self.cmds.append(self.gpa, .{ .tex = tex, .start = start });
+            self.cur_tex = tex;
+        }
+    }
+
+    /// A texture from the game data for use in the overlay.
+    pub fn sprite(self: *Ui, path: []const u8) ?Sprite {
+        const sc = self.scene orelse return null;
+        return sc.sprite(path);
+    }
+
+    /// Draws part (sx, sy, sw, sh) of a sprite, in texels, into a rectangle.
+    pub fn image(self: *Ui, spr: Sprite, x: f32, y: f32, w: f32, h: f32, src: [4]f32, tint: [4]f32) !void {
+        try self.useTex(spr.tex);
+        try self.quad(x, y, w, h, src[0] / spr.w, src[1] / spr.h, (src[0] + src[2]) / spr.w, (src[1] + src[3]) / spr.h, tint);
+    }
+
+    /// Draws one of the game's panel templates (`ui/template/backs/<name>.xml`)
+    /// stretched over a box. `alpha` multiplies the template's own opacity.
+    pub fn template(self: *Ui, name: []const u8, x: f32, y: f32, w: f32, h: f32, scale: f32, alpha: f32) void {
+        const sc = self.scene orelse return;
+        const t = sc.template(name) orelse return;
+        for (t.pieces) |p| {
+            const spr = sc.sprite(p.image) orelse continue;
+            const d = uiskin.place(p, x, y, w, h, scale);
+            if (d[2] <= 0 or d[3] <= 0) continue;
+            self.image(spr, d[0], d[1], d[2], d[3], p.rect, .{ p.color[0], p.color[1], p.color[2], @min(1, p.color[3] * alpha) }) catch {};
+        }
     }
 
     fn quad(self: *Ui, x: f32, y: f32, w: f32, h: f32, ua: f32, va: f32, ub: f32, vb: f32, c: [4]f32) !void {
@@ -637,6 +691,7 @@ pub const Ui = struct {
     }
 
     pub fn rect(self: *Ui, x: f32, y: f32, w: f32, h: f32, color: [4]f32) !void {
+        try self.useTex(0);
         const sx: f32 = @floatFromInt((font.solid_cell % font.cols) * font.cell + font.cell / 2);
         const sy: f32 = @floatFromInt((font.solid_cell / font.cols) * font.cell + font.cell / 2);
         const u = sx / font.atlas_w;
@@ -650,6 +705,7 @@ pub const Ui = struct {
 
     /// Draws `text` with its top-left at (x, y); returns the width drawn.
     pub fn text(self: *Ui, x: f32, y: f32, scale: f32, str: []const u8, color: [4]f32) !f32 {
+        try self.useTex(0);
         var cx = x;
         for (str) |ch| {
             if (ch != ' ') {
@@ -852,6 +908,8 @@ pub const Scene = struct {
     dds_index: std.StringHashMapUnmanaged([]const u8) = .empty,
     /// lowercase basename -> GL texture
     textures: std.StringHashMapUnmanaged(gl.Uint) = .empty,
+    sprites: std.StringHashMapUnmanaged(?Sprite) = .empty,
+    templates: std.StringHashMapUnmanaged(?uiskin.Template) = .empty,
     white: gl.Uint = 0,
     min: nif.Vec3 = .{ 1e30, 1e30, 1e30 },
     max: nif.Vec3 = .{ -1e30, -1e30, -1e30 },
@@ -972,6 +1030,15 @@ pub const Scene = struct {
         var it = self.textures.keyIterator();
         while (it.next()) |k| self.gpa.free(k.*);
         self.textures.deinit(self.gpa);
+        var sit = self.sprites.iterator();
+        while (sit.next()) |e| self.gpa.free(e.key_ptr.*);
+        self.sprites.deinit(self.gpa);
+        var tit = self.templates.iterator();
+        while (tit.next()) |e| {
+            if (e.value_ptr.*) |*t| t.deinit();
+            self.gpa.free(e.key_ptr.*);
+        }
+        self.templates.deinit(self.gpa);
         self.dds_index.deinit(self.gpa);
     }
 
@@ -1513,6 +1580,54 @@ pub const Scene = struct {
         }
     }
 
+    /// A UI texture by VFS path (cached, edge-clamped); null if missing.
+    pub fn sprite(self: *Scene, path: []const u8) ?Sprite {
+        var buf: [256]u8 = undefined;
+        if (path.len == 0 or path.len > buf.len) return null;
+        const key = std.ascii.lowerString(&buf, path);
+        for (buf[0..path.len]) |*c| if (c.* == '\\') {
+            c.* = '/';
+        };
+        if (self.sprites.get(key)) |s| return s;
+        var result: ?Sprite = null;
+        if (self.vfs.read(self.gpa, key)) |bytes| {
+            defer self.gpa.free(bytes);
+            if (dds.parse(self.gpa, bytes)) |parsed| {
+                var img = parsed;
+                defer img.deinit();
+                const id = upload(self.g, &img);
+                self.g.bindTexture(gl.TEXTURE_2D, id);
+                self.g.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, @intCast(gl.CLAMP_TO_EDGE));
+                self.g.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, @intCast(gl.CLAMP_TO_EDGE));
+                const l0 = img.level(0, 0);
+                result = .{ .tex = id, .w = @floatFromInt(l0.width), .h = @floatFromInt(l0.height) };
+            } else |_| {}
+        } else |_| {}
+        const owned = self.gpa.dupe(u8, key) catch return result;
+        self.sprites.put(self.gpa, owned, result) catch self.gpa.free(owned);
+        return result;
+    }
+
+    /// A panel template from `ui/template/backs/<name>.xml`; null if missing.
+    pub fn template(self: *Scene, name: []const u8) ?*const uiskin.Template {
+        if (self.templates.getPtr(name)) |t| return if (t.*) |*v| v else null;
+        var parsed: ?uiskin.Template = null;
+        var pbuf: [128]u8 = undefined;
+        if (std.fmt.bufPrint(&pbuf, "ui/template/backs/{s}.xml", .{name})) |path| {
+            if (self.vfs.read(self.gpa, path)) |bytes| {
+                defer self.gpa.free(bytes);
+                parsed = uiskin.parse(self.gpa, bytes) catch null;
+            } else |_| {}
+        } else |_| {}
+        const owned = self.gpa.dupe(u8, name) catch return null;
+        self.templates.put(self.gpa, owned, parsed) catch {
+            self.gpa.free(owned);
+            return null;
+        };
+        const t = self.templates.getPtr(owned) orelse return null;
+        return if (t.*) |*v| v else null;
+    }
+
     /// Loads a texture by its exact VFS path; the white texture if missing.
     pub fn loadTexturePath(self: *Scene, path: []const u8) gl.Uint {
         const bytes = self.vfs.read(self.gpa, path) catch return self.white;
@@ -1998,6 +2113,7 @@ pub const Gfx = struct {
     ui_prog: gl.Uint,
     ui_screen: gl.Int,
     ui_atlas_loc: gl.Int,
+    ui_sprite_loc: gl.Int,
     ui_vao: gl.Uint,
     ui_vbo: gl.Uint,
     ui_tex: gl.Uint,
@@ -2134,6 +2250,7 @@ pub const Gfx = struct {
         self.ui_prog = try makeProgramFrom(g, ui_vs, ui_fs);
         self.ui_screen = g.getUniformLocation(self.ui_prog, "uScreen");
         self.ui_atlas_loc = g.getUniformLocation(self.ui_prog, "uAtlas");
+        self.ui_sprite_loc = g.getUniformLocation(self.ui_prog, "uSprite");
         var atlas: [font.atlas_w * font.atlas_h * 4]u8 = undefined;
         font.buildAtlas(&atlas);
         g.genTextures(1, @ptrCast(&self.ui_tex));
@@ -2169,11 +2286,17 @@ pub const Gfx = struct {
         g.uniform2f(self.ui_screen, ui.width, ui.height);
         g.uniform1i(self.ui_atlas_loc, 0);
         g.activeTexture(gl.TEXTURE0);
-        g.bindTexture(gl.TEXTURE_2D, self.ui_tex);
         g.bindVertexArray(self.ui_vao);
         g.bindBuffer(gl.ARRAY_BUFFER, self.ui_vbo);
         g.bufferData(gl.ARRAY_BUFFER, @intCast(ui.verts.items.len * 4), ui.verts.items.ptr, gl.DYNAMIC_DRAW);
-        g.drawArrays(gl.TRIANGLES, 0, @intCast(ui.verts.items.len / 8));
+        const total: u32 = @intCast(ui.verts.items.len / 8);
+        for (ui.cmds.items, 0..) |c, i| {
+            const end: u32 = if (i + 1 < ui.cmds.items.len) ui.cmds.items[i + 1].start else total;
+            if (end <= c.start) continue;
+            g.uniform1i(self.ui_sprite_loc, if (c.tex == 0) 0 else 1);
+            g.bindTexture(gl.TEXTURE_2D, if (c.tex == 0) self.ui_tex else c.tex);
+            g.drawArrays(gl.TRIANGLES, @intCast(c.start), @intCast(end - c.start));
+        }
         g.bindVertexArray(0);
         g.depthMask(1);
         g.enable(gl.DEPTH_TEST);
@@ -2984,7 +3107,8 @@ pub fn loopWith(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Came
             runPost(gfx, scene.fx, cam, aspect, near, far, .{ .width = size.width, .height = size.height });
         }
         if (comptime @hasDecl(Hk, "overlay")) {
-            ui.verts.clearRetainingCapacity();
+            ui.reset();
+            ui.scene = scene;
             ui.width = @floatFromInt(size.width);
             ui.height = @floatFromInt(size.height);
             try hooks.overlay(&ui, &ctx);

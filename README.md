@@ -137,6 +137,7 @@ zootycon2 play maps/default/alpinesml.zt2 --shot \
 | `sim.zig` | agents, walkway graph, fence blocking; people walk the paths, animals run their data-driven brains |
 | `ai.zig` | the game's task templates and behaviour sets (`ai/tasks`): need-based task choice and posture-aware behaviour execution for animals |
 | `viewer.zig`, `gl.zig`, `platform/` | OpenGL 3.3 renderer, SDL3 binding |
+| `uiskin.zig` | the game's own UI panel templates (`ui/template/backs/*.xml`), drawn from its textures at any size |
 | `app.zig` | the interactive app: tools, picking, undo, save/load, input driver |
 
 Format notes live in the header comment of each reader (`bf.zig` and

@@ -19,6 +19,7 @@ pub const world = @import("world.zig");
 pub const sim = @import("sim.zig");
 pub const app = @import("app.zig");
 pub const font = @import("font.zig");
+pub const uiskin = @import("uiskin.zig");
 pub const environment = @import("environment.zig");
 pub const ai = @import("ai.zig");
 
@@ -41,6 +42,7 @@ test {
     _ = sim;
     _ = app;
     _ = font;
+    _ = uiskin;
     _ = environment;
     _ = ai;
 }

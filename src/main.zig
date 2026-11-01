@@ -250,6 +250,23 @@ pub fn main(init: std.process.Init) !void {
                 }
             }
         }
+    } else if (std.mem.eql(u8, cmd, "dds2ppm")) {
+        // Debug: write a texture's top level as a PPM (alpha shown on black).
+        if (rest.len < 1) return fail("dds2ppm <file.dds>\n");
+        const data = try vfs.read(gpa, rest[0]);
+        defer gpa.free(data);
+        var img = try zootycon2.dds.parse(gpa, data);
+        defer img.deinit();
+        const rgba = try zootycon2.dds.decodeLevel(gpa, &img, 0, 0);
+        defer gpa.free(rgba);
+        const lv = img.level(0, 0);
+        try out.print("P6\n{d} {d}\n255\n", .{ lv.width, lv.height });
+        var pi: usize = 0;
+        while (pi < @as(usize, lv.width) * lv.height) : (pi += 1) {
+            const a: u32 = rgba[pi * 4 + 3];
+            const px = [3]u8{ @intCast(@as(u32, rgba[pi * 4]) * a / 255), @intCast(@as(u32, rgba[pi * 4 + 1]) * a / 255), @intCast(@as(u32, rgba[pi * 4 + 2]) * a / 255) };
+            try out.writeAll(&px);
+        }
     } else if (std.mem.eql(u8, cmd, "headcheck")) {
         // Debug: where the Link_Head node goes in every animation of a model.
         if (rest.len < 1) return fail("headcheck <file.bfm>\n");
