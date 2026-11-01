@@ -31,14 +31,64 @@ pub const Hooks = struct {
     brain: *const fn (ctx: *anyopaque, binder: []const u8) ?BrainSetup,
     /// Length of an animation for this actor's model, null if it has none by that name.
     anim_len: *const fn (ctx: *anyopaque, actor_id: u32, name: []const u8) ?f32,
+    /// Whether an entity has a flag such as `b_Granivore`.
+    flag: *const fn (ctx: *anyopaque, binder: []const u8, name: []const u8) bool,
+    /// If an entity is a feeder, the kind of container it is (`FoodDish`).
+    feeder: *const fn (ctx: *anyopaque, binder: []const u8) ?[]const u8,
 };
 
+/// A food or water container placed in the world.
+pub const Feeder = struct {
+    prop_id: u32,
+    pos: [2]f32,
+    binder: []const u8,
+    kind: []const u8,
+    /// 0..100, drops as animals eat.
+    food: f32,
+};
+
+/// What an animal's brain can ask about its surroundings.
 const OracleCtx = struct {
+    sim: *Sim,
     hooks: Hooks,
     id: u32,
+    binder: []const u8,
+    pos: [2]f32,
+
     fn duration(ctx: *anyopaque, name: []const u8) ?f32 {
         const c: *OracleCtx = @ptrCast(@alignCast(ctx));
         return c.hooks.anim_len(c.hooks.ctx, c.id, name);
+    }
+
+    fn flag(ctx: *anyopaque, name: []const u8) bool {
+        const c: *OracleCtx = @ptrCast(@alignCast(ctx));
+        return c.hooks.flag(c.hooks.ctx, c.binder, name);
+    }
+
+    /// The nearest feeder of this kind that has food and can be walked to
+    /// (no fence in between).
+    fn findTarget(ctx: *anyopaque, class: []const u8) ?ai.Target {
+        const c: *OracleCtx = @ptrCast(@alignCast(ctx));
+        var best: ?ai.Target = null;
+        var best_d: f32 = 30 * 30;
+        for (c.sim.feeders.items) |f| {
+            if (!std.ascii.eqlIgnoreCase(f.binder, class) or f.food < 1) continue;
+            const dx = f.pos[0] - c.pos[0];
+            const dy = f.pos[1] - c.pos[1];
+            const d = dx * dx + dy * dy;
+            if (d >= best_d) continue;
+            if (c.sim.blocked(c.pos, f.pos)) continue;
+            best_d = d;
+            best = .{ .id = f.prop_id, .pos = f.pos, .kind = f.kind };
+        }
+        return best;
+    }
+
+    fn useTarget(ctx: *anyopaque, id: u32, amount: f32) void {
+        const c: *OracleCtx = @ptrCast(@alignCast(ctx));
+        for (c.sim.feeders.items) |*f| if (f.prop_id == id) {
+            f.food = @max(0, f.food - amount);
+        };
     }
 };
 
@@ -59,6 +109,10 @@ pub const Agent = struct {
     /// Behaviour driven by game data (animals); null uses the built-in
     /// idle/walk loop.
     brain: ?ai.Brain = null,
+    /// The entity name this agent was made from.
+    binder: []const u8 = "",
+    /// True while walking to a brain-chosen destination (a feeder).
+    goto_active: bool = false,
     /// Visitors follow routes along the paths, watch animals and leave.
     is_guest: bool = false,
     goal: Goal = .none,
@@ -270,6 +324,8 @@ pub const Sim = struct {
     graph_paths: usize = std.math.maxInt(usize),
     hooks: ?Hooks = null,
     zoo: Zoo = .{},
+    feeders: std.ArrayList(Feeder) = .empty,
+    feeders_key: usize = std.math.maxInt(usize),
     /// Entity names guests are made from.
     guest_binders: []const []const u8 = &.{},
     max_guests: u32 = 50,
@@ -294,6 +350,7 @@ pub const Sim = struct {
 
     pub fn deinit(self: *Sim) void {
         self.to_remove.deinit(self.gpa);
+        self.feeders.deinit(self.gpa);
         for (self.agents.items) |*a| self.freeAgent(a);
         self.agents.deinit(self.gpa);
         self.walls.deinit(self.gpa);
@@ -361,6 +418,40 @@ pub const Sim = struct {
             self.entrance_key = std.math.maxInt(usize);
         }
         self.findEntrance(w);
+        self.syncFeeders(w);
+    }
+
+    /// Rebuilds the feeder list from the world's props, keeping food levels
+    /// of feeders that were already known.
+    fn syncFeeders(self: *Sim, w: *const world_mod.World) void {
+        const h = self.hooks orelse return;
+        var key: usize = w.props.items.len;
+        for (w.props.items) |p| key = key *% 31 +% p.id;
+        if (key == self.feeders_key) return;
+        self.feeders_key = key;
+        var next: std.ArrayList(Feeder) = .empty;
+        for (w.props.items) |p| {
+            if (p.binder.len == 0) continue;
+            const kind = h.feeder(h.ctx, p.binder) orelse continue;
+            var food = p.food;
+            for (self.feeders.items) |old| if (old.prop_id == p.id) {
+                food = old.food;
+            };
+            next.append(self.gpa, .{ .prop_id = p.id, .pos = .{ p.position[0], p.position[1] }, .binder = p.binder, .kind = kind, .food = food }) catch {};
+        }
+        self.feeders.deinit(self.gpa);
+        self.feeders = next;
+    }
+
+    /// Average wellbeing of the animals, 0..100 (hunger and thirst count).
+    pub fn animalWelfare(self: *const Sim) f32 {
+        var sum: f32 = 0;
+        var n: f32 = 0;
+        for (self.agents.items) |a| if (a.kind == .animal) if (a.brain) |b| {
+            sum += 100 - @max(b.needs[5], b.needs[6]);
+            n += 1;
+        };
+        return if (n > 0) sum / n else 0;
     }
 
     fn makeAgent(self: *Sim, a: world_mod.Actor, w: *const world_mod.World) !Agent {
@@ -377,6 +468,7 @@ pub const Sim = struct {
         const rnd = self.rng.random();
         return .{
             .brain = brain,
+            .binder = a.binder,
             .is_guest = guest,
             .tour_left = if (guest) self.tour_secs[0] + rnd.float(f32) * (self.tour_secs[1] - self.tour_secs[0]) else std.math.inf(f32),
             .happiness = 45 + rnd.float(f32) * 20,
@@ -450,6 +542,10 @@ pub const Sim = struct {
                 self.spawnGuest(w) catch {};
             }
         }
+        // Feeder food levels live in the world so they are saved.
+        for (self.feeders.items) |f| for (w.props.items) |*p| if (p.id == f.prop_id) {
+            p.food = f.food;
+        };
         // Guests who reached the exit leave the world.
         if (self.to_remove.items.len > 0) {
             for (self.to_remove.items) |id| {
@@ -747,15 +843,34 @@ pub const Sim = struct {
     /// Runs an animal's data-driven brain and carries out what it asks for.
     fn thinkAnimal(self: *Sim, ag: *Agent, w: *const world_mod.World, dt: f32) void {
         const h = self.hooks.?;
-        var oc: OracleCtx = .{ .hooks = h, .id = ag.id };
+        var oc: OracleCtx = .{ .sim = self, .hooks = h, .id = ag.id, .binder = ag.binder, .pos = .{ ag.pos[0], ag.pos[1] } };
         const brain = &ag.brain.?;
-        brain.update(dt, .{ .ctx = &oc, .duration = OracleCtx.duration });
+        brain.update(dt, .{
+            .ctx = &oc,
+            .duration = OracleCtx.duration,
+            .flag = OracleCtx.flag,
+            .find_target = OracleCtx.findTarget,
+            .use_target = OracleCtx.useTarget,
+        });
         const before = ag.anim_name;
         switch (brain.current()) {
             .anim => |name| {
                 ag.state = .idle;
                 ag.anim = .idle;
                 ag.anim_name = name;
+                ag.goto_active = false;
+            },
+            .goto => |p| {
+                ag.anim_name = "Walk_Ahead";
+                ag.anim = .walk;
+                ag.state = .walk;
+                ag.goto_active = true;
+                ag.target = p;
+                switch (self.moveToward(ag, w, dt, ag.speed)) {
+                    .moving => {},
+                    .arrived => brain.reached(),
+                    .blocked => brain.abort(),
+                }
             },
             .wander => |speed| {
                 const fast = speed == .fast and h.anim_len(h.ctx, ag.id, "Run_Ahead") != null;
@@ -766,8 +881,9 @@ pub const Sim = struct {
                     .medium => 1.0,
                     .fast => 2.2,
                 };
-                if (ag.state != .walk) {
+                if (ag.state != .walk or ag.goto_active) {
                     ag.state = .walk;
+                    ag.goto_active = false;
                     self.pickWanderTarget(ag, w);
                 }
                 switch (self.moveToward(ag, w, dt, ag.speed * factor)) {
@@ -920,8 +1036,14 @@ const BrainTest = struct {
         const self: *BrainTest = @ptrCast(@alignCast(ctx));
         return .{ .lib = self.lib, .groups = &.{ "Lion", "Lion_Adult_F" } };
     }
+    fn flag(_: *anyopaque, _: []const u8, name: []const u8) bool {
+        return std.mem.eql(u8, name, "b_Granivore") or std.mem.eql(u8, name, "b_LargeAnimal");
+    }
+    fn feeder(_: *anyopaque, binder: []const u8) ?[]const u8 {
+        return if (std.mem.startsWith(u8, binder, "FoodDish")) "FoodDish" else null;
+    }
     fn animLen(_: *anyopaque, _: u32, name: []const u8) ?f32 {
-        const known = [_][]const u8{ "Stand_Idle", "Lie_Idle", "Walk_Ahead", "Stand_2Lie", "Lie_2Stand", "Sleep_Idle" };
+        const known = [_][]const u8{ "Stand_Idle", "Lie_Idle", "Walk_Ahead", "Stand_2Lie", "Lie_2Stand", "Sleep_Idle", "Eat_Idle", "Stand_2Eat", "Eat_2Stand" };
         for (known) |k| if (std.mem.eql(u8, k, name)) return 1.5;
         return null;
     }
@@ -960,7 +1082,7 @@ test "animals run data-driven tasks: they wander inside the pen and rest" {
     var bt: BrainTest = .{ .lib = &lib };
     var sim = Sim.init(gpa, 21);
     defer sim.deinit();
-    sim.hooks = .{ .ctx = &bt, .brain = BrainTest.brain, .anim_len = BrainTest.animLen };
+    sim.hooks = .{ .ctx = &bt, .brain = BrainTest.brain, .anim_len = BrainTest.animLen, .flag = BrainTest.flag, .feeder = BrainTest.feeder };
     try sim.sync(&w);
     try testing.expect(sim.agents.items[0].brain != null);
     var walked = false;
@@ -1058,6 +1180,64 @@ test "guests arrive, pay, watch animals and leave" {
     // agents and world actors agree once synced
     try sim.sync(&w);
     try testing.expectEqual(w.actors.items.len, sim.agents.items.len);
+}
+
+test "hungry animals eat from a reachable feeder and not through a fence" {
+    const gpa = testing.allocator;
+    var lib = ai.Library.init(gpa);
+    defer lib.deinit();
+    try lib.addSets(
+        \\<BehaviorSets>
+        \\ <UseFoodDish><behaviors><BFBehAnimate targetAnim="Eat_Idle"/></behaviors></UseFoodDish>
+        \\</BehaviorSets>
+    );
+    try lib.addTasks(
+        \\<BFAITaskTemplateList>
+        \\ <BFAITaskTemplate Name="Eat"><BFAICreateData>
+        \\   <Subjects_AND><b_Granivore/><b_LargeAnimal/></Subjects_AND>
+        \\   <Targets><FoodDish_Hay/><Qualifiers_AND f_FoodLevel="GE 1" inHabitat="true"/></Targets></BFAICreateData>
+        \\  <BFAIEvalData><BFAIAttributeFloatMap hunger="-40"/></BFAIEvalData>
+        \\  <BFBehExecTask><BFBehEnter/><BFBehPlaySet behSet="useContainer"/></BFBehExecTask>
+        \\  <BFAICompletionData><BFAIAttributeFloatMap hunger="-100"/><BFAITargetData f_FoodLevel="-20"/></BFAICompletionData></BFAITaskTemplate>
+        \\</BFAITaskTemplateList>
+    );
+    var w = world_mod.World.init(gpa, try testTerrain(gpa));
+    defer w.deinit();
+    const corners = [_][3]f32{ .{ 24, 24, 0 }, .{ 36, 24, std.math.pi / 2.0 }, .{ 36, 36, std.math.pi }, .{ 24, 36, 3.0 * std.math.pi / 2.0 } };
+    for (corners) |c| for (0..4) |i| {
+        const k = @as(f32, @floatFromInt(i)) * 3.0;
+        _ = try w.addFence("zoowall", .{ c[0] + @cos(c[2]) * k, c[1] + @sin(c[2]) * k, 0 }, c[2]);
+    };
+    const inside = try w.addPropEx("m", .{ 32, 32, 6 }, world_mod.identity_rotation, 1, &.{}, "FoodDish_Hay", 100);
+    const outside = try w.addPropEx("m", .{ 40, 30, 6 }, world_mod.identity_rotation, 1, &.{}, "FoodDish_Hay", 100);
+    _ = try w.addActor("Zebra_Adult_F", .{ 28, 28, 6 }, world_mod.identity_rotation, &.{});
+    var bt: BrainTest = .{ .lib = &lib };
+    var sim = Sim.init(gpa, 8);
+    defer sim.deinit();
+    sim.hooks = .{ .ctx = &bt, .brain = BrainTest.brain, .anim_len = BrainTest.animLen, .flag = BrainTest.flag, .feeder = BrainTest.feeder };
+    try sim.sync(&w);
+    try testing.expectEqual(@as(usize, 2), sim.feeders.items.len);
+    sim.agents.items[0].brain.?.needs = @splat(0);
+    sim.agents.items[0].brain.?.needs[5] = 95; // very hungry
+    const welfare_before = sim.animalWelfare();
+    var ate = false;
+    for (0..3000) |_| {
+        sim.advance(&w, 1.0 / 30.0);
+        const ag = sim.agents.items[0];
+        if (std.mem.eql(u8, ag.anim_name, "Eat_Idle")) ate = true;
+        try testing.expect(ag.pos[0] > 24 and ag.pos[0] < 36 and ag.pos[1] > 24 and ag.pos[1] < 36);
+    }
+    try testing.expect(ate);
+    // the food was taken from the feeder inside the pen, and recorded in the world
+    var inside_food: f32 = -1;
+    var outside_food: f32 = -1;
+    for (w.props.items) |p| {
+        if (p.id == inside) inside_food = p.food;
+        if (p.id == outside) outside_food = p.food;
+    }
+    try testing.expect(inside_food < 100);
+    try testing.expectEqual(@as(f32, 100), outside_food); // behind the fence: never used
+    try testing.expect(sim.animalWelfare() > welfare_before);
 }
 
 test "curbs and gates do not block" {

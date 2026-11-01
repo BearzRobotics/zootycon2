@@ -13,6 +13,10 @@ pub const Swap = map_mod.Swap;
 
 pub const Prop = struct {
     id: u32,
+    /// The entity this prop is (`BrowseHolder_Hay`), empty for plain scenery.
+    binder: []const u8 = "",
+    /// For feeders: how much food is left, 0..100.
+    food: f32 = 0,
     model: []const u8,
     scale: f32,
     position: [3]f32,
@@ -130,7 +134,9 @@ pub const World = struct {
         w.income = m.income;
         w.guests_total = m.guests_total;
         w.views = m.views;
-        for (m.objects) |o| _ = try w.addProp(o.model, o.position, o.rotation, o.scale, o.swaps);
+        for (m.objects) |o| {
+            _ = try w.addPropEx(o.model, o.position, o.rotation, o.scale, o.swaps, o.binder, o.food);
+        }
         for (m.fences) |f| _ = try w.addFence(f.kind, f.position, f.rotation);
         for (m.paths) |p| _ = try w.addPath(p.texture, p.position, p.width, p.height);
         for (m.actors) |a| {
@@ -148,9 +154,15 @@ pub const World = struct {
     }
 
     pub fn addProp(self: *World, model: []const u8, pos: [3]f32, rot: [9]f32, scale: f32, swaps: []const Swap) !u32 {
+        return self.addPropEx(model, pos, rot, scale, swaps, "", 0);
+    }
+
+    pub fn addPropEx(self: *World, model: []const u8, pos: [3]f32, rot: [9]f32, scale: f32, swaps: []const Swap, binder: []const u8, food: f32) !u32 {
         const id = self.newId();
         try self.props.append(self.gpa, .{
             .id = id,
+            .binder = if (binder.len > 0) try self.str(binder) else "",
+            .food = food,
             .model = try self.str(model),
             .scale = scale,
             .position = pos,
@@ -261,7 +273,12 @@ pub const World = struct {
         try w.writeAll("</ZTWorldMgr>\n\t<BFGManager><entityList>\n");
 
         for (self.props.items) |p| {
-            try w.writeAll("\t\t<BFPhysObj version=\"0\"><BFRSceneGraphComponent version=\"0\"");
+            try w.writeAll("\t\t<BFPhysObj version=\"0\"");
+            if (p.binder.len > 0) {
+                try attr(w, "zootycon_binder", p.binder);
+                try w.print(" zootycon_food=\"{d:.2}\"", .{p.food});
+            }
+            try w.writeAll("><BFRSceneGraphComponent version=\"0\"");
             try attr(w, "modelfile", p.model);
             try w.print(" scale=\"{d:.6}\" visible=\"1\" />", .{p.scale});
             try w.print("<position x=\"{d:.6}\" y=\"{d:.6}\" z=\"{d:.6}\" />", .{ p.position[0], p.position[1], p.position[2] });
@@ -343,7 +360,7 @@ test "save and reload round trip" {
     w.income = 1234.5;
     w.guests_total = 7;
     const swaps = [_]Swap{.{ .image = "a/b.dds", .layer = "base" }};
-    const prop_id = try w.addProp("entities/objects/x", .{ 1, 2, 3 }, yawRotation(0.5), 1.5, &swaps);
+    const prop_id = try w.addPropEx("entities/objects/x", .{ 1, 2, 3 }, yawRotation(0.5), 1.5, &swaps, "FoodDish_Hay", 42.5);
     _ = try w.addFence("zoowall", .{ 6, 9, 0 }, 1.5708);
     _ = try w.addPath("tex/path.dds", .{ 4.5, 7.5 }, 6, 6);
     _ = try w.addActor("Guest_Adult_F_05", .{ 10, 11, 12 }, identity_rotation, &.{});
@@ -368,6 +385,8 @@ test "save and reload round trip" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.5), m.objects[0].scale, 1e-5);
     try std.testing.expectApproxEqAbs(@cos(@as(f32, 0.5)), m.objects[0].rotation[0], 1e-5);
     try std.testing.expectEqualStrings("a/b.dds", m.objects[0].swaps[0].image);
+    try std.testing.expectEqualStrings("FoodDish_Hay", m.objects[0].binder);
+    try std.testing.expectApproxEqAbs(@as(f32, 42.5), m.objects[0].food, 1e-4);
     try std.testing.expectEqual(@as(usize, 1), m.fences.len);
     try std.testing.expectEqualStrings("zoowall", m.fences[0].kind);
     try std.testing.expectEqual(@as(usize, 1), m.paths.len);

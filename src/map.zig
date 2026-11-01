@@ -26,6 +26,10 @@ pub const Object = struct {
     /// Row-major 3x3 rotation.
     rotation: [9]f32,
     swaps: []const Swap = &.{},
+    /// The entity this object belongs to (`BrowseHolder_Hay`), if known.
+    binder: []const u8 = "",
+    /// Food held, for feeders (0..100).
+    food: f32 = 0,
 };
 
 /// One straight 3-unit fence (or curb) segment on a tile edge. `kind` names
@@ -250,12 +254,26 @@ const Collector = struct {
                 rot[i * 3 + 2] = v[2];
             };
         }
+        // The entity name: saved by this engine, or the middle part of the
+        // game's `mainObj/<entity>/BFBinderRoot` names.
+        var binder: []const u8 = e.attr("zootycon_binder") orelse "";
+        var food = attrFloat(e, "zootycon_food", 0);
+        if (binder.len == 0) if (e.attr("binderUniqueName")) |bn| {
+            if (std.mem.startsWith(u8, bn, "mainObj/")) {
+                const rest = bn["mainObj/".len..];
+                binder = rest[0 .. std.mem.indexOfScalar(u8, rest, '/') orelse rest.len];
+                // The game's maps do not record how full a feeder is.
+                food = 60;
+            }
+        };
         try self.list.append(self.a, .{
             .model = model,
             .scale = attrFloat(sg, "scale", 1.0),
             .position = vec3(pos),
             .rotation = rot,
             .swaps = try self.swaps(e),
+            .binder = binder,
+            .food = food,
         });
     }
 };
@@ -304,6 +322,17 @@ pub fn parse(gpa: std.mem.Allocator, data: []const u8) Error!Map {
         .guests_total = guests_total,
         .views = views,
     };
+}
+
+test "game entity names give a prop's binder" {
+    const src =
+        \\<BFContext><ZTWorldMgr terrFile="x.dat"/><BFPhysObj binderUniqueName="mainObj/BrowseHolder_Hay/BFBinderRoot">
+        \\<BFRSceneGraphComponent modelfile="m" visible="1"/><position x="1" y="2" z="3"/></BFPhysObj></BFContext>
+    ;
+    var m = try parse(std.testing.allocator, src);
+    defer m.deinit();
+    try std.testing.expectEqualStrings("BrowseHolder_Hay", m.objects[0].binder);
+    try std.testing.expect(m.objects[0].food > 0);
 }
 
 test "parses a synthetic map" {
