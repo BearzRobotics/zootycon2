@@ -5,6 +5,11 @@ the player's own install: **no game assets are included**, and the engine
 never runs or patches `zt.exe`. See `specs.md` for goals and the clean-room
 rules.
 
+Guests arrive at the front gate, pay admission, walk the paths to spots near
+animals, watch them, and leave; the top right shows guests, takings, views,
+happiness and the star rating (which raises the guest cap). The numbers come
+from the game's own `ai/guestmgr.xml`.
+
 Status: an asset pipeline (every model, texture, animation and map in the
 game loads), a renderer, a small simulation, and build tools. It is not yet
 a playable game. There is no UI, economy, or real AI.
@@ -60,6 +65,7 @@ shows the current tool, the selected item, and the last message.
 | `Z` | undo |
 | `Tab`, `,`, `.` | pause, slower, faster simulation |
 | `T`, `F2`, `F3` | run or stop the clock, previous or next time of day |
+| `G` | turn guest arrivals on or off |
 | `F5`, `F9` | save, load the last save |
 
 An on-screen display shows the current tool, a hint for it, the simulation
