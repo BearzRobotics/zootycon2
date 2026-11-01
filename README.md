@@ -61,10 +61,21 @@ shows the current tool, the selected item, and the last message.
 | `Tab`, `,`, `.` | pause, slower, faster simulation |
 | `F5`, `F9` | save, load the last save |
 
-Hold Shift with `[` `]` to jump ten items. Saves go to
+An on-screen display shows the current tool, a hint for it, the simulation
+status and a key reference; `F1` hides the help. Hold Shift with `[` `]` to
+jump ten items. Saves go to
 `~/.local/share/zootycon2/saves/<map>.zt2` (plus a `.dat` with the edited
 terrain). They use the game's own map schema, so `play` and `map` open them;
 the original game does not.
+
+## Performance
+
+Large maps have thousands of draw calls. Placed objects are frustum- and
+size-culled, but there is no level-of-detail switching yet (the most detailed
+model is always used). In WSL without GPU access the renderer is Mesa's
+software `llvmpipe` (the title and `info` output show it), which runs the
+biggest map at single-digit frames per second; a real GPU should be far
+faster. Use `-Doptimize=ReleaseFast` for anything but debugging.
 
 ## Driving it without a person
 
