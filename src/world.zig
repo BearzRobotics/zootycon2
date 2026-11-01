@@ -36,8 +36,15 @@ pub const PathTile = struct {
     height: f32,
 };
 
+pub const Head = struct {
+    model: []const u8,
+    yaw: f32 = 0,
+    swaps: []const Swap = &.{},
+};
+
 pub const Actor = struct {
     id: u32,
+    head: ?Head = null,
     binder: []const u8,
     position: [3]f32,
     rotation: [9]f32,
@@ -116,7 +123,15 @@ pub const World = struct {
         for (m.objects) |o| _ = try w.addProp(o.model, o.position, o.rotation, o.scale, o.swaps);
         for (m.fences) |f| _ = try w.addFence(f.kind, f.position, f.rotation);
         for (m.paths) |p| _ = try w.addPath(p.texture, p.position, p.width, p.height);
-        for (m.actors) |a| _ = try w.addActor(a.binder, a.position, a.rotation, a.swaps);
+        for (m.actors) |a| {
+            const id = try w.addActor(a.binder, a.position, a.rotation, a.swaps);
+            if (a.head) |h| w.actors.items[w.actors.items.len - 1].head = .{
+                .model = try w.str(h.model),
+                .yaw = h.yaw,
+                .swaps = try w.swapsCopy(h.swaps),
+            };
+            _ = id;
+        }
         w.revision = 0;
         return w;
     }
@@ -263,7 +278,19 @@ pub const World = struct {
             try w.print("><position x=\"{d:.6}\" y=\"{d:.6}\" z=\"{d:.6}\" />", .{ a.position[0], a.position[1], a.position[2] });
             try rotationXml(w, a.rotation);
             try swapsXml(w, a.swaps);
-            try w.writeAll("</BFPhysObj></subComponents></BFGEntity>\n");
+            try w.writeAll("</BFPhysObj>");
+            if (a.head) |h| {
+                const head_name = try std.fmt.allocPrint(self.gpa, "headObj/{s}/BFBinderRoot", .{a.binder});
+                defer self.gpa.free(head_name);
+                try w.writeAll("<BFPhysObj version=\"0\"");
+                try attr(w, "binderUniqueName", head_name);
+                try w.writeAll("><BFSimpleLODComponent version=\"0\"");
+                try attr(w, "modelfile", h.model);
+                try w.print(" worldyaw=\"{d:.6}\" visible=\"1\" />", .{h.yaw});
+                try swapsXml(w, h.swaps);
+                try w.writeAll("</BFPhysObj>");
+            }
+            try w.writeAll("</subComponents></BFGEntity>\n");
         }
         try w.writeAll("\t</entityList></BFGManager>\n</BFContext>\n");
     }
@@ -302,6 +329,7 @@ test "save and reload round trip" {
     _ = try w.addFence("zoowall", .{ 6, 9, 0 }, 1.5708);
     _ = try w.addPath("tex/path.dds", .{ 4.5, 7.5 }, 6, 6);
     _ = try w.addActor("Guest_Adult_F_05", .{ 10, 11, 12 }, identity_rotation, &.{});
+    w.actors.items[0].head = .{ .model = "entities/units/guests/head", .yaw = 3.14 };
     const gone = try w.addProp("entities/objects/y", .{ 0, 0, 0 }, identity_rotation, 1, &.{});
     try std.testing.expect(w.remove(gone));
     try std.testing.expect(!w.remove(gone));
@@ -327,4 +355,7 @@ test "save and reload round trip" {
     try std.testing.expectEqual(@as(usize, 1), m.actors.len);
     try std.testing.expectEqualStrings("Guest_Adult_F_05", m.actors[0].binder);
     try std.testing.expectApproxEqAbs(@as(f32, 12), m.actors[0].position[2], 1e-5);
+    try std.testing.expectEqualStrings("entities/units/guests/head", m.actors[0].head.?.model);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.14), m.actors[0].head.?.yaw, 1e-4);
+    try std.testing.expectEqual(@as(usize, 1), m.objects.len); // the head is not a prop
 }

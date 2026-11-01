@@ -367,7 +367,7 @@ pub fn main(init: std.process.Init) !void {
         }
         if (shot) vopts.screenshot = out;
         if (std.mem.eql(u8, cmd, "map"))
-            try zootycon2.viewer.runMap(gpa, &vfs, rest[0], vopts)
+            try zootycon2.app.run(gpa, io, &vfs, rest[0], .{ .viewer = vopts, .tools = false, .sim = false, .save_dir = "." })
         else
             try zootycon2.viewer.run(gpa, &vfs, rest[0], vopts);
     } else if (std.mem.eql(u8, cmd, "elements") and rest.len >= 2) {

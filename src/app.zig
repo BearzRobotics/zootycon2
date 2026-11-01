@@ -330,7 +330,13 @@ pub const App = struct {
             const def = self.actorDef(a.binder) orelse continue;
             const m = viewer.fromTransform(.{ .translation = a.position, .rotation = a.rotation, .scale = def.scale });
             const phase = @mod(a.position[0] * 0.37 + a.position[1] * 0.61, 3.0);
-            if (!try scene.addActor(def.file, m, phase, a.swaps)) continue;
+            var head: ?viewer.ActorHead = null;
+            if (a.head) |h| {
+                head = .{ .model = h.model, .yaw = h.yaw, .swaps = h.swaps };
+            } else if (viewer.actorHead(self.gpa, &self.reg, a.binder)) |hm| {
+                head = .{ .model = hm };
+            }
+            if (!try scene.addActor(def.file, m, phase, a.swaps, head)) continue;
             try self.actor_ids.append(self.gpa, a.id);
             try self.actor_scales.append(self.gpa, def.scale);
             try self.inst_anim.append(self.gpa, null);

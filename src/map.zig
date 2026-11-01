@@ -47,7 +47,16 @@ pub const PathDecal = struct {
 
 /// An entity whose model is not stored in the save: it comes from the
 /// entity definition named `binder` (animals, guests, staff).
+/// The separate head model of a person (attached to the body's `Link_Head`).
+pub const Head = struct {
+    model: []const u8,
+    /// Extra yaw applied to the head model (`worldyaw`).
+    yaw: f32 = 0,
+    swaps: []const Swap = &.{},
+};
+
 pub const Actor = struct {
+    head: ?Head = null,
     binder: []const u8,
     position: [3]f32,
     /// Row-major 3x3 rotation.
@@ -148,6 +157,18 @@ const Collector = struct {
             if (!std.mem.startsWith(u8, name, "mainObj/")) continue;
             if (hasModel(c)) return;
             const pos = c.child("position") orelse return;
+            var head: ?Head = null;
+            for (sub.children) |hc| {
+                if (!std.ascii.eqlIgnoreCase(hc.name, "BFPhysObj")) continue;
+                const hname = hc.attr("binderUniqueName") orelse continue;
+                if (!std.mem.startsWith(u8, hname, "headObj/")) continue;
+                for (hc.children) |comp| for (model_components) |mc| {
+                    if (!std.ascii.eqlIgnoreCase(comp.name, mc)) continue;
+                    const mf = comp.attr("modelfile") orelse continue;
+                    if (mf.len == 0) continue;
+                    head = .{ .model = mf, .yaw = attrFloat(comp, "worldyaw", 0), .swaps = try self.swaps(hc) };
+                };
+            }
             var rot = [9]f32{ 1, 0, 0, 0, 1, 0, 0, 0, 1 };
             if (c.child("rotation")) |r| {
                 const rows = [3][]const u8{ "row0", "row1", "row2" };
@@ -158,7 +179,7 @@ const Collector = struct {
                     rot[i * 3 + 2] = v[2];
                 };
             }
-            try self.actors.append(self.a, .{ .binder = binder, .position = vec3(pos), .rotation = rot, .swaps = try self.swaps(c) });
+            try self.actors.append(self.a, .{ .binder = binder, .position = vec3(pos), .rotation = rot, .swaps = try self.swaps(c), .head = head });
             return;
         }
     }
@@ -207,6 +228,8 @@ const Collector = struct {
                 if (std.ascii.eqlIgnoreCase(c.name, name)) comp = c;
             }
         }
+        // Heads belong to their body; they are placed with the actor.
+        if (e.attr("binderUniqueName")) |n| if (std.mem.startsWith(u8, n, "headObj/")) return;
         const sg = comp orelse return;
         const model = sg.attr("modelfile") orelse return;
         if (model.len == 0) return;
