@@ -35,6 +35,8 @@ const sc = struct {
     const z: u32 = 29;
     const k1: u32 = 30;
     const k8: u32 = 37;
+    const k9: u32 = 38;
+    const f: u32 = 9;
     const tab: u32 = 43;
     const lbracket: u32 = 47;
     const rbracket: u32 = 48;
@@ -60,6 +62,7 @@ pub const Tool = enum {
     lower,
     flatten,
     actor,
+    food,
 
     fn label(self: Tool) []const u8 {
         return switch (self) {
@@ -71,6 +74,7 @@ pub const Tool = enum {
             .lower => "lower terrain",
             .flatten => "flatten terrain",
             .actor => "place animal/guest",
+            .food => "place food or water",
         };
     }
 };
@@ -182,6 +186,7 @@ pub const App = struct {
 
     // Clickable interface, rebuilt each frame by `overlay`.
     hits: std.ArrayList(Hit) = .empty,
+    feeder_state: u64 = 0,
     over_ui: bool = false,
 
     // Virtual input.
@@ -201,6 +206,12 @@ pub const App = struct {
     actor_i: usize = 0,
     /// Entity names visitors are made from (adults and children with a model).
     guest_names: std.ArrayList([]const u8) = .empty,
+    /// Food and water containers (entity names) and the chosen one.
+    food_names: std.ArrayList([]const u8) = .empty,
+    food_i: usize = 0,
+    /// Entity names whose task files are already in the animal libraries.
+    food_loaded: std.StringHashMapUnmanaged(void) = .empty,
+    chains: std.StringHashMapUnmanaged([]const *const entity.Binder) = .empty,
     arrivals_on: bool = true,
     /// From `ai/guestmgr.xml`: the visitor cap is base + per_star * stars.
     guests_base: f32 = 30,
@@ -217,6 +228,16 @@ pub const App = struct {
         self.path_textures.deinit(self.gpa);
         self.actor_names.deinit(self.gpa);
         self.guest_names.deinit(self.gpa);
+        self.food_names.deinit(self.gpa);
+        var fl = self.food_loaded.keyIterator();
+        while (fl.next()) |k| self.gpa.free(k.*);
+        self.food_loaded.deinit(self.gpa);
+        var ch = self.chains.iterator();
+        while (ch.next()) |e| {
+            self.gpa.free(e.key_ptr.*);
+            self.gpa.free(e.value_ptr.*);
+        }
+        self.chains.deinit(self.gpa);
         self.catalog_arena.deinit();
         var it = self.actor_defs.keyIterator();
         while (it.next()) |k| self.gpa.free(k.*);
@@ -310,6 +331,15 @@ pub const App = struct {
             if (self.actorDef(n) != null) try self.guest_names.append(self.gpa, n);
         }
         self.sim.guest_binders = self.guest_names.items;
+        // Food and water containers that have a model.
+        var bit = self.reg.binders.valueIterator();
+        while (bit.next()) |b| {
+            const bd = b.*;
+            if (bd.abstract or self.feederKind(bd.name) == null) continue;
+            if (viewer.binderModel(self.gpa, &self.reg, bd.name, "mainObj") == null) continue;
+            try self.food_names.append(self.gpa, try ca.dupe(u8, bd.name));
+        }
+        std.mem.sort([]const u8, self.food_names.items, {}, lessStr);
         // Start on a sensible default: the first path texture that is a concrete path.
         for (self.path_textures.items, 0..) |t, i| if (std.mem.indexOf(u8, t, "concrete") != null) {
             self.path_i = i;
@@ -357,7 +387,7 @@ pub const App = struct {
         const scene = self.scene;
         scene.clearStatic();
         for (self.world.props.items) |p| {
-            const draws = (try scene.loadModel(p.model)) orelse continue;
+            const draws = (try scene.loadModel(self.displayModel(p))) orelse continue;
             try scene.place(draws, propMatrix(p), p.swaps);
         }
         for (self.world.fences.items) |f| {
@@ -420,6 +450,7 @@ pub const App = struct {
                 if (self.scene.walkSpeed(i)) |sp| ag.speed = sp * self.actor_scales.items[i];
             }
             self.synced_actor_rev = self.world.actors_revision;
+            self.loadFoodTasks();
         }
         if (self.synced_terrain_rev != self.world.terrain_revision and secs - self.last_terrain_secs > 0.1) {
             try self.rebuildTerrain();
@@ -538,6 +569,42 @@ pub const App = struct {
         const id = try self.world.addActor(name, at, world_mod.yawRotation(self.yaw), &.{});
         self.pushAdded(&.{id});
         self.say("placed {s}", .{name});
+    }
+
+    fn placeFood(self: *App, at: [3]f32) !void {
+        if (self.food_names.items.len == 0) return;
+        const name = self.food_names.items[self.food_i];
+        const m = viewer.binderModel(self.gpa, &self.reg, name, "mainObj") orelse return;
+        const id = try self.world.addPropEx(m.file, at, world_mod.yawRotation(self.yaw), m.scale, &.{}, name, 100);
+        self.pushAdded(&.{id});
+        self.say("placed {s}", .{name});
+    }
+
+    /// The model a prop is drawn with: feeders show a full or empty look.
+    fn displayModel(self: *App, p: world_mod.Prop) []const u8 {
+        if (p.binder.len == 0 or self.feederKind(p.binder) == null) return p.model;
+        for (self.sim.feeders.items) |f| if (f.prop_id == p.id) {
+            if (f.food >= 1) if (viewer.binderModel(self.gpa, &self.reg, p.binder, "full")) |m| return m.file;
+            return p.model;
+        };
+        if (p.food >= 1) if (viewer.binderModel(self.gpa, &self.reg, p.binder, "full")) |m| return m.file;
+        return p.model;
+    }
+
+    const refill_cost: f64 = 10;
+
+    /// Refills the selected feeder (Shift: every feeder) for a small fee.
+    fn refill(self: *App) void {
+        var filled: u32 = 0;
+        for (self.sim.feeders.items) |*f| {
+            const wanted = if (self.shift) true else if (self.selected) |sel| sel.kind == .prop and sel.id == f.prop_id else false;
+            if (!wanted or f.food >= 99) continue;
+            f.food = 100;
+            filled += 1;
+        }
+        if (filled == 0) return self.say("select a feeder first (tool 1), then press F", .{});
+        self.sim.zoo.income -= refill_cost * @as(f64, @floatFromInt(filled));
+        self.say("refilled {d} feeder(s) for ${d:.0}", .{ filled, refill_cost * @as(f64, @floatFromInt(filled)) });
     }
 
     fn placePath(self: *App, at: [3]f32) !void {
@@ -800,6 +867,17 @@ pub const App = struct {
             var t: f32 = 0;
             while (t < secs) : (t += 1.0 / 30.0) self.brush(x, y, 1.0 / 30.0);
             self.resettle();
+        } else if (std.mem.eql(u8, verb, "food")) {
+            const x = try num(it.next());
+            const y = try num(it.next());
+            try self.placeFood(self.groundAt(x, y));
+        } else if (std.mem.eql(u8, verb, "foodname")) {
+            self.food_i = pickByName(self.food_names.items, it.rest()) orelse return error.NotFound;
+        } else if (std.mem.eql(u8, verb, "hungry")) {
+            try self.sim.sync(&self.world);
+            for (self.sim.agents.items) |*ag| if (ag.brain) |*b| {
+                b.needs[5] = 95;
+            };
         } else if (std.mem.eql(u8, verb, "delete")) {
             const x = try num(it.next());
             const y = try num(it.next());
@@ -928,8 +1006,76 @@ pub const App = struct {
         return std.math.clamp(1 + @floor(h / 25.0), 1, 5);
     }
 
+    /// The inheritance chain of an entity, cached.
+    fn chainFor(self: *App, binder: []const u8) ?[]const *const entity.Binder {
+        var buf: [128]u8 = undefined;
+        if (binder.len > buf.len) return null;
+        const key = std.ascii.lowerString(&buf, binder);
+        if (self.chains.get(key)) |c| return c;
+        const b = self.reg.get(binder) orelse return null;
+        const chain = self.reg.chain(self.gpa, b) catch return null;
+        const owned = self.gpa.dupe(u8, key) catch {
+            self.gpa.free(chain);
+            return null;
+        };
+        self.chains.put(self.gpa, owned, chain) catch {
+            self.gpa.free(owned);
+            self.gpa.free(chain);
+            return null;
+        };
+        return chain;
+    }
+
+    fn hookFlag(ctx: *anyopaque, binder: []const u8, name: []const u8) bool {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        const chain = self.chainFor(binder) orelse return false;
+        const v = entity.Registry.attr(chain, .shared, "BFAIEntityDataShared", name) orelse return false;
+        return std.ascii.eqlIgnoreCase(v, "true") or std.mem.eql(u8, v, "1");
+    }
+
+    /// A food container's kind (`FoodDish`, `Trough`...): the type name just
+    /// below `food` on its type path.
+    fn feederKind(self: *App, binder: []const u8) ?[]const u8 {
+        const b = self.reg.get(binder) orelse return null;
+        for (b.type_path, 0..) |t, i| if (std.ascii.eqlIgnoreCase(t, "food") and i + 1 < b.type_path.len) {
+            return b.type_path[i + 1];
+        };
+        return null;
+    }
+
+    fn hookFeeder(ctx: *anyopaque, binder: []const u8) ?[]const u8 {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        return self.feederKind(binder);
+    }
+
+    /// Loads the feeding tasks of every feeder in the world into the animal
+    /// libraries (the tasks live with the food, not the animal).
+    fn loadFoodTasks(self: *App) void {
+        for (self.world.props.items) |p| {
+            if (p.binder.len == 0 or self.feederKind(p.binder) == null) continue;
+            var lit = self.ai_libs.iterator();
+            while (lit.next()) |e| {
+                var kb: [200]u8 = undefined;
+                var lower: [96]u8 = undefined;
+                if (p.binder.len > lower.len) continue;
+                const l = std.ascii.lowerString(&lower, p.binder);
+                const key = std.fmt.bufPrint(&kb, "{s}|{s}", .{ e.key_ptr.*, l }) catch continue;
+                if (self.food_loaded.contains(key)) continue;
+                const owned = self.gpa.dupe(u8, key) catch continue;
+                self.food_loaded.put(self.gpa, owned, {}) catch {
+                    self.gpa.free(owned);
+                    continue;
+                };
+                if (self.fileExists("ai/tasks/food/{s}.tsk", .{l})) |d| {
+                    defer self.gpa.free(d);
+                    e.value_ptr.*.addTasks(d) catch {};
+                }
+            }
+        }
+    }
+
     fn installHooks(self: *App) void {
-        self.sim.hooks = .{ .ctx = self, .brain = hookBrain, .anim_len = hookAnimLen };
+        self.sim.hooks = .{ .ctx = self, .brain = hookBrain, .anim_len = hookAnimLen, .flag = hookFlag, .feeder = hookFeeder };
         self.sim.guest_binders = self.guest_names.items;
         self.updateGuestCap();
     }
@@ -1044,6 +1190,8 @@ pub const App = struct {
             for (self.sim.agents.items[0..@min(self.sim.agents.items.len, 6)]) |ag| {
                 std.debug.print("agent #{d}: {s} speed={d:.2} state={s} anim={s} brain={}\n", .{ ag.id, @tagName(ag.kind), ag.speed, @tagName(ag.state), ag.anim_name, ag.brain != null });
             }
+            for (self.sim.feeders.items) |f| std.debug.print("feeder #{d} {s}: food {d:.0}\n", .{ f.prop_id, f.binder, f.food });
+            std.debug.print("animal welfare: {d:.0}\n", .{self.sim.animalWelfare()});
             std.debug.print("perf: {d:.1} fps ({d} static draws, {d} actor draws)\n", .{ if (ctx.dt > 0) 1.0 / ctx.dt else 0.0, self.scene.draws.items.len, self.scene.actor_draws.items.len });
             std.debug.print("zoo: guests={d} total={d} left={d} income={d:.0} views={d} happy={d:.0}\n", .{
                 self.sim.liveGuests(), self.sim.zoo.guests_total, self.sim.zoo.guests_left, self.sim.zoo.income, self.sim.zoo.views, self.sim.happiness(),
@@ -1101,6 +1249,7 @@ pub const App = struct {
                 }
             },
             .path => cycle(&self.path_i, self.path_textures.items.len, d),
+            .food => cycle(&self.food_i, self.food_names.items.len, d),
             .actor => {
                 var tries: usize = 0;
                 var dd = d;
@@ -1211,6 +1360,7 @@ pub const App = struct {
             .fence => self.fence_kinds.items.len,
             .path => self.path_textures.items.len,
             .actor => self.actor_names.items.len,
+            .food => self.food_names.items.len,
             else => 0,
         };
     }
@@ -1221,6 +1371,7 @@ pub const App = struct {
             .fence => self.fence_i,
             .path => self.path_i,
             .actor => self.actor_i,
+            .food => self.food_i,
             else => 0,
         };
     }
@@ -1231,6 +1382,7 @@ pub const App = struct {
             .fence => self.fence_kinds.items[i],
             .path => std.fs.path.basename(self.path_textures.items[i]),
             .actor => self.actor_names.items[i],
+            .food => self.food_names.items[i],
             else => "",
         };
     }
@@ -1242,6 +1394,7 @@ pub const App = struct {
             .prop => self.prop_i = i,
             .fence => self.fence_i = i,
             .path => self.path_i = i,
+            .food => self.food_i = i,
             .actor => {
                 if (self.actorDef(self.actor_names.items[i]) == null) {
                     self.say("{s} has no model", .{self.actor_names.items[i]});
@@ -1262,8 +1415,8 @@ pub const App = struct {
     }
 
     fn toolKey(self: *App, code: u32) void {
-        if (code >= sc.k1 and code <= sc.k8) {
-            const tools = [_]Tool{ .select, .prop, .fence, .path, .raise, .lower, .flatten, .actor };
+        if (code >= sc.k1 and code <= sc.k9) {
+            const tools = [_]Tool{ .select, .prop, .fence, .path, .raise, .lower, .flatten, .actor, .food };
             self.tool = tools[code - sc.k1];
             self.fence_start = null;
             self.title_dirty = true;
@@ -1277,6 +1430,7 @@ pub const App = struct {
                 self.title_dirty = true;
             },
             sc.delete, sc.x => self.deleteSelected(),
+            sc.f => self.refill(),
             sc.z => self.doUndo(),
             sc.c => {
                 self.fence_start = null;
@@ -1297,6 +1451,7 @@ pub const App = struct {
             },
             .prop => if (hit) |h| self.placeProp(h) catch {},
             .actor => if (hit) |h| self.placeActor(h) catch {},
+            .food => if (hit) |h| self.placeFood(h) catch {},
             .path => if (hit) |h| self.placePath(h) catch {},
             .fence => if (hit) |h| {
                 const p = [2]f32{ snap(h[0], 3.0), snap(h[1], 3.0) };
@@ -1335,6 +1490,11 @@ pub const App = struct {
                 const name = self.actor_names.items[self.actor_i];
                 if (self.actorDef(name)) |def| {
                     if (try scene.loadModel(def.file)) |d| try scene.addOverlay(d, self.modelMatrixAt(h, self.yaw, def.scale), green);
+                }
+            },
+            .food => if (self.food_names.items.len > 0) {
+                if (viewer.binderModel(self.gpa, &self.reg, self.food_names.items[self.food_i], "mainObj")) |m| {
+                    if (try scene.loadModel(m.file)) |d| try scene.addOverlay(d, self.modelMatrixAt(h, self.yaw, m.scale), green);
                 }
             },
             .fence => if (self.fence_kinds.items.len > 0) {
@@ -1392,7 +1552,15 @@ pub const App = struct {
             .lower => "HOLD LEFT MOUSE TO LOWER THE GROUND",
             .flatten => "CLICK TO PICK A HEIGHT, THEN HOLD TO FLATTEN TO IT",
             .actor => "CLICK THE GROUND TO PLACE. [ ] CHANGE ANIMAL OR PERSON",
+            .food => "CLICK TO PLACE A FEEDER. F REFILLS THE SELECTED ONE (SHIFT: ALL)",
         };
+    }
+
+    fn statsText(self: *const App, buf: []u8) []const u8 {
+        const z = &self.sim.zoo;
+        return std.fmt.bufPrint(buf, "GUESTS {d}/{d}  TAKINGS ${d:.0}  VIEWS {d}  HAPPY {d:.0}  ANIMALS {d:.0}  STARS {d:.0}", .{
+            self.sim.liveGuests(), self.sim.max_guests, z.income, z.views, self.sim.happiness(), self.sim.animalWelfare(), self.stars(),
+        }) catch "";
     }
 
     /// The on-screen display, drawn over the scene each frame.
@@ -1421,6 +1589,9 @@ pub const App = struct {
             .actor => if (self.actor_names.items.len > 0) {
                 detail = self.actor_names.items[self.actor_i];
             },
+            .food => if (self.food_names.items.len > 0) {
+                detail = self.food_names.items[self.food_i];
+            },
             else => {},
         }
         const head = if (self.opts.tools)
@@ -1429,8 +1600,13 @@ pub const App = struct {
             "VIEW";
         try ui.label(pad, y, scale, head, white);
         y += line + 2 * scale;
+        // The right-hand statistics take the same row, so clip the hint to fit.
+        const stats_w = viewer.Ui.textWidth(self.statsText(&buf), scale);
+        const room = @max(0, ui.width - stats_w - pad * 4 - 4);
         if (self.opts.tools and self.show_help) {
-            try ui.label(pad, y, scale, self.toolHint(), grey);
+            const hint = self.toolHint();
+            const fit: usize = @intFromFloat(@floor(room / (6 * scale)));
+            try ui.label(pad, y, scale, hint[0..@min(hint.len, fit)], grey);
             y += line + 2 * scale;
         }
         if (self.message_len > 0) {
@@ -1454,16 +1630,18 @@ pub const App = struct {
         if (self.opts.tools) try self.drawControls(ui, scale, pad, line);
 
         // Zoo statistics: guests, takings, how happy they are.
-        const z = &self.sim.zoo;
-        const stats = std.fmt.bufPrint(&buf, "GUESTS {d}/{d}   TAKINGS ${d:.0}   VIEWS {d}   HAPPY {d:.0}   STARS {d:.0}", .{
-            self.sim.liveGuests(), self.sim.max_guests, z.income, z.views, self.sim.happiness(), self.stars(),
-        }) catch "";
+        const stats = self.statsText(&buf);
         const stw = viewer.Ui.textWidth(stats, scale);
         try ui.label(ui.width - stw - pad, pad + line + 2 * scale, scale, stats, white);
 
         // Selection.
         if (self.selected) |sel| {
-            const t = std.fmt.bufPrint(&buf, "SELECTED {s} #{d}", .{ @tagName(sel.kind), sel.id }) catch "";
+            var food_text: [32]u8 = undefined;
+            var food: []const u8 = "";
+            if (sel.kind == .prop) for (self.sim.feeders.items) |f| if (f.prop_id == sel.id) {
+                food = std.fmt.bufPrint(&food_text, "  FOOD {d:.0}%", .{f.food}) catch "";
+            };
+            const t = std.fmt.bufPrint(&buf, "SELECTED {s} #{d}{s}", .{ @tagName(sel.kind), sel.id, food }) catch "";
             const w2 = viewer.Ui.textWidth(t, scale);
             try ui.label(ui.width - w2 - pad, pad + 2 * (line + 2 * scale), scale, t, yellow);
         }
@@ -1471,9 +1649,9 @@ pub const App = struct {
         // Key reference.
         if (self.show_help) {
             const lines = if (self.opts.tools) [_][]const u8{
-                "1 SELECT  2 OBJECT  3 FENCE  4 PATH  5 RAISE  6 LOWER  7 FLATTEN  8 ANIMAL/PERSON",
+                "1 SELECT 2 OBJECT 3 FENCE 4 PATH 5 RAISE 6 LOWER 7 FLATTEN 8 ANIMAL/PERSON 9 FOOD",
                 "[ ] CHOOSE (SHIFT: x10)  R ROTATE  Z UNDO  TAB PAUSE  , . SPEED  F5 SAVE  F9 LOAD",
-                "T RUN/STOP CLOCK   F2 F3 PREVIOUS/NEXT TIME OF DAY   G GUEST ARRIVALS",
+                "T RUN/STOP CLOCK   F2 F3 PREVIOUS/NEXT TIME OF DAY   G GUEST ARRIVALS   F REFILL FEEDER",
                 "RIGHT-DRAG ORBIT   WHEEL ZOOM   WASD PAN   F1 HIDE THIS   ESC QUIT",
             } else [_][]const u8{
                 "TAB PAUSE  , . SPEED   T RUN/STOP CLOCK   F2 F3 TIME OF DAY",
@@ -1513,6 +1691,7 @@ pub const App = struct {
             .{ .t = .lower, .label = "6 LOWER" },
             .{ .t = .flatten, .label = "7 FLATTEN" },
             .{ .t = .actor, .label = "8 ANIMAL" },
+            .{ .t = .food, .label = "9 FOOD" },
         };
         var y = pad + line * 4.5;
         for (tools) |t| {
@@ -1573,6 +1752,9 @@ pub const App = struct {
             .actor => if (self.actor_names.items.len > 0) {
                 detail = self.actor_names.items[self.actor_i];
             },
+            .food => if (self.food_names.items.len > 0) {
+                detail = self.food_names.items[self.food_i];
+            },
             else => {},
         }
         const msg = self.message[0..self.message_len];
@@ -1611,6 +1793,16 @@ pub const App = struct {
                 else => {},
             };
             try self.drawOverlays();
+        }
+
+        // Feeders look full or empty; redraw them when that changes.
+        {
+            var state: u64 = 0;
+            for (self.sim.feeders.items) |f| state = state *% 31 +% f.prop_id *% 2 +% @intFromBool(f.food >= 1);
+            if (state != self.feeder_state) {
+                self.feeder_state = state;
+                self.world.revision += 1;
+            }
         }
 
         // Simulation.

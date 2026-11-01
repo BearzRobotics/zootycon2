@@ -276,7 +276,7 @@ pub const World = struct {
             try w.writeAll("\t\t<BFPhysObj version=\"0\"");
             if (p.binder.len > 0) {
                 try attr(w, "zootycon_binder", p.binder);
-                try w.print(" zootycon_food=\"{d:.2}\"", .{p.food});
+                if (p.food >= 0) try w.print(" zootycon_food=\"{d:.2}\"", .{p.food});
             }
             try w.writeAll("><BFRSceneGraphComponent version=\"0\"");
             try attr(w, "modelfile", p.model);

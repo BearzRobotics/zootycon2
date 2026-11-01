@@ -5,6 +5,11 @@ the player's own install: **no game assets are included**, and the engine
 never runs or patches `zt.exe`. See `specs.md` for goals and the clean-room
 rules.
 
+Animals get hungry and thirsty. With a feeder they can reach (inside their
+fence, with food in it, and of a kind their species eats) they walk over and
+eat, using the game's own task files; hungry animals are less fun to watch, so
+guests enjoy them less. Feeders need refilling.
+
 Guests arrive at the front gate, pay admission, walk the paths to spots near
 animals, watch them, and leave; the top right shows guests, takings, views,
 happiness and the star rating (which raises the guest cap). The numbers come
@@ -62,6 +67,7 @@ shows the current tool, the selected item, and the last message.
 | `4` | paint path tiles (click or drag) |
 | `5` `6` `7` | raise, lower, flatten terrain (hold left mouse) |
 | `8` | place an animal or person (`[` `]` choose) |
+| `9` | place a food or water container; select it (tool 1) and press `F` to refill (Shift+F: all) |
 | `Z` | undo |
 | `Tab`, `,`, `.` | pause, slower, faster simulation |
 | `T`, `F2`, `F3` | run or stop the clock, previous or next time of day |

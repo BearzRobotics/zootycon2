@@ -257,13 +257,13 @@ const Collector = struct {
         // The entity name: saved by this engine, or the middle part of the
         // game's `mainObj/<entity>/BFBinderRoot` names.
         var binder: []const u8 = e.attr("zootycon_binder") orelse "";
-        var food = attrFloat(e, "zootycon_food", 0);
+        var food = attrFloat(e, "zootycon_food", -1);
         if (binder.len == 0) if (e.attr("binderUniqueName")) |bn| {
             if (std.mem.startsWith(u8, bn, "mainObj/")) {
                 const rest = bn["mainObj/".len..];
                 binder = rest[0 .. std.mem.indexOfScalar(u8, rest, '/') orelse rest.len];
-                // The game's maps do not record how full a feeder is.
-                food = 60;
+                // The game's maps do not record how full a feeder is (-1: unknown).
+                food = -1;
             }
         };
         try self.list.append(self.a, .{
@@ -332,7 +332,7 @@ test "game entity names give a prop's binder" {
     var m = try parse(std.testing.allocator, src);
     defer m.deinit();
     try std.testing.expectEqualStrings("BrowseHolder_Hay", m.objects[0].binder);
-    try std.testing.expect(m.objects[0].food > 0);
+    try std.testing.expect(m.objects[0].food < 0); // unknown level
 }
 
 test "parses a synthetic map" {

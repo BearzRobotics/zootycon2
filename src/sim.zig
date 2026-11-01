@@ -433,7 +433,7 @@ pub const Sim = struct {
         for (w.props.items) |p| {
             if (p.binder.len == 0) continue;
             const kind = h.feeder(h.ctx, p.binder) orelse continue;
-            var food = p.food;
+            var food = if (p.food < 0) 60 else p.food; // unknown levels start part full
             for (self.feeders.items) |old| if (old.prop_id == p.id) {
                 food = old.food;
             };
@@ -726,7 +726,13 @@ pub const Sim = struct {
                     ag.yaw = std.math.atan2(dy, dx) + std.math.pi / 2.0;
                 };
                 self.zoo.views += 1;
-                ag.happiness = @min(100, ag.happiness + 6 + self.rng.random().float(f32) * 4);
+                // A hungry, thirsty animal is less fun to watch.
+                var welfare: f32 = 100;
+                if (ag.view_target) |tid| if (self.agentFor(tid)) |target| if (target.brain) |b| {
+                    welfare = 100 - @max(b.needs[5], b.needs[6]);
+                };
+                const worth = 0.3 + 0.7 * welfare / 100.0;
+                ag.happiness = @min(100, ag.happiness + (6 + self.rng.random().float(f32) * 4) * worth);
                 self.guestRest(ag, 8, 18);
             },
             else => self.guestRest(ag, 2, 6),

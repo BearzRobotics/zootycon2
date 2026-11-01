@@ -2249,6 +2249,38 @@ pub fn actorModel(gpa: std.mem.Allocator, reg: *const entity.Registry, name: []c
     return null;
 }
 
+/// The model of a named sub-object (`mainObj`, `full`) of an entity.
+pub fn binderModel(gpa: std.mem.Allocator, reg: *const entity.Registry, name: []const u8, which: []const u8) ?ActorModel {
+    const b = reg.get(name) orelse return null;
+    const chain = reg.chain(gpa, b) catch return null;
+    defer gpa.free(chain);
+    var i = chain.len;
+    while (i > 0) {
+        i -= 1;
+        if (findNamed(chain[i].root, which)) |m| return m;
+    }
+    return null;
+}
+
+fn findModelComponent(e: *const @import("xml.zig").Element) ?ActorModel {
+    if (e.attr("modelfile")) |m| if (m.len > 0) {
+        const sc = if (e.attr("scale")) |v| std.fmt.parseFloat(f32, std.mem.trim(u8, v, " ")) catch 1.0 else 1.0;
+        return .{ .file = m, .scale = sc };
+    };
+    for (e.children) |c| if (findModelComponent(c)) |m| return m;
+    return null;
+}
+
+fn findNamed(e: *const @import("xml.zig").Element, which: []const u8) ?ActorModel {
+    if (std.ascii.eqlIgnoreCase(e.name, "BFNamedBinder")) {
+        if (e.attr("binderName")) |n| if (std.ascii.eqlIgnoreCase(n, which)) {
+            if (findModelComponent(e)) |m| return m;
+        };
+    }
+    for (e.children) |c| if (findNamed(c, which)) |m| return m;
+    return null;
+}
+
 /// The head model for a person's entity definition (a `headObj` binder).
 pub fn actorHead(gpa: std.mem.Allocator, reg: *const entity.Registry, name: []const u8) ?[]const u8 {
     const b = reg.get(name) orelse return null;
