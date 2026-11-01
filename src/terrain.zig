@@ -80,6 +80,13 @@ pub const Terrain = struct {
 
 pub const Error = error{ BadTerrain, OutOfMemory };
 
+/// Height of the water surface. Stock maps keep their flat ground at 13 and
+/// every pool, river and sea floor lies below this level (lakes bottom out
+/// around 3.5), so terrain under it is under water.
+pub const water_level: f32 = 12.0;
+/// Where the flat ground of a new map sits.
+pub const ground_level: f32 = 13.0;
+
 fn u32le(d: []const u8, at: usize) u32 {
     return std.mem.readInt(u32, d[at..][0..4], .little);
 }
@@ -213,6 +220,7 @@ pub fn blank(gpa: std.mem.Allocator, tiles_x: u32, tiles_y: u32, biome: u8) Erro
     const count = @as(usize, gw) * gh;
     for (0..count) |i| {
         const rec = pos + i * rs;
+        w(u32, buf[rec..][0..4], @bitCast(ground_level - 6.0), .little);
         w(u32, buf[rec + 8 ..][0..4], biome, .little);
         w(u32, buf[rec + 18 ..][0..4], @bitCast(@as(f32, 6.0)), .little);
         w(u32, buf[rec + 22 ..][0..4], @bitCast(@as(f32, 26.0)), .little);
@@ -227,7 +235,7 @@ test "blank terrain parses back flat with the chosen biome" {
     try std.testing.expectEqual(@as(u32, 13), t.height);
     try std.testing.expectEqual(@as(f32, 12.0), t.world_width);
     try std.testing.expectEqual(@as(f32, 9.0), t.world_height);
-    try std.testing.expectApproxEqAbs(@as(f32, 6.0), t.z[100], 1e-6);
+    try std.testing.expectApproxEqAbs(ground_level, t.z[100], 1e-6);
     try std.testing.expectEqual(@as(u8, 7), t.paint[50]);
     try std.testing.expectEqualStrings("savannah", t.biomes[t.paint[50]]);
 }

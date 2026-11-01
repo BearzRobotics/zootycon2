@@ -267,6 +267,24 @@ pub fn main(init: std.process.Init) !void {
             const px = [3]u8{ @intCast(@as(u32, rgba[pi * 4]) * a / 255), @intCast(@as(u32, rgba[pi * 4 + 1]) * a / 255), @intCast(@as(u32, rgba[pi * 4 + 2]) * a / 255) };
             try out.writeAll(&px);
         }
+    } else if (std.mem.eql(u8, cmd, "terrstat")) {
+        // Debug: height range of a terrain file and how much lies below z = 6 (the base).
+        if (rest.len < 1) return fail("terrstat <file.dat>\n");
+        const data = try vfs.read(gpa, rest[0]);
+        defer gpa.free(data);
+        var t = try zootycon2.terrain.parse(gpa, data);
+        defer t.deinit();
+        var lo: f32 = 1e9;
+        var hi: f32 = -1e9;
+        var below: usize = 0;
+        var below1: usize = 0;
+        for (t.z) |z| {
+            lo = @min(lo, z);
+            hi = @max(hi, z);
+            if (z < 6.0) below += 1;
+            if (z < 5.0) below1 += 1;
+        }
+        try out.print("{s}: {d}x{d} z {d:.1}..{d:.1} below6 {d:.1}% below5 {d:.1}% stride {d}\n", .{ rest[0], t.width, t.height, lo, hi, 100.0 * @as(f32, @floatFromInt(below)) / @as(f32, @floatFromInt(t.z.len)), 100.0 * @as(f32, @floatFromInt(below1)) / @as(f32, @floatFromInt(t.z.len)), t.stride });
     } else if (std.mem.eql(u8, cmd, "headcheck")) {
         // Debug: where the Link_Head node goes in every animation of a model.
         if (rest.len < 1) return fail("headcheck <file.bfm>\n");

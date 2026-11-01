@@ -1092,6 +1092,7 @@ pub const App = struct {
         self.world = fresh;
         self.look.deinit(self.gpa);
         self.look = try viewer.terrainLook(self.gpa, self.vfs, self.scene, &self.world.terrain);
+        viewer.waterLook(self.gpa, self.vfs, self.scene, &self.world.terrain) catch {};
         for (self.undo.items) |op| if (op == .added) self.gpa.free(op.added.ids);
         self.undo.clearRetainingCapacity();
         self.selected = null;
@@ -3788,6 +3789,7 @@ pub const App = struct {
     pub fn frame(self: *App, ctx: *viewer.FrameCtx) !void {
         self.blink +%= 1;
         self.app_time += ctx.dt;
+        self.scene.scrollWater(@floatCast(self.app_time));
         if (self.app_time - self.alert_check > 4 and self.menu == .none and self.opts.sim) {
             self.alert_check = self.app_time;
             self.checkAlerts();
@@ -3956,6 +3958,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, vfs: *vfs_mod.Vfs, path: []const u8, 
     scene.fx.fxaa = opts.modern and !opts.no_post;
 
     var look = try viewer.terrainLook(gpa, vfs, &scene, &world.terrain);
+    viewer.waterLook(gpa, vfs, &scene, &world.terrain) catch {};
     errdefer look.deinit(gpa);
     var env = loadEnvironment(gpa, vfs, world.environment);
     errdefer if (env) |*e| e.deinit();
