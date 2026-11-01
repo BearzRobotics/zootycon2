@@ -219,6 +219,8 @@ const Skin = struct {
 };
 
 const Draw = struct {
+    /// Decals blend over what is behind them without writing depth.
+    depth_write: bool = true,
     /// Second texture for terrain (steep slopes); 0 for ordinary draws.
     texture2: gl.Uint = 0,
     /// Pose-driven draws read `Scene.world[block]` each frame; others use `world`.
@@ -588,6 +590,63 @@ pub const Scene = struct {
             .blend = false,
             .alpha_cut = 0,
         });
+    }
+
+    /// Drapes path tiles over the terrain: one blended mesh per texture.
+    pub fn addPaths(self: *Scene, t: *const terrain_mod.Terrain, paths: []const map_mod.PathDecal) !void {
+        var done = try self.gpa.alloc(bool, paths.len);
+        defer self.gpa.free(done);
+        @memset(done, false);
+        const subdiv = 6; // quads per decal side
+        for (paths, 0..) |first, fi| {
+            if (done[fi]) continue;
+            var verts: std.ArrayList(f32) = .empty;
+            defer verts.deinit(self.gpa);
+            var idx: std.ArrayList(u32) = .empty;
+            defer idx.deinit(self.gpa);
+            for (paths[fi..], fi..) |p, pi| {
+                if (done[pi] or !std.ascii.eqlIgnoreCase(p.texture, first.texture)) continue;
+                done[pi] = true;
+                const base: u32 = @intCast(verts.items.len / 16);
+                for (0..subdiv + 1) |j| for (0..subdiv + 1) |i| {
+                    const u = @as(f32, @floatFromInt(i)) / subdiv;
+                    const v = @as(f32, @floatFromInt(j)) / subdiv;
+                    const x = p.position[0] + (u - 0.5) * p.width;
+                    const y = p.position[1] + (v - 0.5) * p.height;
+                    var vert: [16]f32 = @splat(0);
+                    vert[0] = x;
+                    vert[1] = y;
+                    vert[2] = t.zAt(x, y) + 0.04;
+                    vert[5] = 1; // normal up
+                    vert[6] = u;
+                    vert[7] = 1 - v;
+                    try verts.appendSlice(self.gpa, &vert);
+                };
+                for (0..subdiv) |j| for (0..subdiv) |i| {
+                    const a: u32 = base + @as(u32, @intCast(j * (subdiv + 1) + i));
+                    const b = a + 1;
+                    const c = a + subdiv + 1;
+                    const d = c + 1;
+                    try idx.appendSlice(self.gpa, &.{ a, b, d, a, d, c });
+                };
+            }
+            const tex = self.loadTexturePath(first.texture);
+            const vao = self.uploadMesh(verts.items, idx.items.ptr, idx.items.len * 4);
+            try self.draws.append(self.gpa, .{
+                .depth_write = false,
+                .dynamic = false,
+                .index_type = gl.UNSIGNED_INT,
+                .block = 0,
+                .skin = null,
+                .vao = vao,
+                .index_count = @intCast(idx.items.len),
+                .world = identity,
+                .texture = tex,
+                .tint = .{ 1, 1, 1, 1 },
+                .blend = true,
+                .alpha_cut = 10.0 / 255.0,
+            });
+        }
     }
 
     /// Loads a texture by its exact VFS path; the white texture if missing.
@@ -973,6 +1032,7 @@ fn loop(gpa: std.mem.Allocator, gfx: *Gfx, scene: *Scene, cam_init: Camera, play
             g.uniform1f(gfx.u_cut, d.alpha_cut);
             g.bindTexture(gl.TEXTURE_2D, d.texture);
             if (d.blend) g.enable(gl.BLEND) else g.disable(gl.BLEND);
+            g.depthMask(if (d.depth_write) 1 else 0);
             g.bindVertexArray(d.vao);
             g.drawElements(gl.TRIANGLES, d.index_count, d.index_type, null);
         }
@@ -1123,6 +1183,8 @@ pub fn runMap(gpa: std.mem.Allocator, vfs: *vfs_mod.Vfs, path: []const u8, opts:
         if (pieces.post) |d| try scene.place(d, m);
         fences_placed += 1;
     }
+    try scene.addPaths(&terr, mp.paths);
+    std.debug.print("{d} path tiles\n", .{mp.paths.len});
     std.debug.print("{d} of {d} fence segments placed\n", .{ fences_placed, mp.fences.len });
     std.debug.print("{s}: {d}x{d} terrain, {d} objects placed, {d} without a model, {d} textures missing\n", .{
         path, terr.width, terr.height, placed, missing, scene.missing_textures,

@@ -29,6 +29,14 @@ pub const Fence = struct {
     position: [3]f32,
 };
 
+/// A path tile: a texture quad draped over the terrain, centred on `position`.
+pub const PathDecal = struct {
+    texture: []const u8,
+    position: [2]f32,
+    width: f32,
+    height: f32,
+};
+
 pub const Map = struct {
     arena: std.heap.ArenaAllocator,
     name: []const u8,
@@ -38,6 +46,7 @@ pub const Map = struct {
     camera: ?[3]f32,
     objects: []const Object,
     fences: []const Fence,
+    paths: []const PathDecal,
 
     pub fn deinit(self: *Map) void {
         self.arena.deinit();
@@ -61,8 +70,10 @@ const Collector = struct {
     a: std.mem.Allocator,
     list: std.ArrayList(Object) = .empty,
     fences: std.ArrayList(Fence) = .empty,
+    paths: std.ArrayList(PathDecal) = .empty,
 
     fn visit(self: *Collector, e: *const xml.Element) Error!void {
+        if (std.ascii.eqlIgnoreCase(e.name, "BFGEntity")) try self.pathEntity(e);
         if (std.ascii.eqlIgnoreCase(e.name, "ZTFenceEntity")) {
             try self.fence(e);
             return;
@@ -72,6 +83,27 @@ const Collector = struct {
             return;
         }
         for (e.children) |c| try self.visit(c);
+    }
+
+    /// A path entity holds a `ZTPath` (the texture) and a physics object with
+    /// a terrain-decal component (the placement).
+    fn pathEntity(self: *Collector, e: *const xml.Element) Error!void {
+        const sub = e.child("subComponents") orelse return;
+        const zp = sub.child("ZTPath") orelse return;
+        const texture = zp.attr("texture") orelse return;
+        for (sub.children) |c| {
+            if (!std.ascii.eqlIgnoreCase(c.name, "BFPhysObj")) continue;
+            const decal = c.child("BFTerrainDecalComponent") orelse continue;
+            const pos = c.child("position") orelse continue;
+            const v = vec3(pos);
+            try self.paths.append(self.a, .{
+                .texture = texture,
+                .position = .{ v[0], v[1] },
+                .width = attrFloat(decal, "dwidth", 6),
+                .height = attrFloat(decal, "dheight", 6),
+            });
+            return;
+        }
     }
 
     fn fence(self: *Collector, e: *const xml.Element) Error!void {
@@ -148,6 +180,7 @@ pub fn parse(gpa: std.mem.Allocator, data: []const u8) Error!Map {
         .camera = cam,
         .objects = try col.list.toOwnedSlice(a),
         .fences = try col.fences.toOwnedSlice(a),
+        .paths = try col.paths.toOwnedSlice(a),
     };
 }
 
