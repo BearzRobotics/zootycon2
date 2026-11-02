@@ -137,6 +137,8 @@ pub const Manager = struct {
     host: Host = .{},
     /// Localized id of the scenario's introduction (the root's `info`).
     intro: []const u8 = "",
+    /// Objects the scenario says the player may buy (`BFS_ADD_SCENARIO_OBJECT`).
+    offered: std.ArrayList([]const u8) = .empty,
 
     pub fn create(gpa: std.mem.Allocator, vfs: *vfs_mod.Vfs, loc: *const loc_mod.Loc) !*Manager {
         const eng = try script.Engine.create(gpa, vfs);
@@ -153,6 +155,7 @@ pub const Manager = struct {
         self.roots.deinit(self.gpa);
         self.vars.deinit(self.gpa);
         self.messages.deinit(self.gpa);
+        self.offered.deinit(self.gpa);
         self.arena.deinit();
         if (active == self) active = null;
         self.gpa.destroy(self);
@@ -413,6 +416,13 @@ pub const Manager = struct {
                 }
                 return 1;
             }
+        } else if (eq(u8, comp, "ZTScenarioMgr") or eq(u8, comp, "ZTMode")) {
+            // UI calls naming a node, like on the scenario manager
+            if (std.mem.startsWith(u8, method, "UI_")) if (l.str(L, 2)) |name| if (self.host.ui) |st| {
+                const e = st.at(name);
+                if (eq(u8, method, "UI_SHOW")) e.visible = true else if (eq(u8, method, "UI_HIDE")) e.visible = false else if (eq(u8, method, "UI_ENABLE")) e.enabled = true else if (eq(u8, method, "UI_DISABLE")) e.enabled = false else if (eq(u8, method, "UI_ACTIVATE_ON")) e.activated = true else if (eq(u8, method, "UI_ACTIVATE_OFF") or eq(u8, method, "UI_REPRESS")) e.activated = false;
+                return 0;
+            };
         } else if (eq(u8, comp, "ZTWorldMgr")) {
             if (eq(u8, method, "ZT_GET_REAL_TIME")) {
                 c.lua_pushnumber(L, h.stat(h.ctx, "simtime"));
@@ -788,6 +798,7 @@ fn apiQueryObject(L: ?*c.lua_State) callconv(.c) c_int {
             .{ "BFS_SETUSERVAL", apiSetVar2 },
             .{ "BFS_GETUSERVAL", apiGetVar2 },
             .{ "BFS_GETLOCID", mgrLocId },
+            .{ "BFS_ADD_SCENARIO_OBJECT", mgrAddObject },
             .{ "UI_DISABLE", mgrUi("UI_DISABLE") },
             .{ "UI_ENABLE", mgrUi("UI_ENABLE") },
             .{ "UI_HIDE", mgrUi("UI_HIDE") },
@@ -802,7 +813,7 @@ fn apiQueryObject(L: ?*c.lua_State) callconv(.c) c_int {
         }
         return 1;
     }
-    const known = [_][]const u8{ "BFGManager", "UIRoot", "ZTStatus", "ZTEconomyMgr", "ZTPhotoChallengesComponent", "ZTAIMgr", "ZTMode", "ZTPuzzleMgr", "ZTWorldMgr", "ZTResearchMgr" };
+    const known = [_][]const u8{ "BFGManager", "UIRoot", "ZTStatus", "ZTEconomyMgr", "ZTPhotoChallengesComponent", "ZTAIMgr", "ZTMode", "ZTScenarioMgr", "ZTPuzzleMgr", "ZTWorldMgr", "ZTResearchMgr" };
     for (known) |k| if (std.mem.eql(u8, k, name)) {
         pushComponent(L, if (std.mem.eql(u8, k, "UIRoot")) "ui:" else name);
         return 1;
@@ -923,6 +934,15 @@ fn mgrUi(comptime method: []const u8) c.lua_CFunction {
             return 0;
         }
     }.f;
+}
+
+/// Names the scenario offers for purchase. Recorded, not enforced yet.
+fn mgrAddObject(L: ?*c.lua_State) callconv(.c) c_int {
+    const m = active orelse return 0;
+    const name = l.str(L, 2) orelse return 0;
+    const owned = m.arena.allocator().dupe(u8, name) catch return 0;
+    m.offered.append(m.gpa, owned) catch {};
+    return 0;
 }
 
 fn mgrSetRuleState(L: ?*c.lua_State) callconv(.c) c_int {
