@@ -50,6 +50,8 @@ pub const Node = struct {
     on_failure: ?Action = null,
     /// Registry reference of the rule's persistent Lua table (0 = none yet).
     comp: c_int = 0,
+    /// Script errors in a row; a rule that keeps failing is dropped.
+    errors: u8 = 0,
     /// Texts set by scripts at run time.
     alt_neutral: ?[]const u8 = null,
     alt_neutral_overview: ?[]const u8 = null,
@@ -139,6 +141,14 @@ pub const Manager = struct {
     intro: []const u8 = "",
     /// Objects the scenario says the player may buy (`BFS_ADD_SCENARIO_OBJECT`).
     offered: std.ArrayList([]const u8) = .empty,
+    rng: std.Random.DefaultPrng = .init(1),
+    /// Challenge scripts (stems) whose rules errored repeatedly; not offered again.
+    broken: std.StringHashMapUnmanaged(void) = .empty,
+    /// Challenges offered so far (counted by the scripts that give them).
+    challenges_offered: u32 = 0,
+    /// Challenge Mode: offer a challenge now and then (see `update`).
+    challenge_mode: bool = false,
+    challenge_timer: f32 = 90,
 
     pub fn create(gpa: std.mem.Allocator, vfs: *vfs_mod.Vfs, loc: *const loc_mod.Loc) !*Manager {
         const eng = try script.Engine.create(gpa, vfs);
@@ -156,6 +166,7 @@ pub const Manager = struct {
         self.vars.deinit(self.gpa);
         self.messages.deinit(self.gpa);
         self.offered.deinit(self.gpa);
+        self.broken.deinit(self.gpa);
         self.arena.deinit();
         if (active == self) active = null;
         self.gpa.destroy(self);
@@ -267,6 +278,21 @@ pub const Manager = struct {
     /// Advances the scenario clock; rules are checked every `interval` seconds.
     pub fn update(self: *Manager, dt: f32) void {
         if (self.outcome != .running) return;
+        if (self.challenge_mode) {
+            self.challenge_timer -= dt;
+            if (self.challenge_timer <= 0) {
+                self.challenge_timer = 60;
+                active = self;
+                script.setCurrent(self.eng);
+                // One at a time: not while one is on offer or being played.
+                const busy = if (self.getVar("challengeactive")) |v| std.mem.eql(u8, v, "true") else false;
+                const waiting = if (self.getVar("challenge")) |v| std.mem.eql(u8, v, "waiting") or std.mem.eql(u8, v, "accept") else false;
+                if (!busy and !waiting) {
+                    self.setVarNil("challenge");
+                    self.pickChallenge("scenario/scripts/challenge/");
+                }
+            }
+        }
         self.accum += dt;
         if (self.accum < self.interval) return;
         self.accum = 0;
@@ -305,7 +331,12 @@ pub const Manager = struct {
 
     fn evaluateRule(self: *Manager, n: *Node) State {
         const act = n.on_eval orelse return n.state;
-        const r = self.call(n, act) orelse return n.state;
+        const r = self.call(n, act) orelse {
+            n.errors +|= 1;
+            if (n.errors >= 3) self.dropRule(n, act);
+            return n.state;
+        };
+        n.errors = 0;
         if (self.log and r != 0) std.debug.print("scenario: {s} -> {d}\n", .{ n.name, r });
         if (r >= 0.5) {
             n.state = .success;
@@ -330,6 +361,22 @@ pub const Manager = struct {
             return null;
         };
         return r;
+    }
+
+    /// Gives up on a rule whose script keeps failing, so the player is not left
+    /// waiting on it; a challenge is also taken off the offer list.
+    fn dropRule(self: *Manager, n: *Node, act: Action) void {
+        n.state = .failed;
+        if (self.log) std.debug.print("scenario: dropped rule {s} ({s}) after repeated errors\n", .{ n.name, act.script });
+        if (std.mem.indexOf(u8, act.script, "/challenge/") != null) {
+            var lb: [200]u8 = undefined;
+            const low = normalize(act.script, &lb);
+            const stem = if (std.mem.endsWith(u8, low, ".lua")) low[0 .. low.len - 4] else low;
+            const owned = self.arena.allocator().dupe(u8, stem) catch return;
+            self.broken.put(self.gpa, owned, {}) catch {};
+            self.setVar("challengeactive", "false");
+            self.setVarNil("challenge");
+        }
     }
 
     /// The text to show for a rule right now.
@@ -366,6 +413,10 @@ pub const Manager = struct {
         }
         const k = a.dupe(u8, key) catch return;
         self.vars.put(self.gpa, k, v) catch {};
+    }
+
+    pub fn setVarNil(self: *Manager, key: []const u8) void {
+        _ = self.vars.remove(key);
     }
 
     pub fn getVar(self: *const Manager, key: []const u8) ?[]const u8 {
@@ -424,11 +475,40 @@ pub const Manager = struct {
                 return 0;
             };
         } else if (eq(u8, comp, "ZTWorldMgr")) {
+            if (eq(u8, method, "ZT_RETURN_SCRIPT_AS_STRING")) {
+                // The caller builds odd paths (a folder prefix plus a full path, `.lua.lua`);
+                // use the last `scenario/scripts/` onwards and the first extension.
+                var raw = l.str(L, 2) orelse "";
+                if (std.mem.lastIndexOf(u8, raw, "scenario/scripts/")) |i| raw = raw[i..];
+                const stem = if (std.mem.indexOf(u8, raw, ".lua")) |i| raw[0..i] else raw;
+                var pb: [240]u8 = undefined;
+                for ([_][]const u8{ ".bin", ".lua" }) |ext| {
+                    const path = std.fmt.bufPrint(&pb, "{s}{s}", .{ stem, ext }) catch continue;
+                    if (!self.vfs.exists(path)) continue;
+                    const data = self.vfs.read(self.gpa, path) catch continue;
+                    defer self.gpa.free(data);
+                    l.pushStr(L, data);
+                    return 1;
+                }
+                c.lua_pushnil(L);
+                return 1;
+            }
             if (eq(u8, method, "ZT_GET_REAL_TIME")) {
                 c.lua_pushnumber(L, h.stat(h.ctx, "simtime"));
                 return 1;
             }
-        } else if (eq(u8, comp, "ZTStatus")) {
+        } else if (eq(u8, comp, "ZTStatus") or eq(u8, comp, "ZTEconomyMgr")) {
+            if (eq(u8, method, "ZT_GET_INFO") and c.lua_type(L, 2) == c.LUA_TTABLE) {
+                // {period=lifetime|monthly, category=, type=, month=}: a figure from the books
+                var nb: [160]u8 = undefined;
+                const period = tableStr(L, 2, "period") orelse "lifetime";
+                const cat = tableStr(L, 2, "category") orelse "";
+                const typ = tableStr(L, 2, "type") orelse "";
+                const month = tableNum(L, 2, "month") orelse -1;
+                const key = std.fmt.bufPrint(&nb, "eco:{s}:{s}:{s}:{d:.0}", .{ period, cat, typ, month }) catch "eco";
+                c.lua_pushnumber(L, h.stat(h.ctx, key));
+                return 1;
+            }
             const simple = [_]struct { m: []const u8, n: []const u8 }{
                 .{ .m = "ZT_GET_ZOO_CASH", .n = "cash" },
                 .{ .m = "ZT_GET_ZOO_FAME", .n = "fame" },
@@ -477,12 +557,26 @@ pub const Manager = struct {
         const st = self.host.ui orelse return 0;
         if (eq(u8, method, "UI_GET_CHILD")) {
             const child = l.str(L, 2) orelse "";
-            if (!self.host.ui_known(self.host.ctx, child)) {
+            // below a real node any child name is accepted: the layouts' inner nodes are not all modelled
+            // Names no layout we load defines (award popups, list boxes...) still get a
+            // stand-in node, so scripts that assert on them keep going.
+            const lenient = true;
+            if (lenient) st.at(child).loaded = true;
+            if (!lenient and !self.host.ui_known(self.host.ctx, child)) {
+                if (self.log) std.debug.print("scenario: ui child '{s}' of '{s}' not found\n", .{ child, name });
                 c.lua_pushnil(L);
                 return 1;
             }
             var nb: [100]u8 = undefined;
             pushComponent(L, std.fmt.bufPrint(&nb, "ui:{s}", .{child}) catch "ui:");
+            return 1;
+        }
+        if (eq(u8, method, "UI_LOAD_CHILD")) {
+            // dynamically loaded layouts (award popups...) are stand-in nodes
+            var nb: [100]u8 = undefined;
+            const lname = l.str(L, 2) orelse "loaded";
+            st.at(lname).loaded = true;
+            pushComponent(L, std.fmt.bufPrint(&nb, "ui:{s}", .{lname}) catch "ui:loaded");
             return 1;
         }
         if (name.len == 0) return 0;
@@ -577,6 +671,56 @@ pub const Manager = struct {
         return null;
     }
 
+    /// Script stems (game paths without extension) directly inside `dir`.
+    fn listScripts(self: *Manager, dir: []const u8, names: *std.ArrayList([]const u8)) void {
+        var prefix_buf: [200]u8 = undefined;
+        const prefix = normalize(dir, &prefix_buf);
+        const Collect = struct {
+            list: *std.ArrayList([]const u8),
+            gpa: std.mem.Allocator,
+            prefix: []const u8,
+            fn add(cc: @This(), name: []const u8) anyerror!void {
+                if (!std.mem.startsWith(u8, name, cc.prefix)) return;
+                const rest = name[cc.prefix.len..];
+                if (std.mem.indexOfScalar(u8, rest, '/') != null) return; // subfolders are other pools
+                if (!std.mem.endsWith(u8, name, ".bin") and !std.mem.endsWith(u8, name, ".lua")) return;
+                const stem = name[0 .. name.len - 4];
+                for (cc.list.items) |e| if (std.mem.eql(u8, e, stem)) return;
+                try cc.list.append(cc.gpa, try cc.gpa.dupe(u8, stem));
+            }
+        };
+        self.vfs.forEach(Collect{ .list = names, .gpa = self.gpa, .prefix = prefix }, Collect.add) catch {};
+    }
+
+    /// Offers one challenge from the scripts in `dir`, if any is valid now.
+    pub fn pickChallenge(self: *Manager, dir: []const u8) void {
+        var names: std.ArrayList([]const u8) = .empty;
+        defer {
+            for (names.items) |n| self.gpa.free(n);
+            names.deinit(self.gpa);
+        }
+        self.listScripts(dir, &names);
+        self.rng.random().shuffle([]const u8, names.items);
+        for (names.items) |stem| {
+            if (self.broken.contains(stem)) continue;
+            var pb: [220]u8 = undefined;
+            const path = std.fmt.bufPrint(&pb, "{s}.lua", .{stem}) catch continue;
+            self.eng.loadFresh(path) catch |e| {
+                if (self.log) std.debug.print("scenario: challenge {s}: load {s} {s}\n", .{ stem, @errorName(e), self.eng.errorText() });
+                continue;
+            };
+            const r = self.eng.callNumber("validate") catch |e| {
+                if (self.log) std.debug.print("scenario: challenge {s}: validate {s} {s}\n", .{ stem, @errorName(e), self.eng.errorText() });
+                continue;
+            };
+            if (r >= 0.5) {
+                self.challenges_offered += 1;
+                if (self.log) std.debug.print("scenario: offered challenge {s}\n", .{stem});
+                return;
+            }
+        }
+    }
+
     pub fn say(self: *Manager, text: []const u8) void {
         const t = self.arena.allocator().dupe(u8, text) catch return;
         self.messages.append(self.gpa, t) catch {};
@@ -615,6 +759,9 @@ fn registerApi(eng: *script.Engine) void {
     eng.register("giveCash", apiGiveCash);
     eng.register("howMuchCash", apiHowMuchCash);
     eng.register("getCurrentMonth", apiCurrentMonth);
+    eng.register("__simtime", apiSimTime);
+    // scripts use os.time/os.clock for timers; the game clock stands in
+    eng.runString("os = { time = function() return __simtime() end, clock = function() return __simtime() end, date = function() return \"\" end }") catch {};
     eng.register("getCurrentTimeOfDay", apiTimeOfDay);
 }
 
@@ -631,6 +778,11 @@ fn apiGiveCash(L: ?*c.lua_State) callconv(.c) c_int {
 
 fn apiHowMuchCash(L: ?*c.lua_State) callconv(.c) c_int {
     c.lua_pushnumber(L, statOf("cash"));
+    return 1;
+}
+
+fn apiSimTime(L: ?*c.lua_State) callconv(.c) c_int {
+    c.lua_pushnumber(L, statOf("simtime"));
     return 1;
 }
 
@@ -799,6 +951,9 @@ fn apiQueryObject(L: ?*c.lua_State) callconv(.c) c_int {
             .{ "BFS_GETUSERVAL", apiGetVar2 },
             .{ "BFS_GETLOCID", mgrLocId },
             .{ "BFS_ADD_SCENARIO_OBJECT", mgrAddObject },
+            .{ "BFS_PICKCHALLENGE", mgrPickChallenge },
+            .{ "BFS_GET_CHALLENGE_DELAY", mgrChallengeDelay },
+            .{ "BFS_GETALLCHALLENGES", mgrAllChallenges },
             .{ "UI_DISABLE", mgrUi("UI_DISABLE") },
             .{ "UI_ENABLE", mgrUi("UI_ENABLE") },
             .{ "UI_HIDE", mgrUi("UI_HIDE") },
@@ -832,6 +987,14 @@ fn tableNum(L: ?*c.lua_State, idx: c_int, key: [:0]const u8) ?f32 {
     defer c.lua_pop(L, 1);
     if (c.lua_isnumber(L, -1) == 0) return null;
     return @floatCast(c.lua_tonumber(L, -1));
+}
+
+fn tableStr(L: ?*c.lua_State, idx: c_int, key: [:0]const u8) ?[]const u8 {
+    c.lua_pushstring(L, key.ptr);
+    c.lua_rawget(L, idx);
+    defer c.lua_pop(L, 1);
+    if (c.lua_type(L, -1) != c.LUA_TSTRING) return null;
+    return std.mem.span(c.lua_tostring(L, -1));
 }
 
 fn pushRect(L: ?*c.lua_State, x: f32, y: f32, w: f32, h: f32) void {
@@ -934,6 +1097,46 @@ fn mgrUi(comptime method: []const u8) c.lua_CFunction {
             return 0;
         }
     }.f;
+}
+
+/// `BFS_GETALLCHALLENGES(folder)`: the challenge scripts there, as `{value=path}` entries.
+fn mgrAllChallenges(L: ?*c.lua_State) callconv(.c) c_int {
+    const m = active orelse return 0;
+    const dir = l.str(L, 2) orelse return 0;
+    var names: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (names.items) |n| m.gpa.free(n);
+        names.deinit(m.gpa);
+    }
+    m.listScripts(dir, &names);
+    c.lua_newtable(L);
+    for (names.items, 1..) |n, i| {
+        c.lua_pushnumber(L, @floatFromInt(i));
+        c.lua_newtable(L);
+        c.lua_pushstring(L, "value");
+        var pb: [220]u8 = undefined;
+        l.pushStr(L, std.fmt.bufPrint(&pb, "{s}.lua", .{n}) catch n);
+        c.lua_settable(L, -3);
+        c.lua_settable(L, -3);
+    }
+    return 1;
+}
+
+/// Months between challenges.
+fn mgrChallengeDelay(L: ?*c.lua_State) callconv(.c) c_int {
+    c.lua_pushnumber(L, 2);
+    return 1;
+}
+
+/// `BFS_PICKCHALLENGE(folder)`: loads the challenge scripts in a folder in
+/// random order and stops at the first whose `validate()` offers its
+/// challenge (it adds its own goals through BFS_ADDSCENARIO).
+fn mgrPickChallenge(L: ?*c.lua_State) callconv(.c) c_int {
+    const m = active orelse return 0;
+    const dir = l.str(L, 2) orelse return 0;
+    if (m.log) std.debug.print("scenario: pick challenge from {s}\n", .{dir});
+    m.pickChallenge(dir);
+    return 0;
 }
 
 /// Names the scenario offers for purchase. Recorded, not enforced yet.

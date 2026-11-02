@@ -94,6 +94,17 @@ pub const Engine = struct {
         c.lua_pop(self.L, 1);
     }
 
+    /// Runs a script again even if it already ran (scripts that all define the
+    /// same entry names, like each challenge's `validate`, need this).
+    pub fn loadFresh(self: *Engine, path: []const u8) Error!void {
+        var lower_buf: [200]u8 = undefined;
+        if (path.len <= lower_buf.len) {
+            const key = std.ascii.lowerString(&lower_buf, path);
+            if (self.loaded.fetchRemove(key)) |kv| self.gpa.free(kv.key);
+        }
+        return self.load(path);
+    }
+
     /// Runs the script at a game path (`scenario/scripts/ui.lua`): the
     /// compiled `.bin` next to it, or the plain text if that is what exists.
     /// Each script runs once.

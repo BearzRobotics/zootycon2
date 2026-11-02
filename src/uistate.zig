@@ -16,6 +16,8 @@ pub const Entry = struct {
     size: ?[2]f32 = null,
     /// Counts presses, so a script can notice a click that already ended.
     presses: u32 = 0,
+    /// A stand-in for a layout loaded by a script: every child lookup succeeds.
+    loaded: bool = false,
 };
 
 pub const State = struct {

@@ -149,6 +149,9 @@ const MenuAction = enum {
     open_settings,
     open_finances,
     open_goals,
+    open_challenge,
+    challenge_accept,
+    challenge_decline,
     tutorial_continue,
     gender_male,
     gender_female,
@@ -321,6 +324,8 @@ pub const App = struct {
     feeder_state: u64 = 0,
     /// Zoo fame in stars (fractional); see updateFame.
     fame: f32 = 1,
+    /// The next zoo started is a Challenge Mode zoo.
+    challenge_next: bool = false,
     /// Canvas scale and offset of the last HUD draw (UI rects are kept in canvas units).
     cv_scale: f32 = 0,
     cv_off: [2]f32 = .{ 0, 0 },
@@ -1944,6 +1949,7 @@ pub const App = struct {
             m.destroy();
             return;
         };
+        m.challenge_mode = std.mem.endsWith(u8, goals, "challengegoals.xml");
         m.log = self.opts.scenario_log;
         m.eng.log = self.opts.scenario_log;
         self.scen = m;
@@ -1993,10 +1999,61 @@ pub const App = struct {
         us.at("tutorial block out").visible = false;
     }
 
+    /// Challenge Mode: the scenario manager hands out timed challenges.
+    fn maybeStartChallenge(self: *App) void {
+        if (!self.challenge_next) return;
+        self.challenge_next = false;
+        self.startScenario("scenario/goals/challengegoals.xml");
+        if (self.scen) |m| m.challenge_mode = true;
+        self.say("challenge mode: challenges will be offered as your zoo grows", .{});
+    }
+
+    fn challengeOpen(self: *const App) bool {
+        const us = &(self.ui_state orelse return false);
+        for ([_][]const u8{ "challenge layout", "instant challenge layout" }) |n| {
+            if (us.get(n)) |e| if (e.visible orelse false) return true;
+        }
+        return false;
+    }
+
+    /// The accept / decline panel for a challenge, from what the scripts put in
+    /// the challenge layout's text nodes.
+    fn drawChallenge(self: *App, ui: *viewer.Ui, scale: f32) !void {
+        const us = &(self.ui_state orelse return);
+        const instant = if (us.get("instant challenge layout")) |e| e.visible orelse false else false;
+        const text = if (instant) (if (us.get("instant challenge text")) |e| e.text else "") else (if (us.get("challenge text")) |e| e.text else "");
+        const intro = if (instant) (if (us.get("instant challenge description text")) |e| e.text else "") else "";
+        const ts: f32 = @max(2, @round(scale * 1.1));
+        const pw = @min(ui.width * 0.8, 120 * 6 * ts);
+        const ph = ui.height * 0.62;
+        const px = (ui.width - pw) / 2;
+        const py = ui.height * 0.14;
+        try ui.rect(0, 0, ui.width, ui.height, .{ 0, 0, 0, 0.45 });
+        ui.template("blank", px, py, pw, ph, scale / 2, 1);
+        _ = try ui.text(px + 16 * ts, py + 10 * ts, ts * 1.4, if (instant) "INSTANT CHALLENGE" else "CHALLENGE", .{ 1, 0.92, 0.5, 1 });
+        const cols: usize = @intFromFloat(@max(20, (pw - 32 * ts) / (6 * ts)));
+        var y = py + 36 * ts;
+        if (intro.len > 0) y += try self.wrapText(ui, px + 16 * ts, y, ts, cols, intro, .{ 0.8, 0.85, 0.9, 1 }) + 8 * ts;
+        _ = try self.wrapText(ui, px + 16 * ts, y, ts, cols, text, .{ 1, 1, 1, 1 });
+        const bw = 22 * 6 * ts;
+        const bh = 7 * ts + 10 * ts;
+        const by = py + ph - bh - 12 * ts;
+        const items = [_]struct { label: []const u8, x: f32, act: MenuAction }{
+            .{ .label = "ACCEPT", .x = px + pw / 2 - bw - 10 * ts, .act = .challenge_accept },
+            .{ .label = "DECLINE", .x = px + pw / 2 + 10 * ts, .act = .challenge_decline },
+        };
+        for (items) |it| {
+            ui.template("buttonbar", it.x, by, bw, bh, ts / 2, 1);
+            _ = try ui.text(it.x + (bw - viewer.Ui.textWidth(it.label, ts)) / 2, by + 5 * ts, ts, it.label, .{ 1, 1, 1, 1 });
+            try self.hits.append(self.gpa, .{ .x = it.x, .y = by, .w = bw, .h = bh, .action = .{ .menu = it.act } });
+        }
+    }
+
     fn scenUiKnown(ctx: *anyopaque, name: []const u8) bool {
         const self: *App = @ptrCast(@alignCast(ctx));
         const h = &(self.hud orelse return false);
         if (h.shell.find(name) != null) return true;
+        for ([_][]const u8{ "challenge layout", "instant challenge layout", "challenge text", "instant challenge text", "instant challenge description text", "branch layout" }) |kn| if (std.ascii.eqlIgnoreCase(kn, name)) return true;
         inline for (.{ "tutorial", "goals", "status", "info", "bucks", "mainmenu" }) |f| {
             if (@field(h, f)) |*lay| if (lay.find(name) != null) return true;
         }
@@ -2075,6 +2132,7 @@ pub const App = struct {
             if (eq(u8, name, "cam_zoom")) return fc.cam.dist;
             if (eq(u8, name, "cam_yaw")) return fc.cam.yaw;
         }
+        if (std.mem.startsWith(u8, name, "eco:")) return self.ecoFigure(name);
         if (eq(u8, name, "guests_total")) return @floatFromInt(self.sim.zoo.guests_total);
         if (eq(u8, name, "admission")) return self.sim.adult_price;
         if (eq(u8, name, "is_campaign")) return if (self.scen_key_len > 0) 1 else 0;
@@ -2096,6 +2154,30 @@ pub const App = struct {
             return t;
         }
         return 0;
+    }
+
+    /// `eco:<period>:<category>:<type>:<month>` figures for ZTEconomyMgr:ZT_GET_INFO.
+    fn ecoFigure(self: *App, key: []const u8) f64 {
+        var it = std.mem.splitScalar(u8, key, ':');
+        _ = it.next();
+        const period = it.next() orelse return 0;
+        const cat = it.next() orelse return 0;
+        const typ = it.next() orelse return 0;
+        const z = &self.sim.zoo;
+        const led = if (std.mem.eql(u8, period, "monthly")) z.month else z.total;
+        if (std.mem.eql(u8, typ, "totalUsers")) return @floatFromInt(z.guests_total);
+        var earned: f64 = 0;
+        var spent: f64 = 0;
+        for (std.enums.values(sim_mod.Cat)) |cv| {
+            const match = cat.len == 0 or std.ascii.eqlIgnoreCase(cat, @tagName(cv));
+            if (match) {
+                earned += led.earned[@intFromEnum(cv)];
+                spent += led.spent[@intFromEnum(cv)];
+            }
+        }
+        if (std.mem.indexOf(u8, typ, "xpense") != null or std.mem.indexOf(u8, typ, "pent") != null) return spent;
+        if (std.mem.eql(u8, typ, "profit")) return earned - spent;
+        return earned;
     }
 
     fn scenGiveCash(ctx: *anyopaque, amount: f64) void {
@@ -2333,7 +2415,9 @@ pub const App = struct {
         // Escape opens the pause menu instead of quitting.
         switch (ev) {
             .key_down => |k| if (!k.repeat and k.scancode == sc.esc) {
-                self.openMenu(.pause);
+                if (self.challengeOpen()) {
+                    self.menuAction(.challenge_decline, ctx);
+                } else self.openMenu(.pause);
                 ctx.consumed = true;
                 return;
             },
@@ -2582,6 +2666,14 @@ pub const App = struct {
                 self.buildBuyLists();
             },
             .tutorial_continue => self.pressContinue(),
+            .open_challenge => {
+                self.challenge_next = true;
+                self.openMenu(.maps);
+            },
+            .challenge_accept, .challenge_decline => if (self.ui_state) |*us| {
+                if (self.scen) |m| m.setVar("challenge", if (a == .challenge_accept) "accept" else "decline");
+                for ([_][]const u8{ "challenge layout", "instant challenge layout", "branch layout" }) |n| us.at(n).visible = false;
+            },
             .open_goals => self.openMenu(.goals),
             .open_campaigns => {
                 self.loadCampaigns();
@@ -2619,6 +2711,7 @@ pub const App = struct {
             .new_zoo_start => {
                 self.startBlankZoo();
                 self.openMenu(.none);
+                self.maybeStartChallenge();
             },
             .ui_size => {
                 self.ui_zoom = if (self.ui_zoom < 1.2) 1.25 else if (self.ui_zoom < 1.4) 1.5 else if (self.ui_zoom < 1.8) 2.0 else 1.0;
@@ -2669,6 +2762,7 @@ pub const App = struct {
                 self.loadPath(self.map_paths.items[i]) catch {};
                 self.custom_len = 0;
                 self.openMenu(.none);
+                self.maybeStartChallenge();
             },
             .campaigns => if (i < self.campaigns.items.len) {
                 self.camp_sel = i;
@@ -2787,6 +2881,7 @@ pub const App = struct {
                 y += try self.menuButton(ui, y, scale, "LOAD GAME", .{ .menu = .open_saves }, false);
                 y += try self.menuButton(ui, y, scale, "NEW MAP", .{ .menu = .open_maps }, false);
                 y += try self.menuButton(ui, y, scale, "CAMPAIGNS", .{ .menu = .open_campaigns }, false);
+                y += try self.menuButton(ui, y, scale, "CHALLENGE MODE", .{ .menu = .open_challenge }, false);
                 y += try self.menuButton(ui, y, scale, "MAIN MENU", .{ .menu = .open_main }, false);
                 y += try self.menuButton(ui, y, scale, "SETTINGS", .{ .menu = .open_settings }, false);
                 y += try self.menuButton(ui, y, scale, "QUIT", .{ .menu = .quit }, false);
@@ -3561,6 +3656,7 @@ pub const App = struct {
         if (eq(name, "Freeform Button")) return .{ .menu = .open_maps };
         if (eq(name, "Load Save Game Button")) return .{ .menu = .open_saves };
         if (eq(name, "Campaign Game Button")) return .{ .menu = .open_campaigns };
+        if (eq(name, "Challenge Button")) return .{ .menu = .open_challenge };
         if (eq(name, "Game Options Button")) return .{ .menu = .open_settings };
         if (eq(name, "Exit Game Button")) return .{ .menu = .quit };
         if (eq(name, "close")) return .{ .menu = .close_selection };
@@ -3700,6 +3796,7 @@ pub const App = struct {
                 e.size = .{ 70, 20 };
             }
         }
+        if (self.scen != null and self.challengeOpen()) self.drawChallenge(ui, self.canvas(ui).scale * 1.5) catch {};
         if (self.scen != null) if (h.tutorial) |*tl| if (self.ui_state) |*us| {
             const shown = (if (us.get("tutorial layout")) |e| e.visible orelse false else false) or (if (us.get("tutorial info")) |e| e.visible orelse false else false);
             if (shown) {
@@ -3757,7 +3854,7 @@ pub const App = struct {
             .{ .node = "Game Options Button", .pointer = "Game Options Pointer", .label = "GAME OPTIONS" },
             .{ .node = "Exit Game Button", .pointer = "Exit Game Pointer", .label = "QUIT" },
             .{ .node = "Campaign Game Button", .pointer = "Campaign Game Pointer", .label = "PLAY THE CAMPAIGNS" },
-            .{ .node = "Challenge Button", .pointer = "Challenge Pointer", .label = "CHALLENGES: COMING SOON" },
+            .{ .node = "Challenge Button", .pointer = "Challenge Pointer", .label = "PLAY CHALLENGE MODE" },
             .{ .node = "Downloads Button", .pointer = "Downloads Pointer", .label = "DOWNLOADS: NOT AVAILABLE" },
         };
         var hover_label: []const u8 = "";
@@ -4217,7 +4314,7 @@ pub const App = struct {
             sc.f => self.refill(),
             sc.f10 => if (self.scen) |m| if (m.skipStep()) |n| self.say("skipped step: {s}", .{n}),
             sc.o => self.openMenu(if (self.menu == .goals) .none else .goals),
-            40 => if (self.ui_state) |*us| if (us.get("continue tutorial")) |e| if (e.visible orelse false) self.pressContinue(),
+            40 => if (self.challengeOpen()) self.menuAction(.challenge_accept, self.cur_ctx.?) else if (self.ui_state) |*us| if (us.get("continue tutorial")) |e| if (e.visible orelse false) self.pressContinue(),
             sc.z => self.doUndo(),
             sc.c => {
                 self.fence_start = null;
@@ -4790,7 +4887,12 @@ pub const App = struct {
         // Simulation.
         if (self.opts.sim) {
             self.updateGuestCap();
-            if (!self.paused and self.menu == .none) {
+            const pop = self.challengeOpen();
+            if (pop) if (self.scen) |m| {
+                self.syncUiState();
+                m.update(ctx.dt);
+            };
+            if (!self.paused and self.menu == .none and !pop) {
                 self.sim.advance(&self.world, ctx.dt * self.speed);
                 self.updateFame(ctx.dt * self.speed);
                 if (self.scen) |m| {
