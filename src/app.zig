@@ -4416,7 +4416,7 @@ pub const App = struct {
 
     fn countAnimals(self: *const App) usize {
         var n: usize = 0;
-        for (self.sim.agents.items) |ag| if (ag.kind == .animal) {
+        for (self.sim.agents.items) |ag| if (ag.kind == .animal and !ag.is_guest and !ag.is_keeper) {
             n += 1;
         };
         return n;
@@ -4696,7 +4696,7 @@ pub const App = struct {
 
     fn statsText(self: *const App, buf: []u8) []const u8 {
         const z = &self.sim.zoo;
-        return std.fmt.bufPrint(buf, "GUESTS {d}/{d}  MONEY ${d:.0}  VIEWS {d}  HAPPY {d:.0}  ANIMALS {d:.0}  STARS {d:.0}", .{
+        return std.fmt.bufPrint(buf, "GUESTS {d}/{d}  MONEY ${d:.0}  VIEWS {d}  HAPPY {d:.0}  ANIMAL WELFARE {d:.0}  STARS {d:.0}", .{
             self.sim.liveGuests(), self.sim.max_guests, z.income, z.views, self.sim.happiness(), self.sim.animalWelfare(), self.stars(),
         }) catch "";
     }
