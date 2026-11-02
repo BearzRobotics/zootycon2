@@ -374,7 +374,7 @@ pub const Manager = struct {
     fn handleCall(self: *Manager, L: ?*c.lua_State, comp: []const u8, method: []const u8) ?c_int {
         const h = self.host;
         const eq = std.mem.eql;
-        if (eq(u8, comp, "BFGManager")) {
+        {
             const cam = [_]struct { m: []const u8, n: []const u8 }{
                 .{ .m = "BFG_GET_CAMERA_X", .n = "cam_x" },
                 .{ .m = "BFG_GET_CAMERA_Y", .n = "cam_y" },
@@ -386,6 +386,8 @@ pub const Manager = struct {
                 c.lua_pushnumber(L, h.stat(h.ctx, cm.n));
                 return 1;
             };
+        }
+        if (eq(u8, comp, "BFGManager")) {
             if (eq(u8, method, "BFG_GET_SELECTED_ENTITY")) {
                 if (h.selected(h.ctx)) |id| {
                     pushEntity(L, id);
@@ -409,6 +411,11 @@ pub const Manager = struct {
                     c.lua_settable(L, -3);
                     c.lua_settable(L, -3);
                 }
+                return 1;
+            }
+        } else if (eq(u8, comp, "ZTWorldMgr")) {
+            if (eq(u8, method, "ZT_GET_REAL_TIME")) {
+                c.lua_pushnumber(L, h.stat(h.ctx, "simtime"));
                 return 1;
             }
         } else if (eq(u8, comp, "ZTStatus")) {
@@ -505,9 +512,21 @@ pub const Manager = struct {
             l.pushStr(L, e.text);
             return 1;
         } else if (eq(u8, method, "UI_SET_POS")) {
-            if (c.lua_isnumber(L, 2) != 0 and c.lua_isnumber(L, 3) != 0) e.pos = .{ @floatCast(c.lua_tonumber(L, 2)), @floatCast(c.lua_tonumber(L, 3)) };
+            // `{x=, y=}` or two numbers
+            if (c.lua_type(L, 2) == c.LUA_TTABLE) {
+                const x = tableNum(L, 2, "x");
+                const y = tableNum(L, 2, "y");
+                if (x != null and y != null) e.pos = .{ x.?, y.? };
+            } else if (c.lua_isnumber(L, 2) != 0 and c.lua_isnumber(L, 3) != 0) e.pos = .{ @floatCast(c.lua_tonumber(L, 2)), @floatCast(c.lua_tonumber(L, 3)) };
         } else if (eq(u8, method, "UI_SET_SIZE")) {
-            if (c.lua_isnumber(L, 2) != 0 and c.lua_isnumber(L, 3) != 0) e.size = .{ @floatCast(c.lua_tonumber(L, 2)), @floatCast(c.lua_tonumber(L, 3)) };
+            if (c.lua_type(L, 2) == c.LUA_TTABLE) {
+                const w = tableNum(L, 2, "w");
+                const h = tableNum(L, 2, "h");
+                if (w != null and h != null) e.size = .{ w.?, h.? };
+            } else if (c.lua_isnumber(L, 2) != 0 and c.lua_isnumber(L, 3) != 0) e.size = .{ @floatCast(c.lua_tonumber(L, 2)), @floatCast(c.lua_tonumber(L, 3)) };
+        } else if (eq(u8, method, "UI_GET_LINEAGE_VISIBLE")) {
+            c.lua_pushboolean(L, @intFromBool(e.visible orelse true));
+            return 1;
         } else if (eq(u8, method, "UI_GET_CHILDREN")) {
             c.lua_newtable(L);
             return 1;
@@ -528,6 +547,24 @@ pub const Manager = struct {
             if (script.currentEngine()) |en| en.noteMissing(std.fmt.bufPrint(&nb, "ui:{s}", .{method}) catch method);
         }
         return 0;
+    }
+
+    /// Marks the first unfinished rule of the scenario done, as if its goal had
+    /// been met, and runs its success entry. For steps that rely on parts of the
+    /// game this engine does not have yet. Returns the rule's name.
+    pub fn skipStep(self: *Manager) ?[]const u8 {
+        for (self.roots.items) |r| if (firstPending(r)) |n| {
+            n.state = .success;
+            if (n.on_success) |s| _ = self.call(n, s);
+            return n.name;
+        };
+        return null;
+    }
+
+    fn firstPending(n: *Node) ?*Node {
+        if (!n.is_group) return if (n.state == .pending and n.on_eval != null and n.sticky) n else null;
+        for (n.children) |k| if (firstPending(k)) |f| return f;
+        return null;
     }
 
     pub fn say(self: *Manager, text: []const u8) void {
@@ -776,6 +813,14 @@ fn apiQueryObject(L: ?*c.lua_State) callconv(.c) c_int {
     }
     c.lua_pushnil(L);
     return 1;
+}
+
+fn tableNum(L: ?*c.lua_State, idx: c_int, key: [:0]const u8) ?f32 {
+    c.lua_pushstring(L, key.ptr);
+    c.lua_rawget(L, idx);
+    defer c.lua_pop(L, 1);
+    if (c.lua_isnumber(L, -1) == 0) return null;
+    return @floatCast(c.lua_tonumber(L, -1));
 }
 
 fn pushRect(L: ?*c.lua_State, x: f32, y: f32, w: f32, h: f32) void {

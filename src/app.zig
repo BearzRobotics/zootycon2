@@ -58,6 +58,7 @@ const sc = struct {
     const f3: u32 = 60;
     const f5: u32 = 62;
     const f9: u32 = 66;
+    const f10: u32 = 67;
     const delete: u32 = 76;
     const lshift: u32 = 225;
     const rshift: u32 = 229;
@@ -1410,7 +1411,7 @@ pub const App = struct {
                 for (b.needs) |nv| std.debug.print("{d:.0} ", .{nv});
                 std.debug.print("\n", .{});
             };
-        } else if (std.mem.eql(u8, verb, "wait")) {
+        } else if (std.mem.eql(u8, verb, "wait") or std.mem.eql(u8, verb, "sim")) {
             const secs = try num(it.next());
             try self.sim.sync(&self.world);
             self.rebuildActors() catch {};
@@ -1418,7 +1419,10 @@ pub const App = struct {
             var t: f32 = 0;
             while (t < secs) : (t += 0.2) {
                 self.sim.advance(&self.world, 0.2);
-                if (self.scen) |m| m.update(0.2);
+                if (self.scen) |m| {
+                    self.syncUiState();
+                    m.update(0.2);
+                }
             }
         } else if (std.mem.eql(u8, verb, "propname")) {
             self.prop_i = pickByName(self.props.items, it.rest()) orelse return error.NotFound;
@@ -2003,6 +2007,8 @@ pub const App = struct {
     fn syncUiState(self: *App) void {
         const st = &(self.ui_state orelse return);
         st.at("goals layout").visible = self.menu == .goals;
+        st.at("goalpanel").visible = self.menu == .goals;
+        st.at("goal panel").visible = self.menu == .goals;
         st.at("scenariogoals").activated = self.menu == .goals;
         st.at("Zoofinance").activated = self.menu == .finances;
         st.at("zoo status layout").visible = self.menu == .finances;
@@ -2225,7 +2231,7 @@ pub const App = struct {
             for (self.hits.items) |hh| std.debug.print("  hit {d:.0},{d:.0} {d:.0}x{d:.0}\n", .{ hh.x, hh.y, hh.w, hh.h });
             if (self.ui_state) |*us| {
                 var uit = us.map.iterator();
-                while (uit.next()) |kv| if (kv.value_ptr.visible != null or kv.value_ptr.text.len > 0) std.debug.print("  ui {s}: visible={any} text='{s}'\n", .{ kv.key_ptr.*, kv.value_ptr.visible, kv.value_ptr.text[0..@min(kv.value_ptr.text.len, 50)] });
+                while (uit.next()) |kv| if (kv.value_ptr.visible != null or kv.value_ptr.text.len > 0 or kv.value_ptr.pos != null) std.debug.print("  ui {s}: visible={any} pos={any} size={any} text='{s}'\n", .{ kv.key_ptr.*, kv.value_ptr.visible, kv.value_ptr.pos, kv.value_ptr.size, kv.value_ptr.text[0..@min(kv.value_ptr.text.len, 50)] });
             }
             if (self.scen) |m| {
                 const Dump = struct {
@@ -2259,7 +2265,7 @@ pub const App = struct {
             ctx.shot_request = true;
         } else if (std.mem.eql(u8, verb, "quit")) {
             ctx.quit = true;
-        } else return error.UnknownCommand;
+        } else return self.runCommand(cmd);
     }
 
     // ------------------------------------------------------------- events
@@ -2702,6 +2708,7 @@ pub const App = struct {
                     }
                     return;
                 }
+                if (!k.repeat and k.scancode == sc.o and self.menu == .goals) self.openMenu(.none);
                 if (!k.repeat and k.scancode == sc.esc) {
                     switch (self.menu) {
                         .pause => self.openMenu(.none),
@@ -3639,7 +3646,7 @@ pub const App = struct {
 
     fn hudButton(ctx: *anyopaque, n: *const uilayout.Node, rect: [4]f32) void {
         const self: *App = @ptrCast(@alignCast(ctx));
-        if (self.ui_state) |*us| if (self.cv_scale > 0) {
+        if (self.ui_state) |*us| if (self.cv_scale > 0 and !std.ascii.eqlIgnoreCase(n.name, "scenariogoals")) {
             const e = us.at(n.name);
             e.pos = .{ (rect[0] - self.cv_off[0]) / self.cv_scale, (rect[1] - self.cv_off[1]) / self.cv_scale };
             e.size = .{ rect[2] / self.cv_scale, rect[3] / self.cv_scale };
@@ -3675,11 +3682,31 @@ pub const App = struct {
         }
         self.drawBuyPanel(ui, &d, &h.shell);
         self.syncUiState();
+        if (self.scen != null) {
+            // The game's own Goals button sits off the visible HUD here, so show one.
+            const cs = d.canvas.scale;
+            const bx = 8 * cs;
+            const by = 104 * cs;
+            const bw = 70 * cs;
+            const bh = 20 * cs;
+            ui.template("buttonbar", bx, by, bw, bh, cs / 2, 1);
+            const ts1: f32 = @max(1, @round(cs));
+            _ = ui.text(bx + (bw - viewer.Ui.textWidth("GOALS (O)", ts1)) / 2, by + (bh - 7 * ts1) / 2, ts1, "GOALS (O)", .{ 1, 1, 1, 1 }) catch {};
+            self.hits.append(self.gpa, .{ .x = bx, .y = by, .w = bw, .h = bh, .action = .{ .menu = .open_goals } }) catch {};
+            if (self.ui_state) |*us| {
+                const e = us.at("scenariogoals");
+                // canvas units are relative to the canvas offset, which hudButton also subtracts
+                e.pos = .{ (bx - self.cv_off[0]) / cs, (by - self.cv_off[1]) / cs };
+                e.size = .{ 70, 20 };
+            }
+        }
         if (self.scen != null) if (h.tutorial) |*tl| if (self.ui_state) |*us| {
             const shown = (if (us.get("tutorial layout")) |e| e.visible orelse false else false) or (if (us.get("tutorial info")) |e| e.visible orelse false else false);
             if (shown) {
                 if (tl.find("tutorial info")) |n| uilayout.drawTop(&d, n);
                 if (tl.find("continue tutorial")) |n| uilayout.drawTop(&d, n);
+                const hint = "ENTER: CONTINUE     F10: SKIP A STEP THIS ENGINE CANNOT DO YET";
+                ui.label((ui.width - viewer.Ui.textWidth(hint, 1)) / 2, ui.height - 14, 1, hint, .{ 0.85, 0.9, 1, 1 }) catch {};
             }
             // The ring the script places around the thing to use next.
             if (us.get("tutorial ring")) |re| if ((re.visible orelse false) and re.pos != null and re.size != null) {
@@ -3863,6 +3890,12 @@ pub const App = struct {
     }
 
     fn goalsClose(self: *App, ui: *viewer.Ui, px: f32, py: f32, pw: f32, ph: f32, ts: f32) !void {
+        if (self.ui_state) |*us| if (self.cv_scale > 0) {
+            const e = us.at("close");
+            const bw0 = 30 * 6 * ts;
+            e.pos = .{ (px + (pw - bw0) / 2 - self.cv_off[0]) / self.cv_scale, (py + ph - 26 * ts - self.cv_off[1]) / self.cv_scale };
+            e.size = .{ bw0 / self.cv_scale, (7 * ts + 8 * ts) / self.cv_scale };
+        };
         const bw = 30 * 6 * ts;
         const bx = px + (pw - bw) / 2;
         const by = py + ph - 26 * ts;
@@ -4182,6 +4215,7 @@ pub const App = struct {
             },
             sc.delete, sc.x => self.deleteSelected(),
             sc.f => self.refill(),
+            sc.f10 => if (self.scen) |m| if (m.skipStep()) |n| self.say("skipped step: {s}", .{n}),
             sc.o => self.openMenu(if (self.menu == .goals) .none else .goals),
             40 => if (self.ui_state) |*us| if (us.get("continue tutorial")) |e| if (e.visible orelse false) self.pressContinue(),
             sc.z => self.doUndo(),
@@ -4760,6 +4794,7 @@ pub const App = struct {
                 self.sim.advance(&self.world, ctx.dt * self.speed);
                 self.updateFame(ctx.dt * self.speed);
                 if (self.scen) |m| {
+                    self.syncUiState();
                     m.update(ctx.dt * self.speed);
                     if (m.roots.items.len > 0 and m.roots.items[0].state == .success) self.markScenarioDone();
                 }
