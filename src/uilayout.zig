@@ -248,9 +248,34 @@ fn drawNode(d: *Draw, n: *const Node, box: [4]f32) void {
         if (info.text.len > 0) {
             const ts = @max(1, @round(s * 2));
             const tw = viewer.Ui.textWidth(info.text, ts);
-            const tx = if (n.centered) box[0] + (box[2] - tw) / 2 else box[0];
-            const ty = box[1] + (box[3] - 7 * ts) / 2;
-            _ = ui.text(tx, ty, ts, info.text, n.text_color) catch {};
+            if (tw <= box[2] or box[2] <= 0) {
+                const tx = if (n.centered) box[0] + (box[2] - tw) / 2 else box[0];
+                const ty = box[1] + (box[3] - 7 * ts) / 2;
+                _ = ui.text(tx, ty, ts, info.text, n.text_color) catch {};
+            } else {
+                // Too long for one line: smaller text, wrapped on spaces.
+                const ws = @max(1, @round(s));
+                const cols: usize = @max(8, @as(usize, @intFromFloat(box[2] / (6 * ws))));
+                var line: [200]u8 = undefined;
+                var ln: usize = 0;
+                var y = box[1];
+                var words = std.mem.tokenizeAny(u8, info.text, " \t\r\n");
+                while (words.next()) |w| {
+                    if (ln > 0 and ln + 1 + w.len > cols) {
+                        _ = ui.text(box[0], y, ws, line[0..ln], n.text_color) catch {};
+                        y += 10 * ws;
+                        ln = 0;
+                    }
+                    if (ln > 0 and ln < line.len) {
+                        line[ln] = ' ';
+                        ln += 1;
+                    }
+                    const take = @min(w.len, line.len - ln);
+                    _ = std.ascii.upperString(line[ln..][0..take], w[0..take]);
+                    ln += take;
+                }
+                if (ln > 0) _ = ui.text(box[0], y, ws, line[0..ln], n.text_color) catch {};
+            }
         }
     } else if (n.image.len > 0) {
         if (ui.sprite(n.image)) |spr| {

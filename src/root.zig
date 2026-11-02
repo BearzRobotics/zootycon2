@@ -26,6 +26,7 @@ pub const environment = @import("environment.zig");
 pub const ai = @import("ai.zig");
 pub const script = @import("script.zig");
 pub const loc = @import("loc.zig");
+pub const uistate = @import("uistate.zig");
 pub const scenario = @import("scenario.zig");
 
 test {
@@ -54,5 +55,6 @@ test {
     _ = ai;
     _ = script;
     _ = loc;
+    _ = uistate;
     _ = scenario;
 }

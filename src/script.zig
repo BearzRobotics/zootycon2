@@ -243,7 +243,16 @@ fn luaInclude(L: ?*c.lua_State) callconv(.c) c_int {
 /// returns nothing.
 fn luaMissing(L: ?*c.lua_State) callconv(.c) c_int {
     const eng = current orelse return 0;
-    if (c.lua_type(L, 2) == c.LUA_TSTRING) eng.noteMissing(std.mem.span(c.lua_tostring(L, 2)));
+    if (c.lua_type(L, 2) != c.LUA_TSTRING) return 0;
+    const name = std.mem.span(c.lua_tostring(L, 2));
+    // Game API names (BFG_..., ZT_..., UI_...) read as a do-nothing function;
+    // anything else is just an unset variable, which scripts test against nil.
+    const api = std.mem.startsWith(u8, name, "BF") or std.mem.startsWith(u8, name, "ZT") or std.mem.startsWith(u8, name, "UI_");
+    if (!api) {
+        c.lua_pushnil(L);
+        return 1;
+    }
+    eng.noteMissing(name);
     c.lua_pushcclosure(L, luaNoop, 0);
     return 1;
 }
@@ -268,7 +277,7 @@ test "unknown game functions are logged instead of failing" {
     defer vfs.deinit();
     const eng = try Engine.create(std.testing.allocator, &vfs);
     defer eng.destroy();
-    try eng.runString("local r = SomethingTheGameProvides(1, 2); done = 1");
+    try eng.runString("local r = BFG_SomethingTheGameProvides(1, 2); done = 1; unset = SomeVariable");
     try std.testing.expectEqual(@as(f64, 1), eng.globalNumber("done").?);
-    try std.testing.expectEqual(@as(u32, 1), eng.missing.get("SomethingTheGameProvides").?);
+    try std.testing.expectEqual(@as(u32, 1), eng.missing.get("BFG_SomethingTheGameProvides").?);
 }

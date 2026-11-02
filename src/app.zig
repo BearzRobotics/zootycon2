@@ -26,6 +26,7 @@ const ai = @import("ai.zig");
 const vfs_mod = @import("vfs.zig");
 const scenario_mod = @import("scenario.zig");
 const loc_mod = @import("loc.zig");
+const uistate = @import("uistate.zig");
 
 const Mat4 = viewer.Mat4;
 
@@ -147,6 +148,7 @@ const MenuAction = enum {
     open_settings,
     open_finances,
     open_goals,
+    tutorial_continue,
     gender_male,
     gender_female,
     open_campaigns,
@@ -318,9 +320,14 @@ pub const App = struct {
     feeder_state: u64 = 0,
     /// Zoo fame in stars (fractional); see updateFame.
     fame: f32 = 1,
+    /// Canvas scale and offset of the last HUD draw (UI rects are kept in canvas units).
+    cv_scale: f32 = 0,
+    cv_off: [2]f32 = .{ 0, 0 },
     /// Scenario goals: localized strings and the running goal tree.
     strings: ?loc_mod.Loc = null,
     scen: ?*scenario_mod.Manager = null,
+    /// State of UI nodes that scenario scripts read and drive.
+    ui_state: ?uistate.State = null,
     /// Key of the campaign scenario being played (for saving progress).
     scen_key: [64]u8 = undefined,
     scen_key_len: usize = 0,
@@ -366,7 +373,7 @@ pub const App = struct {
     audio: ?audio_mod.Engine = null,
     audio_biome_dirty: bool = true,
     /// The game's own HUD, drawn from its layout files.
-    hud: ?struct { shell: uilayout.Layout, bucks: ?uilayout.Layout, info: ?uilayout.Layout = null, status: ?uilayout.Layout = null, mainmenu: ?uilayout.Layout = null } = null,
+    hud: ?struct { shell: uilayout.Layout, bucks: ?uilayout.Layout, info: ?uilayout.Layout = null, status: ?uilayout.Layout = null, mainmenu: ?uilayout.Layout = null, tutorial: ?uilayout.Layout = null, goals: ?uilayout.Layout = null } = null,
     hud_on: bool = true,
     /// A name the player gave the zoo's save (empty: derived from the map).
     custom_name: [48]u8 = undefined,
@@ -442,6 +449,7 @@ pub const App = struct {
         self.guest_names.deinit(self.gpa);
         self.food_names.deinit(self.gpa);
         if (self.scen) |m| m.destroy();
+        if (self.ui_state) |*u| u.deinit();
         if (self.camp_ready) {
             self.campaigns.deinit(self.gpa);
             self.camp_labels.deinit(self.gpa);
@@ -1354,6 +1362,16 @@ pub const App = struct {
             for (self.sim.agents.items) |*ag| if (ag.is_guest) {
                 ag.needs[0] = 95;
             };
+        } else if (std.mem.eql(u8, verb, "lua")) {
+            const m = self.scen orelse return error.NotFound;
+            m.eng.load("scenario/scripts/entity.lua") catch {};
+            m.eng.runString(it.rest()) catch std.debug.print("lua error: {s}\n", .{m.eng.errorText()});
+        } else if (std.mem.eql(u8, verb, "count")) {
+            const kind = it.next() orelse return error.BadScript;
+            var ids: std.ArrayList(u32) = .empty;
+            defer ids.deinit(self.gpa);
+            scenEntities(self, self.gpa, kind, false, &ids);
+            std.debug.print("count {s}: {d} (props {d}, actors {d})\n", .{ kind, ids.items.len, self.world.props.items.len, self.world.actors.items.len });
         } else if (std.mem.eql(u8, verb, "thirsty")) {
             try self.sim.sync(&self.world);
             for (self.sim.agents.items) |*ag| if (ag.brain) |*b| {
@@ -1897,6 +1915,7 @@ pub const App = struct {
             st.load(self.vfs, "lang/1033/") catch {};
             self.strings = st;
         }
+        if (self.ui_state == null) self.ui_state = uistate.State.init(self.gpa);
         const m = scenario_mod.Manager.create(self.gpa, self.vfs, &self.strings.?) catch |e| {
             self.say("scenario failed: {s}", .{@errorName(e)});
             return;
@@ -1907,6 +1926,8 @@ pub const App = struct {
             .attr = scenAttr,
             .set_attr = scenSetAttr,
             .selected = scenSelected,
+            .ui = &self.ui_state.?,
+            .ui_known = scenUiKnown,
             .attr_bool = scenAttrBool,
             .attr_str = scenAttrStr,
             .kind_of = scenKindOf,
@@ -1922,6 +1943,7 @@ pub const App = struct {
         m.log = self.opts.scenario_log;
         m.eng.log = self.opts.scenario_log;
         self.scen = m;
+        self.syncUiState();
         m.tick();
     }
 
@@ -1955,6 +1977,35 @@ pub const App = struct {
         const b = ag.brain orelse return null;
         for (ai.need_names, 0..) |n, i| if (std.ascii.eqlIgnoreCase(n, name)) return b.needs[i];
         return null;
+    }
+
+    /// The tutorial's Continue button: it hides itself, the panel and the block-out.
+    fn pressContinue(self: *App) void {
+        const us = &(self.ui_state orelse return);
+        const e = us.at("continue tutorial");
+        e.presses += 1;
+        e.visible = false;
+        us.at("tutorial info").visible = false;
+        us.at("tutorial block out").visible = false;
+    }
+
+    fn scenUiKnown(ctx: *anyopaque, name: []const u8) bool {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        const h = &(self.hud orelse return false);
+        if (h.shell.find(name) != null) return true;
+        inline for (.{ "tutorial", "goals", "status", "info", "bucks", "mainmenu" }) |f| {
+            if (@field(h, f)) |*lay| if (lay.find(name) != null) return true;
+        }
+        return false;
+    }
+
+    /// Writes what the player has open or pressed into the UI state scripts read.
+    fn syncUiState(self: *App) void {
+        const st = &(self.ui_state orelse return);
+        st.at("goals layout").visible = self.menu == .goals;
+        st.at("scenariogoals").activated = self.menu == .goals;
+        st.at("Zoofinance").activated = self.menu == .finances;
+        st.at("zoo status layout").visible = self.menu == .finances;
     }
 
     fn scenSelected(ctx: *anyopaque) ?u32 {
@@ -2010,6 +2061,14 @@ pub const App = struct {
         if (eq(u8, name, "time")) return self.tod;
         if (eq(u8, name, "fame")) return self.stars() * 2;
         if (eq(u8, name, "guests")) return @floatFromInt(self.sim.liveGuests());
+        if (std.mem.startsWith(u8, name, "cam_")) {
+            const fc = self.cur_ctx orelse return 0;
+            if (eq(u8, name, "cam_x")) return fc.cam.center[0];
+            if (eq(u8, name, "cam_y")) return fc.cam.center[1];
+            if (eq(u8, name, "cam_z")) return fc.cam.center[2];
+            if (eq(u8, name, "cam_zoom")) return fc.cam.dist;
+            if (eq(u8, name, "cam_yaw")) return fc.cam.yaw;
+        }
         if (eq(u8, name, "guests_total")) return @floatFromInt(self.sim.zoo.guests_total);
         if (eq(u8, name, "admission")) return self.sim.adult_price;
         if (eq(u8, name, "is_campaign")) return if (self.scen_key_len > 0) 1 else 0;
@@ -2163,6 +2222,11 @@ pub const App = struct {
             }
             for (self.sim.feeders.items) |f| std.debug.print("feeder #{d} {s}: food {d:.0}\n", .{ f.prop_id, f.binder, f.food });
             std.debug.print("animal welfare: {d:.0}\n", .{self.sim.animalWelfare()});
+            for (self.hits.items) |hh| std.debug.print("  hit {d:.0},{d:.0} {d:.0}x{d:.0}\n", .{ hh.x, hh.y, hh.w, hh.h });
+            if (self.ui_state) |*us| {
+                var uit = us.map.iterator();
+                while (uit.next()) |kv| if (kv.value_ptr.visible != null or kv.value_ptr.text.len > 0) std.debug.print("  ui {s}: visible={any} text='{s}'\n", .{ kv.key_ptr.*, kv.value_ptr.visible, kv.value_ptr.text[0..@min(kv.value_ptr.text.len, 50)] });
+            }
             if (self.scen) |m| {
                 const Dump = struct {
                     fn node(mm: *scenario_mod.Manager, n: *const scenario_mod.Node, depth: usize) void {
@@ -2511,6 +2575,7 @@ pub const App = struct {
                 self.buy_scroll = 0;
                 self.buildBuyLists();
             },
+            .tutorial_continue => self.pressContinue(),
             .open_goals => self.openMenu(.goals),
             .open_campaigns => {
                 self.loadCampaigns();
@@ -2641,6 +2706,7 @@ pub const App = struct {
                     switch (self.menu) {
                         .pause => self.openMenu(.none),
                         .main => {},
+                        .goals => self.openMenu(.none),
                         else => self.openMenu(if (self.in_main) .main else .pause),
                     }
                 }
@@ -3459,7 +3525,17 @@ pub const App = struct {
             defer self.gpa.free(mb);
             mainmenu = uilayout.parse(self.gpa, mb) catch null;
         } else |_| {}
-        self.hud = .{ .shell = shell, .bucks = bucks, .info = info, .status = status, .mainmenu = mainmenu };
+        var tutorial: ?uilayout.Layout = null;
+        if (self.vfs.read(self.gpa, "ui/layout/tutorial.xml")) |tb| {
+            defer self.gpa.free(tb);
+            tutorial = uilayout.parse(self.gpa, tb) catch null;
+        } else |_| {}
+        var goals_l: ?uilayout.Layout = null;
+        if (self.vfs.read(self.gpa, "ui/layout/goals.xml")) |gb| {
+            defer self.gpa.free(gb);
+            goals_l = uilayout.parse(self.gpa, gb) catch null;
+        } else |_| {}
+        self.hud = .{ .shell = shell, .bucks = bucks, .info = info, .status = status, .mainmenu = mainmenu, .tutorial = tutorial, .goals = goals_l };
         _ = &shell;
         self.show_help = false;
     }
@@ -3493,6 +3569,7 @@ pub const App = struct {
         if (eq(name, "smooth")) return .{ .tool = .smooth };
         if (eq(name, "Zoofinance")) return .{ .menu = .open_finances };
         if (eq(name, "scenariogoals")) return .{ .menu = .open_goals };
+        if (eq(name, "continue tutorial")) return .{ .menu = .tutorial_continue };
         if (eq(name, "Male button")) return .{ .menu = .gender_male };
         if (eq(name, "Female Button")) return .{ .menu = .gender_female };
         if (eq(name, "zoo info tab")) return .{ .status_tab = 0 };
@@ -3551,11 +3628,22 @@ pub const App = struct {
             if (eq(n.name, "balance sheet tab")) info.on = self.status_tab == 1;
             if (eq(n.name, "graphs tab")) info.on = self.status_tab == 2;
         }
+        if (self.ui_state) |*us| if (us.get(n.name)) |e| {
+            if (e.visible) |v| info.visible = v;
+            if (!e.enabled) info.enabled = false;
+            if (e.activated) info.on = true;
+            if (e.text.len > 0) info.text = e.text;
+        };
         return info;
     }
 
     fn hudButton(ctx: *anyopaque, n: *const uilayout.Node, rect: [4]f32) void {
         const self: *App = @ptrCast(@alignCast(ctx));
+        if (self.ui_state) |*us| if (self.cv_scale > 0) {
+            const e = us.at(n.name);
+            e.pos = .{ (rect[0] - self.cv_off[0]) / self.cv_scale, (rect[1] - self.cv_off[1]) / self.cv_scale };
+            e.size = .{ rect[2] / self.cv_scale, rect[3] / self.cv_scale };
+        };
         const act = hudAction(n.name) orelse return;
         self.hits.append(self.gpa, .{ .x = rect[0], .y = rect[1], .w = rect[2], .h = rect[3], .action = act }) catch {};
     }
@@ -3570,6 +3658,8 @@ pub const App = struct {
             .mouse = toPixels(ctx, ctx.mouse[0], ctx.mouse[1]),
             .pressed = self.lmb,
         };
+        self.cv_scale = d.canvas.scale;
+        self.cv_off = .{ d.canvas.off_x, d.canvas.off_y };
         const tops = [_][]const u8{ "famestarwells", "CurrentDate Background", "Primary Game Button Panel" };
         for (tops) |name| if (h.shell.find(name)) |n| uilayout.drawTop(&d, n);
         if (h.bucks) |*b| if (b.find("zoo_bucks")) |n| uilayout.drawTop(&d, n);
@@ -3584,6 +3674,31 @@ pub const App = struct {
             ui.image(spr, wx, wy, ww * frac, wh, .{ 0, 0, spr.w * frac, spr.h }, .{ 1, 1, 1, 1 }) catch {};
         }
         self.drawBuyPanel(ui, &d, &h.shell);
+        self.syncUiState();
+        if (self.scen != null) if (h.tutorial) |*tl| if (self.ui_state) |*us| {
+            const shown = (if (us.get("tutorial layout")) |e| e.visible orelse false else false) or (if (us.get("tutorial info")) |e| e.visible orelse false else false);
+            if (shown) {
+                if (tl.find("tutorial info")) |n| uilayout.drawTop(&d, n);
+                if (tl.find("continue tutorial")) |n| uilayout.drawTop(&d, n);
+            }
+            // The ring the script places around the thing to use next.
+            if (us.get("tutorial ring")) |re| if ((re.visible orelse false) and re.pos != null and re.size != null) {
+                const cs = d.canvas.scale;
+                const rp = re.pos.?;
+                const rs = re.size.?;
+                const pulse: f32 = 0.55 + 0.45 * @sin(@as(f32, @floatFromInt(self.blink)) * 0.15);
+                const x = d.canvas.off_x + rp[0] * cs;
+                const y = d.canvas.off_y + rp[1] * cs;
+                const w = rs[0] * cs;
+                const hh = rs[1] * cs;
+                const t = 3 * cs;
+                const col = [4]f32{ 1, 0.9, 0.2, pulse };
+                ui.rect(x, y, w, t, col) catch {};
+                ui.rect(x, y + hh - t, w, t, col) catch {};
+                ui.rect(x, y, t, hh, col) catch {};
+                ui.rect(x + w - t, y, t, hh, col) catch {};
+            };
+        };
         if (h.info) |*il| self.drawEntityInfo(ui, &d, il) else self.info_drawn = false;
     }
 
@@ -4067,7 +4182,8 @@ pub const App = struct {
             },
             sc.delete, sc.x => self.deleteSelected(),
             sc.f => self.refill(),
-            sc.o => self.openMenu(.goals),
+            sc.o => self.openMenu(if (self.menu == .goals) .none else .goals),
+            40 => if (self.ui_state) |*us| if (us.get("continue tutorial")) |e| if (e.visible orelse false) self.pressContinue(),
             sc.z => self.doUndo(),
             sc.c => {
                 self.fence_start = null;

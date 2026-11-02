@@ -13,6 +13,7 @@ const xml = @import("xml.zig");
 const script = @import("script.zig");
 const loc_mod = @import("loc.zig");
 const vfs_mod = @import("vfs.zig");
+const uistate = @import("uistate.zig");
 
 pub const State = enum { pending, success, failed };
 
@@ -75,6 +76,10 @@ pub const Host = struct {
     kind_of: *const fn (ctx: *anyopaque, id: u32, kind: []const u8) bool = noKind,
     /// The entity's binder name.
     binder: *const fn (ctx: *anyopaque, id: u32) []const u8 = noBinder,
+    /// The interface the scripts drive; null until the application sets it.
+    ui: ?*uistate.State = null,
+    /// Whether a UI node exists in the layouts that are loaded.
+    ui_known: *const fn (ctx: *anyopaque, name: []const u8) bool = noKnown,
     /// The entity the player has selected, if any.
     selected: *const fn (ctx: *anyopaque) ?u32 = noSelected,
     /// Zoo-wide numbers by name: `cash`, `month`, `day`, `time`, `fame`
@@ -86,6 +91,9 @@ pub const Host = struct {
 fn noEntities(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: bool, _: *std.ArrayList(u32)) void {}
 fn noAttr(_: *anyopaque, _: u32, _: []const u8) ?f64 {
     return null;
+}
+fn noKnown(_: *anyopaque, _: []const u8) bool {
+    return false;
 }
 fn noSelected(_: *anyopaque) ?u32 {
     return null;
@@ -295,6 +303,7 @@ pub const Manager = struct {
     fn evaluateRule(self: *Manager, n: *Node) State {
         const act = n.on_eval orelse return n.state;
         const r = self.call(n, act) orelse return n.state;
+        if (self.log and r != 0) std.debug.print("scenario: {s} -> {d}\n", .{ n.name, r });
         if (r >= 0.5) {
             n.state = .success;
             if (n.on_success) |s| _ = self.call(n, s);
@@ -366,6 +375,17 @@ pub const Manager = struct {
         const h = self.host;
         const eq = std.mem.eql;
         if (eq(u8, comp, "BFGManager")) {
+            const cam = [_]struct { m: []const u8, n: []const u8 }{
+                .{ .m = "BFG_GET_CAMERA_X", .n = "cam_x" },
+                .{ .m = "BFG_GET_CAMERA_Y", .n = "cam_y" },
+                .{ .m = "BFG_GET_CAMERA_Z", .n = "cam_z" },
+                .{ .m = "BFG_GET_CAMERA_ZOOM", .n = "cam_zoom" },
+                .{ .m = "BFG_GET_CAMERA_YAW", .n = "cam_yaw" },
+            };
+            for (cam) |cm| if (eq(u8, method, cm.m)) {
+                c.lua_pushnumber(L, h.stat(h.ctx, cm.n));
+                return 1;
+            };
             if (eq(u8, method, "BFG_GET_SELECTED_ENTITY")) {
                 if (h.selected(h.ctx)) |id| {
                     pushEntity(L, id);
@@ -432,6 +452,82 @@ pub const Manager = struct {
             }
         }
         return null;
+    }
+
+    /// Calls on interface nodes (`ui:<name>`; the root is the empty name).
+    fn uiCall(self: *Manager, L: ?*c.lua_State, name: []const u8, method: []const u8) c_int {
+        const eq = std.mem.eql;
+        const st = self.host.ui orelse return 0;
+        if (eq(u8, method, "UI_GET_CHILD")) {
+            const child = l.str(L, 2) orelse "";
+            if (!self.host.ui_known(self.host.ctx, child)) {
+                c.lua_pushnil(L);
+                return 1;
+            }
+            var nb: [100]u8 = undefined;
+            pushComponent(L, std.fmt.bufPrint(&nb, "ui:{s}", .{child}) catch "ui:");
+            return 1;
+        }
+        if (name.len == 0) return 0;
+        const e = st.at(name);
+        if (eq(u8, method, "UI_SHOW")) {
+            e.visible = true;
+        } else if (eq(u8, method, "UI_HIDE")) {
+            e.visible = false;
+        } else if (eq(u8, method, "UI_ENABLE")) {
+            e.enabled = true;
+        } else if (eq(u8, method, "UI_DISABLE")) {
+            e.enabled = false;
+        } else if (eq(u8, method, "UI_ACTIVATE_ON")) {
+            e.activated = true;
+        } else if (eq(u8, method, "UI_ACTIVATE_OFF") or eq(u8, method, "UI_REPRESS")) {
+            e.activated = false;
+        } else if (eq(u8, method, "UI_ACTIVATE")) {
+            e.activated = !e.activated;
+        } else if (eq(u8, method, "UI_IS_ALTERNATE") or eq(u8, method, "UI_IS_ACTIVATED")) {
+            c.lua_pushboolean(L, @intFromBool(e.activated));
+            return 1;
+        } else if (eq(u8, method, "UI_IS_HIDDEN")) {
+            c.lua_pushboolean(L, @intFromBool(if (e.visible) |v| !v else false));
+            return 1;
+        } else if (eq(u8, method, "UI_IS_DISABLED")) {
+            c.lua_pushboolean(L, @intFromBool(!e.enabled));
+            return 1;
+        } else if (eq(u8, method, "UI_IS_NORMAL")) {
+            c.lua_pushboolean(L, @intFromBool(e.enabled and !e.activated));
+            return 1;
+        } else if (eq(u8, method, "UI_SET_LOCID")) {
+            const id = l.str(L, 2) orelse "";
+            st.setText(name, self.loc.get(id) orelse id);
+        } else if (eq(u8, method, "UI_SET_TEXT")) {
+            st.setText(name, l.str(L, 2) orelse "");
+        } else if (eq(u8, method, "UI_GET_TEXT")) {
+            l.pushStr(L, e.text);
+            return 1;
+        } else if (eq(u8, method, "UI_SET_POS")) {
+            if (c.lua_isnumber(L, 2) != 0 and c.lua_isnumber(L, 3) != 0) e.pos = .{ @floatCast(c.lua_tonumber(L, 2)), @floatCast(c.lua_tonumber(L, 3)) };
+        } else if (eq(u8, method, "UI_SET_SIZE")) {
+            if (c.lua_isnumber(L, 2) != 0 and c.lua_isnumber(L, 3) != 0) e.size = .{ @floatCast(c.lua_tonumber(L, 2)), @floatCast(c.lua_tonumber(L, 3)) };
+        } else if (eq(u8, method, "UI_GET_CHILDREN")) {
+            c.lua_newtable(L);
+            return 1;
+        } else if (eq(u8, method, "UI_GET_STRING_SIZE")) {
+            // width and height of a text as a table (the tutorial panel is 216 wide)
+            const txt: []const u8 = l.str(L, 2) orelse e.text;
+            const lines = (txt.len + 35) / 36;
+            pushRect(L, 0, 0, @floatFromInt(@min(txt.len, 36) * 6), @floatFromInt(@max(1, lines) * 10));
+            return 1;
+        } else if (eq(u8, method, "UI_GET_SRC_RECT") or eq(u8, method, "UI_GET_SCREEN_RECT") or eq(u8, method, "UI_GET_IMAGE_SRC_RECT")) {
+            const p = e.pos orelse .{ 0, 0 };
+            const sz = e.size orelse .{ 70, 70 };
+            pushRect(L, p[0], p[1], sz[0], sz[1]);
+            return 1;
+        } else {
+            // placement, animation and sound calls have no effect here
+            var nb: [160]u8 = undefined;
+            if (script.currentEngine()) |en| en.noteMissing(std.fmt.bufPrint(&nb, "ui:{s}", .{method}) catch method);
+        }
+        return 0;
     }
 
     pub fn say(self: *Manager, text: []const u8) void {
@@ -655,6 +751,13 @@ fn apiQueryObject(L: ?*c.lua_State) callconv(.c) c_int {
             .{ "BFS_SETUSERVAL", apiSetVar2 },
             .{ "BFS_GETUSERVAL", apiGetVar2 },
             .{ "BFS_GETLOCID", mgrLocId },
+            .{ "UI_DISABLE", mgrUi("UI_DISABLE") },
+            .{ "UI_ENABLE", mgrUi("UI_ENABLE") },
+            .{ "UI_HIDE", mgrUi("UI_HIDE") },
+            .{ "UI_SHOW", mgrUi("UI_SHOW") },
+            .{ "UI_ACTIVATE_ON", mgrUi("UI_ACTIVATE_ON") },
+            .{ "UI_ACTIVATE_OFF", mgrUi("UI_ACTIVATE_OFF") },
+            .{ "UI_REPRESS", mgrUi("UI_REPRESS") },
         }) |m| {
             c.lua_pushstring(L, m[0]);
             c.lua_pushcclosure(L, m[1], 0);
@@ -664,7 +767,7 @@ fn apiQueryObject(L: ?*c.lua_State) callconv(.c) c_int {
     }
     const known = [_][]const u8{ "BFGManager", "UIRoot", "ZTStatus", "ZTEconomyMgr", "ZTPhotoChallengesComponent", "ZTAIMgr", "ZTMode", "ZTPuzzleMgr", "ZTWorldMgr", "ZTResearchMgr" };
     for (known) |k| if (std.mem.eql(u8, k, name)) {
-        pushComponent(L, name);
+        pushComponent(L, if (std.mem.eql(u8, k, "UIRoot")) "ui:" else name);
         return 1;
     };
     if (script.currentEngine()) |e| {
@@ -673,6 +776,15 @@ fn apiQueryObject(L: ?*c.lua_State) callconv(.c) c_int {
     }
     c.lua_pushnil(L);
     return 1;
+}
+
+fn pushRect(L: ?*c.lua_State, x: f32, y: f32, w: f32, h: f32) void {
+    c.lua_newtable(L);
+    inline for (.{ .{ "x", x }, .{ "y", y }, .{ "w", w }, .{ "h", h } }) |kv| {
+        c.lua_pushstring(L, kv[0]);
+        c.lua_pushnumber(L, kv[1]);
+        c.lua_settable(L, -3);
+    }
 }
 
 /// A game component as scripts see it: a table whose methods are looked up
@@ -708,6 +820,7 @@ fn componentCall(L: ?*c.lua_State) callconv(.c) c_int {
     const comp = std.mem.span(c.lua_tostring(L, upvalue_base - 1));
     const method = std.mem.span(c.lua_tostring(L, upvalue_base - 2));
     const m = active orelse return 0;
+    if (std.mem.startsWith(u8, comp, "ui:")) return m.uiCall(L, comp[3..], method);
     if (m.handleCall(L, comp, method)) |n| return n;
     var nb: [400]u8 = undefined;
     if (script.currentEngine()) |e| {
@@ -726,11 +839,6 @@ fn componentCall(L: ?*c.lua_State) callconv(.c) c_int {
         }
         w.writeAll(")") catch {};
         if (e.log) e.noteMissing(w.buffered()) else e.noteMissing(w.buffered());
-    }
-    // UI objects answer every call with themselves so chains keep working.
-    if (std.mem.eql(u8, comp, "UIRoot")) {
-        pushComponent(L, comp);
-        return 1;
     }
     return 0;
 }
@@ -756,6 +864,20 @@ fn mgrHideRule(L: ?*c.lua_State) callconv(.c) c_int {
     const m = active orelse return 0;
     if (m.find(l.str(L, 2) orelse return 0)) |n| n.hidden = true;
     return 0;
+}
+
+/// The scenario manager also takes UI calls naming a node (`mgr:UI_DISABLE("undo")`).
+fn mgrUi(comptime method: []const u8) c.lua_CFunction {
+    return struct {
+        fn f(L: ?*c.lua_State) callconv(.c) c_int {
+            const m = active orelse return 0;
+            const name = l.str(L, 2) orelse return 0;
+            const st = m.host.ui orelse return 0;
+            const e = st.at(name);
+            if (std.mem.eql(u8, method, "UI_DISABLE")) e.enabled = false else if (std.mem.eql(u8, method, "UI_ENABLE")) e.enabled = true else if (std.mem.eql(u8, method, "UI_HIDE")) e.visible = false else if (std.mem.eql(u8, method, "UI_SHOW")) e.visible = true else if (std.mem.eql(u8, method, "UI_ACTIVATE_ON")) e.activated = true else e.activated = false;
+            return 0;
+        }
+    }.f;
 }
 
 fn mgrSetRuleState(L: ?*c.lua_State) callconv(.c) c_int {
