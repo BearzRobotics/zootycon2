@@ -288,7 +288,7 @@ pub const Graph = struct {
     }
 
     /// Links tiles whose centres are within `link` of each other.
-    pub fn build(gpa: std.mem.Allocator, tiles: []const world_mod.PathTile, link: f32) !Graph {
+    pub fn build(gpa: std.mem.Allocator, tiles: []const world_mod.PathTile, link: f32, walls: []const Wall) !Graph {
         var arena: std.heap.ArenaAllocator = .init(gpa);
         errdefer arena.deinit();
         const a = arena.allocator();
@@ -306,7 +306,14 @@ pub const Graph = struct {
                 if (i == j) continue;
                 const dx = p[0] - q[0];
                 const dy = p[1] - q[1];
-                if (dx * dx + dy * dy <= link2) try tmp.append(gpa, @intCast(j));
+                if (dx * dx + dy * dy > link2) continue;
+                // people cannot cross fences between path tiles (gates are open to them)
+                var cut = false;
+                for (walls) |wl| if (!wl.gate and segmentsCross(p, q, wl)) {
+                    cut = true;
+                    break;
+                };
+                if (!cut) try tmp.append(gpa, @intCast(j));
             }
             adj[i] = try a.dupe(u32, tmp.items);
         }
@@ -392,7 +399,8 @@ pub const Graph = struct {
 };
 
 /// A fence segment animals cannot cross.
-pub const Wall = struct { ax: f32, ay: f32, bx: f32, by: f32 };
+/// A fence piece; gates block animals but are open to people.
+pub const Wall = struct { ax: f32, ay: f32, bx: f32, by: f32, gate: bool = false };
 
 fn ccw(ax: f32, ay: f32, bx: f32, by: f32, cx: f32, cy: f32) f32 {
     return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
@@ -412,7 +420,7 @@ fn blocksMovement(kind: []const u8) bool {
     var buf: [64]u8 = undefined;
     if (kind.len > buf.len) return true;
     const k = std.ascii.lowerString(&buf, kind);
-    return std.mem.indexOf(u8, k, "curb") == null and std.mem.indexOf(u8, k, "gate") == null;
+    return std.mem.indexOf(u8, k, "curb") == null;
 }
 
 pub fn isGuest(binder: []const u8) bool {
@@ -540,6 +548,7 @@ pub const Sim = struct {
             for (w.fences.items) |f| {
                 if (!blocksMovement(f.kind)) continue;
                 try self.walls.append(self.gpa, .{
+                    .gate = std.mem.indexOf(u8, f.kind, "gate") != null or std.mem.indexOf(u8, f.kind, "Gate") != null,
                     .ax = f.position[0],
                     .ay = f.position[1],
                     .bx = f.position[0] + @cos(f.rotation) * 3.0,
@@ -548,10 +557,10 @@ pub const Sim = struct {
             }
             self.walls_for = w.fences.items.len;
         }
-        if (self.graph_paths != w.paths.items.len) {
+        if (self.graph_paths != w.paths.items.len *% 65537 +% w.fences.items.len) {
             self.graph.deinit();
-            self.graph = try Graph.build(self.gpa, w.paths.items, 3.6);
-            self.graph_paths = w.paths.items.len;
+            self.graph = try Graph.build(self.gpa, w.paths.items, 3.6, self.walls.items);
+            self.graph_paths = w.paths.items.len *% 65537 +% w.fences.items.len;
             for (self.agents.items) |*ag| {
                 ag.node = null;
                 ag.prev_node = null;
@@ -1424,7 +1433,7 @@ test "graph links neighbouring tiles" {
         .{ .id = 2, .texture = "", .position = .{ 3, 0 }, .width = 6, .height = 6 },
         .{ .id = 3, .texture = "", .position = .{ 30, 0 }, .width = 6, .height = 6 },
     };
-    var g = try Graph.build(testing.allocator, &tiles, 3.6);
+    var g = try Graph.build(testing.allocator, &tiles, 3.6, &.{});
     defer g.deinit();
     try testing.expectEqual(@as(usize, 1), g.adj[0].len);
     try testing.expectEqual(@as(usize, 0), g.adj[2].len);
@@ -1595,7 +1604,7 @@ test "routes follow the walkway and avoid gaps" {
     try tiles.append(gpa, .{ .id = 0, .texture = "", .position = .{ 0, 6 }, .width = 6, .height = 6 });
     for (0..5) |i| try tiles.append(gpa, .{ .id = 0, .texture = "", .position = .{ @as(f32, @floatFromInt(i)) * 3, 6 }, .width = 6, .height = 6 });
     try tiles.append(gpa, .{ .id = 0, .texture = "", .position = .{ 100, 100 }, .width = 6, .height = 6 }); // isolated
-    var g = try Graph.build(gpa, tiles.items, 3.6);
+    var g = try Graph.build(gpa, tiles.items, 3.6, &.{});
     defer g.deinit();
     // from the end of the bottom row (node 4) to the end of the top row (node 11)
     const r = try g.route(gpa, 4, 11);
@@ -1725,7 +1734,8 @@ test "hungry animals eat from a reachable feeder and not through a fence" {
 test "curbs and gates do not block" {
     try testing.expect(blocksMovement("zoowall"));
     try testing.expect(!blocksMovement("curb_jungle"));
-    try testing.expect(!blocksMovement("alpinefencegate_df"));
+    // gates are closed to animals (people walk through them, see Graph.build)
+    try testing.expect(blocksMovement("alpinefencegate_df"));
 }
 
 test "removing an actor removes its agent" {
@@ -1740,4 +1750,19 @@ test "removing an actor removes its agent" {
     try testing.expect(w.remove(id));
     try sim.sync(&w);
     try testing.expectEqual(@as(usize, 0), sim.agents.items.len);
+}
+
+test "a fence cuts a path link for people but a gate does not" {
+    const tiles = [_]world_mod.PathTile{
+        .{ .position = .{ 0, 0 }, .texture = "", .id = 1, .width = 3, .height = 3 },
+        .{ .position = .{ 3, 0 }, .texture = "", .id = 2, .width = 3, .height = 3 },
+    };
+    const fence = [_]Wall{.{ .ax = 1.5, .ay = -2, .bx = 1.5, .by = 2 }};
+    var g = try Graph.build(testing.allocator, &tiles, 3.6, &fence);
+    defer g.deinit();
+    try testing.expectEqual(@as(usize, 0), g.adj[0].len);
+    const gate = [_]Wall{.{ .ax = 1.5, .ay = -2, .bx = 1.5, .by = 2, .gate = true }};
+    var g2 = try Graph.build(testing.allocator, &tiles, 3.6, &gate);
+    defer g2.deinit();
+    try testing.expectEqual(@as(usize, 1), g2.adj[0].len);
 }

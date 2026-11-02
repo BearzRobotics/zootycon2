@@ -70,6 +70,9 @@ pub const Tool = enum {
     raise,
     lower,
     flatten,
+    cliff,
+    ditch,
+    smooth,
     actor,
     food,
     /// Any entity from the buy panel's item tabs (buildings, scenery, toys, shelters, plants...).
@@ -84,6 +87,9 @@ pub const Tool = enum {
             .raise => "raise terrain",
             .lower => "lower terrain",
             .flatten => "flatten terrain",
+            .cliff => "raise a cliff",
+            .ditch => "dig a ditch",
+            .smooth => "smooth terrain",
             .actor => "place animal/guest",
             .food => "place food or water",
             .item => "place item",
@@ -141,6 +147,8 @@ const MenuAction = enum {
     open_settings,
     open_finances,
     open_goals,
+    gender_male,
+    gender_female,
     open_campaigns,
     open_pause,
     toggle_pause,
@@ -308,6 +316,8 @@ pub const App = struct {
     // Clickable interface, rebuilt each frame by `overlay`.
     hits: std.ArrayList(Hit) = .empty,
     feeder_state: u64 = 0,
+    /// Zoo fame in stars (fractional); see updateFame.
+    fame: f32 = 1,
     /// Scenario goals: localized strings and the running goal tree.
     strings: ?loc_mod.Loc = null,
     scen: ?*scenario_mod.Manager = null,
@@ -387,6 +397,8 @@ pub const App = struct {
     buy_cat: ?u8 = null,
     buy_tab: BuyTab = .fence,
     buy_scroll: usize = 0,
+    /// Animal tab shows females (otherwise males).
+    buy_female: bool = false,
     buy_rect: [4]f32 = .{ 0, 0, 0, 0 },
     buy_lists: [13]std.ArrayList(u32) = @splat(.empty),
     /// Every entity offered on the item tabs, by name; lists hold indices into this.
@@ -1046,7 +1058,7 @@ pub const App = struct {
     /// Applies the terrain brush at (x, y).
     fn brush(self: *App, x: f32, y: f32, dt: f32) void {
         const t = &self.world.terrain;
-        const radius: f32 = 7.0;
+        const radius: f32 = if (self.tool == .cliff or self.tool == .ditch) 4.0 else 7.0;
         const sx = t.spacingX();
         const sy = t.spacingY();
         const x0: usize = @intFromFloat(@max(0, (x - radius) / sx));
@@ -1062,12 +1074,22 @@ pub const App = struct {
                 const d = @sqrt(dx * dx + dy * dy);
                 if (d >= radius) continue;
                 const f = (1 - (d / radius) * (d / radius));
-                const w = f * f;
+                // cliffs and ditches have a steep, nearly flat-topped profile
+                const w = if (self.tool == .cliff or self.tool == .ditch) std.math.clamp(f * 3, 0, 1) else f * f;
                 const z = &t.z[j * t.width + i];
                 switch (self.tool) {
                     .raise => z.* += 6.0 * dt * w,
                     .lower => z.* -= 6.0 * dt * w,
                     .flatten => z.* += (self.flatten_to - z.*) * @min(1.0, 8.0 * dt) * w,
+                    .cliff => z.* += 14.0 * dt * w,
+                    .ditch => z.* -= 14.0 * dt * w,
+                    .smooth => {
+                        const l = if (i > 0) t.z[j * t.width + i - 1] else z.*;
+                        const r = if (i + 1 < t.width) t.z[j * t.width + i + 1] else z.*;
+                        const u = if (j > 0) t.z[(j - 1) * t.width + i] else z.*;
+                        const dn = if (j + 1 < t.height) t.z[(j + 1) * t.width + i] else z.*;
+                        z.* += ((l + r + u + dn) / 4 - z.*) * @min(1.0, 6.0 * dt) * w;
+                    },
                     else => {},
                 }
             }
@@ -1487,8 +1509,22 @@ pub const App = struct {
 
     /// Star rating from how happy guests are: 1 to 5.
     pub fn stars(self: *const App) f32 {
-        const h = self.sim.happiness();
-        return std.math.clamp(1 + @floor(h / 25.0), 1, 5);
+        return std.math.clamp(@floor(self.fame), 1, 5);
+    }
+
+    /// Fame drifts slowly towards what the zoo deserves: guest happiness,
+    /// capped by how many animals there are to see (a new zoo starts at one star).
+    fn updateFame(self: *App, dt: f32) void {
+        const guests = self.sim.liveGuests();
+        var target: f32 = 1;
+        if (guests > 0) {
+            const animals: f32 = @floatFromInt(self.countAnimals());
+            const cap = 1 + animals * 0.5;
+            target = @min(1 + self.sim.happiness() / 25.0, cap);
+        }
+        target = std.math.clamp(target, 1, 5.99);
+        const step = 0.03 * dt;
+        self.fame += std.math.clamp(target - self.fame, -step, step);
     }
 
     /// The inheritance chain of an entity, cached.
@@ -2470,6 +2506,11 @@ pub const App = struct {
             .open_saves => self.openMenu(.saves),
             .open_maps => self.openMenu(.maps),
             .open_settings => self.openMenu(.settings),
+            .gender_male, .gender_female => {
+                self.buy_female = a == .gender_female;
+                self.buy_scroll = 0;
+                self.buildBuyLists();
+            },
             .open_goals => self.openMenu(.goals),
             .open_campaigns => {
                 self.loadCampaigns();
@@ -2848,7 +2889,12 @@ pub const App = struct {
         }
         for (self.actor_names.items, 0..) |n, i| {
             if (sim_mod.classify(n) == .animal) {
-                if (std.mem.indexOf(u8, n, "Adult") != null and std.mem.indexOf(u8, n, "uper") == null) add(self, .animal, i);
+                if (std.mem.indexOf(u8, n, "Adult") != null and std.mem.indexOf(u8, n, "uper") == null) {
+                    const male = std.mem.endsWith(u8, n, "_M");
+                    const female = std.mem.endsWith(u8, n, "_F");
+                    if ((male and self.buy_female) or (female and !self.buy_female)) continue;
+                    add(self, .animal, i);
+                }
             } else if (!sim_mod.isGuest(n)) add(self, .staff, i);
         }
     }
@@ -3015,6 +3061,7 @@ pub const App = struct {
             self.buy_rect = .{ 0, 0, 0, 0 };
             return;
         }
+        if (cat == 1) if (shell.find("buy animal gender toggleset")) |n| uilayout.drawAt(d, n, .{ ox + 6 * s, oy + 190 * s, 450 * s, 256 * s });
         // Item grid inside the panel background.
         const gx = 292 * s;
         const gy = oy + 222 * s;
@@ -3441,8 +3488,13 @@ pub const App = struct {
         if (eq(name, "hill")) return .{ .tool = .raise };
         if (eq(name, "valley")) return .{ .tool = .lower };
         if (eq(name, "flatten")) return .{ .tool = .flatten };
+        if (eq(name, "cliff")) return .{ .tool = .cliff };
+        if (eq(name, "ditch")) return .{ .tool = .ditch };
+        if (eq(name, "smooth")) return .{ .tool = .smooth };
         if (eq(name, "Zoofinance")) return .{ .menu = .open_finances };
         if (eq(name, "scenariogoals")) return .{ .menu = .open_goals };
+        if (eq(name, "Male button")) return .{ .menu = .gender_male };
+        if (eq(name, "Female Button")) return .{ .menu = .gender_female };
         if (eq(name, "zoo info tab")) return .{ .status_tab = 0 };
         if (eq(name, "balance sheet tab")) return .{ .status_tab = 1 };
         if (eq(name, "graphs tab")) return .{ .status_tab = 2 };
@@ -3485,9 +3537,14 @@ pub const App = struct {
             if (eq(n.name, "Animal Info Tab Button") or eq(n.name, "Guest Info Status Tab")) info.on = self.info_tab == 1;
             if (eq(n.name, "Animal Info Conservation Tab")) info.on = self.info_tab == 2;
             if (eq(n.name, "track camera button")) info.on = self.track_id != null;
+            if (eq(n.name, "Male button")) info.on = !self.buy_female;
+            if (eq(n.name, "Female Button")) info.on = self.buy_female;
             if (eq(n.name, "hill")) info.on = self.tool == .raise;
             if (eq(n.name, "valley")) info.on = self.tool == .lower;
             if (eq(n.name, "flatten")) info.on = self.tool == .flatten;
+            if (eq(n.name, "cliff")) info.on = self.tool == .cliff;
+            if (eq(n.name, "ditch")) info.on = self.tool == .ditch;
+            if (eq(n.name, "smooth")) info.on = self.tool == .smooth;
             if (eq(n.name, "pause")) info.on = self.paused;
             if (eq(n.name, "delete")) info.on = self.delete_mode;
             if (eq(n.name, "zoo info tab")) info.on = self.status_tab == 0;
@@ -4059,7 +4116,7 @@ pub const App = struct {
             .flatten => if (hit) |h| {
                 self.flatten_to = h[2];
             },
-            .raise, .lower => {},
+            .raise, .lower, .cliff, .ditch, .smooth => {},
         }
     }
 
@@ -4147,6 +4204,9 @@ pub const App = struct {
             .raise => "HOLD LEFT MOUSE TO RAISE THE GROUND",
             .lower => "HOLD LEFT MOUSE TO LOWER THE GROUND",
             .flatten => "CLICK TO PICK A HEIGHT, THEN HOLD TO FLATTEN TO IT",
+            .cliff => "HOLD LEFT MOUSE TO RAISE A STEEP CLIFF",
+            .ditch => "HOLD LEFT MOUSE TO DIG A NARROW DITCH",
+            .smooth => "HOLD LEFT MOUSE TO SMOOTH THE GROUND",
             .actor => "CLICK THE GROUND TO PLACE. [ ] CHANGE ANIMAL OR PERSON",
             .food => "CLICK TO PLACE A FEEDER. F REFILLS THE SELECTED ONE (SHIFT: ALL)",
         };
@@ -4560,7 +4620,7 @@ pub const App = struct {
             const r = ctx.cam.ray(ctx.mouse[0], ctx.mouse[1], @floatFromInt(ctx.win_width), @floatFromInt(ctx.win_height));
             self.hover = if (self.over_ui) null else terrainHit(&self.world.terrain, r.origin, r.dir);
             if (self.lmb and self.hover != null) switch (self.tool) {
-                .raise, .lower, .flatten => self.brush(self.hover.?[0], self.hover.?[1], ctx.dt),
+                .raise, .lower, .flatten, .cliff, .ditch, .smooth => self.brush(self.hover.?[0], self.hover.?[1], ctx.dt),
                 .path => self.placePath(self.hover.?) catch {},
                 else => {},
             };
@@ -4582,6 +4642,7 @@ pub const App = struct {
             self.updateGuestCap();
             if (!self.paused and self.menu == .none) {
                 self.sim.advance(&self.world, ctx.dt * self.speed);
+                self.updateFame(ctx.dt * self.speed);
                 if (self.scen) |m| {
                     m.update(ctx.dt * self.speed);
                     if (m.roots.items.len > 0 and m.roots.items[0].state == .success) self.markScenarioDone();
