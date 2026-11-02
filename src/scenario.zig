@@ -708,6 +708,9 @@ pub const Manager = struct {
             const sz = e.size orelse .{ 70, 70 };
             pushRect(L, p[0], p[1], sz[0], sz[1]);
             return 1;
+        } else if (eq(u8, method, "UI_GET_VALUE")) {
+            c.lua_pushnumber(L, 0);
+            return 1;
         } else if (eq(u8, method, "UI_GET_PARENT")) {
             var nb: [110]u8 = undefined;
             const pn = std.fmt.bufPrint(&nb, "{s} parent", .{name}) catch name;
@@ -734,6 +737,12 @@ pub const Manager = struct {
             if (n.on_success) |s| _ = self.call(n, s);
             return n.name;
         };
+        return null;
+    }
+
+    /// The first goal still waiting on the player, if any.
+    pub fn currentPending(self: *Manager) ?*Node {
+        for (self.roots.items) |r| if (firstPending(r)) |n| return n;
         return null;
     }
 
@@ -1147,7 +1156,7 @@ fn componentCall(L: ?*c.lua_State) callconv(.c) c_int {
     if (std.mem.startsWith(u8, comp, "ui:")) return m.uiCall(L, comp[3..], method);
     if (m.handleCall(L, comp, method)) |n| return n;
     // Bookkeeping the original used for its own UI and unlock tracking.
-    const quiet = [_][]const u8{ "ZT_SET_MAX_FAME_REACHED", "ZT_SET_TUTORIALRULE_ACTIVE", "ZT_ENABLE_ADOPTION", "sendMessage" };
+    const quiet = [_][]const u8{ "ZT_SET_MAX_FAME_REACHED", "ZT_SET_TUTORIALRULE_ACTIVE", "ZT_ENABLE_ADOPTION", "sendMessage", "ZT_SETMODE", "ZT_RESEARCH_UNLOCK_ENTITY_KIND" };
     for (quiet) |q| if (std.mem.eql(u8, method, q)) return 0;
     var nb: [400]u8 = undefined;
     if (script.currentEngine()) |e| {

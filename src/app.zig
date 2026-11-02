@@ -339,6 +339,10 @@ pub const App = struct {
     /// Key of the campaign scenario being played (for saving progress).
     scen_key: [64]u8 = undefined,
     scen_key_len: usize = 0,
+    /// The goal the player has been on, and since when (to offer a skip in tutorials).
+    scen_tutorial: bool = false,
+    hint_node: ?*const scenario_mod.Node = null,
+    hint_since: f64 = 0,
     /// The outcome already announced for the running scenario's goals.
     scen_result: scenario_mod.Outcome = .running,
     camp_arena: std.heap.ArenaAllocator = undefined,
@@ -1946,6 +1950,7 @@ pub const App = struct {
     /// current zoo.
     fn startScenario(self: *App, goals: []const u8) void {
         self.scen_result = .running;
+        self.scen_tutorial = std.ascii.findIgnoreCase(goals, "tutorial") != null;
         if (self.scen) |m| {
             m.destroy();
             self.scen = null;
@@ -2328,6 +2333,7 @@ pub const App = struct {
             .{ .n = "backspace", .c = 42 },
             .{ .n = "f5", .c = sc.f5 },
             .{ .n = "f9", .c = sc.f9 },
+            .{ .n = "f10", .c = sc.f10 },
             .{ .n = "f1", .c = sc.f1 },
             .{ .n = "f2", .c = sc.f2 },
             .{ .n = "f3", .c = sc.f3 },
@@ -5017,6 +5023,16 @@ pub const App = struct {
                 if (self.scen) |m| {
                     self.syncUiState();
                     m.update(ctx.dt * self.speed);
+                    if (self.scen_tutorial) {
+                        const cur: ?*const scenario_mod.Node = m.currentPending();
+                        if (cur != self.hint_node) {
+                            self.hint_node = cur;
+                            self.hint_since = self.app_time;
+                        } else if (cur != null and self.app_time - self.hint_since > 90) {
+                            self.hint_since = self.app_time;
+                            self.pushAlert(2, "STUCK ON A GOAL? PRESS F10 TO SKIP IT", .{});
+                        }
+                    }
                     if (m.roots.items.len > 0) {
                         const st = m.roots.items[0].state;
                         if (st == .success) self.markScenarioDone();
