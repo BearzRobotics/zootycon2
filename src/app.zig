@@ -2132,6 +2132,14 @@ pub const App = struct {
             if (eq(u8, name, "cam_zoom")) return fc.cam.dist;
             if (eq(u8, name, "cam_yaw")) return fc.cam.yaw;
         }
+        if (std.mem.startsWith(u8, name, "biome:")) {
+            const t = &self.world.terrain;
+            var n: f64 = 0;
+            for (t.paint) |pi| {
+                if (pi < t.biomes.len and std.ascii.eqlIgnoreCase(t.biomes[pi], name[6..])) n += 1;
+            }
+            return n;
+        }
         if (std.mem.startsWith(u8, name, "eco:")) return self.ecoFigure(name);
         if (eq(u8, name, "guests_total")) return @floatFromInt(self.sim.zoo.guests_total);
         if (eq(u8, name, "admission")) return self.sim.adult_price;

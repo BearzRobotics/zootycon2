@@ -493,6 +493,12 @@ pub const Manager = struct {
                 c.lua_pushnil(L);
                 return 1;
             }
+            if (eq(u8, method, "ZT_GET_BIOME_COUNT")) {
+                var nb: [96]u8 = undefined;
+                const key = std.fmt.bufPrint(&nb, "biome:{s}", .{l.str(L, 2) orelse ""}) catch "biome:";
+                c.lua_pushnumber(L, h.stat(h.ctx, key));
+                return 1;
+            }
             if (eq(u8, method, "ZT_GET_REAL_TIME")) {
                 c.lua_pushnumber(L, h.stat(h.ctx, "simtime"));
                 return 1;
