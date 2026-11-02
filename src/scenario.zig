@@ -91,10 +91,15 @@ pub const Host = struct {
     /// Concrete (non-abstract) type names under a category, like `animal`.
     /// Puts an entity (by binder name) at a spot, free of charge.
     place: *const fn (ctx: *anyopaque, binder: []const u8, x: f32, y: f32, rot: f32) void = noPlace,
+    /// A shared data attribute of a binder (species), as text.
+    binder_attr: *const fn (ctx: *anyopaque, binder: []const u8, name: []const u8) ?[]const u8 = noBinderAttr,
     leaf_types: *const fn (ctx: *anyopaque, gpa: std.mem.Allocator, kind: []const u8, out: *std.ArrayList([]const u8)) void = noLeaves,
 };
 
 fn noPlace(_: *anyopaque, _: []const u8, _: f32, _: f32, _: f32) void {}
+fn noBinderAttr(_: *anyopaque, _: []const u8, _: []const u8) ?[]const u8 {
+    return null;
+}
 fn noLeaves(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: *std.ArrayList([]const u8)) void {}
 
 fn noEntities(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: bool, _: *std.ArrayList(u32)) void {}
@@ -140,6 +145,8 @@ pub const Manager = struct {
     accum: f32 = 0,
     interval: f32 = 2,
     outcome: Outcome = .running,
+    /// Print every component call scripts make (debugging).
+    trace: bool = false,
     /// Lines scripts asked to show (win/fail panels, hints), oldest first.
     messages: std.ArrayList([]const u8) = .empty,
     log: bool = false,
@@ -373,6 +380,12 @@ pub const Manager = struct {
     /// Gives up on a rule whose script keeps failing, so the player is not left
     /// waiting on it; a challenge is also taken off the offer list.
     fn dropRule(self: *Manager, n: *Node, act: Action) void {
+        // A campaign goal whose script errors (usually a feature we lack) just stays
+        // unmet: failing it would end the scenario for a bug the player cannot fix.
+        if (std.mem.indexOf(u8, act.script, "/challenge/") == null) {
+            n.errors = 0;
+            return;
+        }
         n.state = .failed;
         if (self.log) std.debug.print("scenario: dropped rule {s} ({s}) after repeated errors\n", .{ n.name, act.script });
         if (std.mem.indexOf(u8, act.script, "/challenge/") != null) {
@@ -478,6 +491,7 @@ pub const Manager = struct {
                 var ids: std.ArrayList(u32) = .empty;
                 defer ids.deinit(self.gpa);
                 h.entities(h.ctx, self.gpa, kind, direct, &ids);
+                if (self.trace) std.debug.print("  -> {d} entities\n", .{ids.items.len});
                 c.lua_newtable(L);
                 for (ids.items, 1..) |id, i| {
                     c.lua_pushnumber(L, @floatFromInt(i));
@@ -526,6 +540,16 @@ pub const Manager = struct {
                 return 0;
             }
             if (eq(u8, method, "ZT_NAME_ENTITY")) return 0;
+            if ((eq(u8, method, "BFG_GET_ATTR_STRING") or eq(u8, method, "BFG_GET_ATTR_FLOAT")) and c.lua_type(L, 2) == c.LUA_TTABLE) {
+                // {key=<binder>, val=<attribute>}: an attribute of a species' data
+                const binder = tableStr(L, 2, "key") orelse "";
+                const attr = tableStr(L, 2, "val") orelse "";
+                const v = h.binder_attr(h.ctx, binder, attr);
+                if (eq(u8, method, "BFG_GET_ATTR_STRING")) {
+                    if (v) |t| l.pushStr(L, t) else c.lua_pushnil(L);
+                } else c.lua_pushnumber(L, if (v) |t| (std.fmt.parseFloat(f64, t) catch 0) else 0);
+                return 1;
+            }
             if (eq(u8, method, "ZT_GET_BIOME_COUNT")) {
                 var nb: [96]u8 = undefined;
                 const key = std.fmt.bufPrint(&nb, "biome:{s}", .{l.str(L, 2) orelse ""}) catch "biome:";
@@ -684,6 +708,15 @@ pub const Manager = struct {
             const sz = e.size orelse .{ 70, 70 };
             pushRect(L, p[0], p[1], sz[0], sz[1]);
             return 1;
+        } else if (eq(u8, method, "UI_GET_PARENT")) {
+            var nb: [110]u8 = undefined;
+            const pn = std.fmt.bufPrint(&nb, "{s} parent", .{name}) catch name;
+            st.at(pn).loaded = true;
+            var nb2: [120]u8 = undefined;
+            pushComponent(L, std.fmt.bufPrint(&nb2, "ui:{s}", .{pn}) catch "ui:");
+            return 1;
+        } else if (eq(u8, method, "UI_SET_VALUE") or eq(u8, method, "UI_WIND_ANIMATION") or eq(u8, method, "UI_SET_MODAL") or eq(u8, method, "UI_SET_ANIM_RECT_START") or eq(u8, method, "UI_SET_ANIM_RECT_END") or eq(u8, method, "UI_RAISE") or eq(u8, method, "ZT_AUTOPOPULATE_LIST")) {
+            // presentation only: animation, stacking order, list filling
         } else {
             // placement, animation and sound calls have no effect here
             var nb: [160]u8 = undefined;
@@ -913,6 +946,27 @@ fn entityCall(L: ?*c.lua_State) callconv(.c) c_int {
     } else if (eq(u8, method, "BFG_GET_ATTR_STRING")) {
         if (h.attr_str(h.ctx, id, l.str(L, 2) orelse "")) |v| l.pushStr(L, v) else c.lua_pushnil(L);
         return 1;
+    } else if (eq(u8, method, "BFG_GET_LOCATION") or eq(u8, method, "BFG_GET_PRIMARY_BIOME")) {
+        const key: []const u8 = if (eq(u8, method, "BFG_GET_LOCATION")) "@location" else "@primarybiome";
+        if (h.attr_str(h.ctx, id, key)) |v| l.pushStr(L, v) else c.lua_pushnil(L);
+        return 1;
+    } else if (eq(u8, method, "BFG_CAN_MATE_WITH")) {
+        // a male and a female adult of one species
+        var ok = false;
+        if (handleOf(L, 2)) |o| {
+            const other: u32 = @intFromFloat(o);
+            const a = h.binder(h.ctx, id);
+            const b = h.binder(h.ctx, other);
+            const sa = h.attr_str(h.ctx, id, "s_Species") orelse "";
+            const sb = h.attr_str(h.ctx, other, "s_Species") orelse "";
+            const male_a = std.mem.endsWith(u8, a, "_M");
+            const male_b = std.mem.endsWith(u8, b, "_M");
+            const fem_a = std.mem.endsWith(u8, a, "_F");
+            const fem_b = std.mem.endsWith(u8, b, "_F");
+            ok = std.mem.eql(u8, sa, sb) and ((male_a and fem_b) or (fem_a and male_b)) and std.mem.indexOf(u8, a, "Adult") != null and std.mem.indexOf(u8, b, "Adult") != null;
+        }
+        c.lua_pushboolean(L, @intFromBool(ok));
+        return 1;
     } else if (eq(u8, method, "isKindOf")) {
         c.lua_pushboolean(L, @intFromBool(h.kind_of(h.ctx, id, l.str(L, 2) orelse "")));
         return 1;
@@ -1080,8 +1134,21 @@ fn componentCall(L: ?*c.lua_State) callconv(.c) c_int {
     const comp = std.mem.span(c.lua_tostring(L, upvalue_base - 1));
     const method = std.mem.span(c.lua_tostring(L, upvalue_base - 2));
     const m = active orelse return 0;
+    if (m.trace and !std.mem.startsWith(u8, comp, "ui:")) std.debug.print("call {s}:{s}({s},{s})\n", .{ comp, method, if (c.lua_type(L, 2) == c.LUA_TTABLE) "<table>" else (l.str(L, 2) orelse "<nonstr>"), if (c.lua_type(L, 3) == c.LUA_TTABLE) "<table>" else (l.str(L, 3) orelse "<nonstr>") });
+    if (m.trace and c.lua_type(L, 2) == c.LUA_TTABLE and !std.mem.startsWith(u8, comp, "ui:")) {
+        c.lua_pushnil(L);
+        while (c.lua_next(L, 2) != 0) {
+            const kt = c.lua_type(L, -2);
+            const vt = c.lua_type(L, -1);
+            if (kt == c.LUA_TSTRING and (vt == c.LUA_TSTRING or vt == c.LUA_TNUMBER)) std.debug.print("   arg {s} = {s}\n", .{ std.mem.span(c.lua_tostring(L, -2)), std.mem.span(c.lua_tostring(L, -1)) });
+            c.lua_pop(L, 1);
+        }
+    }
     if (std.mem.startsWith(u8, comp, "ui:")) return m.uiCall(L, comp[3..], method);
     if (m.handleCall(L, comp, method)) |n| return n;
+    // Bookkeeping the original used for its own UI and unlock tracking.
+    const quiet = [_][]const u8{ "ZT_SET_MAX_FAME_REACHED", "ZT_SET_TUTORIALRULE_ACTIVE", "ZT_ENABLE_ADOPTION", "sendMessage" };
+    for (quiet) |q| if (std.mem.eql(u8, method, q)) return 0;
     var nb: [400]u8 = undefined;
     if (script.currentEngine()) |e| {
         var w: std.Io.Writer = .fixed(&nb);

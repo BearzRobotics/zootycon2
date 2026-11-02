@@ -1964,6 +1964,7 @@ pub const App = struct {
             .ctx = self,
             .entities = scenEntities,
             .leaf_types = scenLeaves,
+            .binder_attr = scenBinderAttr,
             .place = scenPlace,
             .attr = scenAttr,
             .set_attr = scenSetAttr,
@@ -1985,7 +1986,10 @@ pub const App = struct {
         m.challenge_mode = std.mem.endsWith(u8, goals, "challengegoals.xml");
         m.log = self.opts.scenario_log;
         m.eng.log = self.opts.scenario_log;
+        m.trace = std.c.getenv("ZT_TRACE") != null;
         self.scen = m;
+        // The map's animals must exist before the first check, or sticky rules that count them fail at once.
+        self.sim.sync(&self.world) catch {};
         self.syncUiState();
         m.tick();
     }
@@ -2155,6 +2159,35 @@ pub const App = struct {
     fn scenAttrStr(ctx: *anyopaque, id: u32, name: []const u8) ?[]const u8 {
         const self: *App = @ptrCast(@alignCast(ctx));
         const chain = self.chainFor(scenBinder(ctx, id)) orelse return null;
+        if (name.len > 0 and name[0] == '@') {
+            // Where the species comes from, and the biome it likes best (from BFGBiomeData).
+            if (std.mem.eql(u8, name, "@location")) return entity.Registry.attr(chain, .shared, "BFGBiomeData", "location");
+            var i = chain.len;
+            while (i > 0) {
+                i -= 1;
+                const sec = chain[i].section(.shared) orelse continue;
+                const bd = for (sec.children) |ch| {
+                    if (std.ascii.eqlIgnoreCase(ch.name, "BFGBiomeData")) break ch;
+                } else continue;
+                var best: ?[]const u8 = null;
+                var bv: f32 = -1000;
+                for (sim_mod.habitat_biomes) |bn| for (bd.children) |c| if (std.ascii.eqlIgnoreCase(c.name, bn)) {
+                    const v = std.fmt.parseFloat(f32, c.attr("sensitivity") orelse "0") catch 0;
+                    if (v > bv) {
+                        bv = v;
+                        best = bn;
+                    }
+                };
+                return best;
+            }
+            return null;
+        }
+        return entity.Registry.attr(chain, .shared, "BFAIEntityDataShared", name);
+    }
+
+    fn scenBinderAttr(ctx: *anyopaque, binder: []const u8, name: []const u8) ?[]const u8 {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        const chain = self.chainFor(binder) orelse return null;
         return entity.Registry.attr(chain, .shared, "BFAIEntityDataShared", name);
     }
 
