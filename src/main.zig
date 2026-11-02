@@ -476,6 +476,8 @@ pub fn main(init: std.process.Init) !void {
             } else if (std.mem.eql(u8, arg, "--script") and k + 1 < rest.len) {
                 k += 1;
                 aopts.script = rest[k];
+            } else if (std.mem.eql(u8, arg, "--scenario-log")) {
+                aopts.scenario_log = true;
             } else if (std.mem.eql(u8, arg, "--scenario") and k + 1 < rest.len) {
                 k += 1;
                 aopts.scenario = rest[k];

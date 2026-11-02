@@ -220,6 +220,7 @@ pub const Options = struct {
     script: []const u8 = "",
     /// Goals file of a scenario to play on the loaded map.
     scenario: []const u8 = "",
+    scenario_log: bool = false,
     /// Virtual mouse and keyboard, played through the real event queue one
     /// action per frame, separated by `;`:
     ///   move X Y        pointer to window position
@@ -1375,7 +1376,10 @@ pub const App = struct {
             self.rebuildActors() catch {};
             self.loadFoodTasks();
             var t: f32 = 0;
-            while (t < secs) : (t += 0.2) self.sim.advance(&self.world, 0.2);
+            while (t < secs) : (t += 0.2) {
+                self.sim.advance(&self.world, 0.2);
+                if (self.scen) |m| m.update(0.2);
+            }
         } else if (std.mem.eql(u8, verb, "propname")) {
             self.prop_i = pickByName(self.props.items, it.rest()) orelse return error.NotFound;
         } else if (std.mem.eql(u8, verb, "actorname")) {
@@ -1866,6 +1870,10 @@ pub const App = struct {
             .entities = scenEntities,
             .attr = scenAttr,
             .set_attr = scenSetAttr,
+            .selected = scenSelected,
+            .attr_bool = scenAttrBool,
+            .attr_str = scenAttrStr,
+            .kind_of = scenKindOf,
             .binder = scenBinder,
             .stat = scenStat,
             .give_cash = scenGiveCash,
@@ -1875,6 +1883,8 @@ pub const App = struct {
             m.destroy();
             return;
         };
+        m.log = self.opts.scenario_log;
+        m.eng.log = self.opts.scenario_log;
         self.scen = m;
         m.tick();
     }
@@ -1905,9 +1915,36 @@ pub const App = struct {
         const self: *App = @ptrCast(@alignCast(ctx));
         if (id & prop_handle != 0) return null;
         const ag = self.sim.agentFor(id) orelse return null;
+        if (std.ascii.eqlIgnoreCase(name, "environment")) return if (ag.habitat != null) 100 - @as(f64, ag.hab_score) else 0;
         const b = ag.brain orelse return null;
         for (ai.need_names, 0..) |n, i| if (std.ascii.eqlIgnoreCase(n, name)) return b.needs[i];
         return null;
+    }
+
+    fn scenSelected(ctx: *anyopaque) ?u32 {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        const sel = self.selected orelse return null;
+        return switch (sel.kind) {
+            .actor => sel.id,
+            .prop => sel.id | prop_handle,
+            else => null,
+        };
+    }
+
+    fn scenAttrBool(ctx: *anyopaque, id: u32, name: []const u8) bool {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        return hookFlag(self, scenBinder(ctx, id), name);
+    }
+
+    fn scenAttrStr(ctx: *anyopaque, id: u32, name: []const u8) ?[]const u8 {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        const chain = self.chainFor(scenBinder(ctx, id)) orelse return null;
+        return entity.Registry.attr(chain, .shared, "BFAIEntityDataShared", name);
+    }
+
+    fn scenKindOf(ctx: *anyopaque, id: u32, kind: []const u8) bool {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        return self.binderIs(scenBinder(ctx, id), kind, false);
     }
 
     fn scenSetAttr(ctx: *anyopaque, id: u32, name: []const u8, value: f64) void {
@@ -1937,6 +1974,26 @@ pub const App = struct {
         if (eq(u8, name, "time")) return self.tod;
         if (eq(u8, name, "fame")) return self.stars() * 2;
         if (eq(u8, name, "guests")) return @floatFromInt(self.sim.liveGuests());
+        if (eq(u8, name, "guests_total")) return @floatFromInt(self.sim.zoo.guests_total);
+        if (eq(u8, name, "admission")) return self.sim.adult_price;
+        if (eq(u8, name, "is_campaign")) return if (self.scen_key_len > 0) 1 else 0;
+        if (eq(u8, name, "simtime")) return @as(f64, @floatFromInt(self.sim.zoo.months)) * self.sim.month_secs + (self.sim.month_secs - self.sim.month_timer);
+        if (eq(u8, name, "income")) {
+            var t: f64 = 0;
+            for (self.sim.zoo.month.earned) |v| t += v;
+            return t;
+        }
+        if (eq(u8, name, "profit")) {
+            var t: f64 = 0;
+            for (self.sim.zoo.month.earned) |v| t += v;
+            for (self.sim.zoo.month.spent) |v| t -= v;
+            return t;
+        }
+        if (eq(u8, name, "lifetime_income")) {
+            var t: f64 = 0;
+            for (self.sim.zoo.total.earned) |v| t += v;
+            return t;
+        }
         return 0;
     }
 
@@ -3570,6 +3627,12 @@ pub const App = struct {
         ui.template("blank", px, py, pw, ph, scale / 2, 1);
         _ = try ui.text(px + 16 * ts, py + 10 * ts, ts * 1.4, "GOALS", .{ 1, 0.92, 0.5, 1 });
         var y = py + 34 * ts;
+        if (self.scen) |sm| if (sm.intro.len > 0) {
+            var ib: [96]u8 = undefined;
+            const t = sm.loc.get(sm.intro) orelse sm.intro;
+            const up = std.ascii.upperString(&ib, t[0..@min(t.len, ib.len)]);
+            _ = try ui.text(px + 16 * ts + 70 * ts, py + 12 * ts, ts, up, .{ 0.8, 0.85, 0.9, 1 });
+        };
         const cols: usize = @intFromFloat(@max(20, (pw - 70 * ts) / (6 * ts)));
         const m = self.scen orelse {
             _ = try ui.text(px + 16 * ts, y, ts, "THIS ZOO HAS NO SCENARIO GOALS.", .{ 0.8, 0.85, 0.9, 1 });
@@ -3587,11 +3650,13 @@ pub const App = struct {
                 sp += 1;
             }
         }
+        var overview: []const u8 = "";
         while (sp > 0 and y < py + ph - 40 * ts) {
             sp -= 1;
             const n = stack[sp];
             const d = depth[sp];
             if (!n.is_group and !n.hidden) {
+                if (overview.len == 0 and n.state == .pending) overview = m.overviewFor(n);
                 const text = m.textFor(n);
                 const mark: []const u8 = switch (n.state) {
                     .pending => "[ ]",
@@ -3615,6 +3680,12 @@ pub const App = struct {
                     sp += 1;
                 }
             }
+        }
+        if (overview.len > 0 and y < py + ph - 60 * ts) {
+            y += 6 * ts;
+            _ = try ui.text(px + 16 * ts, y, ts, "OVERVIEW", .{ 1, 0.92, 0.5, 1 });
+            y += 12 * ts;
+            _ = try self.wrapText(ui, px + 16 * ts, y, ts * 0.85, @intFromFloat(@as(f32, @floatFromInt(cols)) * 1.1), overview, .{ 0.8, 0.85, 0.9, 1 });
         }
         return self.goalsClose(ui, px, py, pw, ph, ts);
     }

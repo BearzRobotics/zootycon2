@@ -68,8 +68,15 @@ pub const Host = struct {
     /// A number about an entity (`hunger`, `hygiene`...), if it has one.
     attr: *const fn (ctx: *anyopaque, id: u32, name: []const u8) ?f64 = noAttr,
     set_attr: *const fn (ctx: *anyopaque, id: u32, name: []const u8, value: f64) void = noSetAttr,
+    /// Entity flags (`b_Adult`) and text attributes (`s_Name`).
+    attr_bool: *const fn (ctx: *anyopaque, id: u32, name: []const u8) bool = noBool,
+    attr_str: *const fn (ctx: *anyopaque, id: u32, name: []const u8) ?[]const u8 = noStr,
+    /// Whether the entity is of a kind (category, species or binder).
+    kind_of: *const fn (ctx: *anyopaque, id: u32, kind: []const u8) bool = noKind,
     /// The entity's binder name.
     binder: *const fn (ctx: *anyopaque, id: u32) []const u8 = noBinder,
+    /// The entity the player has selected, if any.
+    selected: *const fn (ctx: *anyopaque) ?u32 = noSelected,
     /// Zoo-wide numbers by name: `cash`, `month`, `day`, `time`, `fame`
     /// (in half stars), `guests`.
     stat: *const fn (ctx: *anyopaque, name: []const u8) f64 = noStat,
@@ -79,6 +86,18 @@ pub const Host = struct {
 fn noEntities(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: bool, _: *std.ArrayList(u32)) void {}
 fn noAttr(_: *anyopaque, _: u32, _: []const u8) ?f64 {
     return null;
+}
+fn noSelected(_: *anyopaque) ?u32 {
+    return null;
+}
+fn noBool(_: *anyopaque, _: u32, _: []const u8) bool {
+    return false;
+}
+fn noStr(_: *anyopaque, _: u32, _: []const u8) ?[]const u8 {
+    return null;
+}
+fn noKind(_: *anyopaque, _: u32, _: []const u8) bool {
+    return false;
 }
 fn noSetAttr(_: *anyopaque, _: u32, _: []const u8, _: f64) void {}
 fn noBinder(_: *anyopaque, _: u32) []const u8 {
@@ -108,6 +127,8 @@ pub const Manager = struct {
     messages: std.ArrayList([]const u8) = .empty,
     log: bool = false,
     host: Host = .{},
+    /// Localized id of the scenario's introduction (the root's `info`).
+    intro: []const u8 = "",
 
     pub fn create(gpa: std.mem.Allocator, vfs: *vfs_mod.Vfs, loc: *const loc_mod.Loc) !*Manager {
         const eng = try script.Engine.create(gpa, vfs);
@@ -138,6 +159,9 @@ pub const Manager = struct {
         const root = try xml.parse(scratch.allocator(), data, null);
         const node = try self.buildNode(root);
         if (std.ascii.eqlIgnoreCase(root.name, "ZTScenarioMgr")) {
+            if (root.child("info")) |inf| if (inf.attr("locid")) |id| {
+                self.intro = try self.dup(id);
+            };
             if (root.attr("interval")) |v| self.interval = std.fmt.parseFloat(f32, v) catch self.interval;
         }
         try self.roots.append(self.gpa, node);
@@ -307,6 +331,18 @@ pub const Manager = struct {
         return self.loc.get(pick[1]) orelse pick[1];
     }
 
+    /// The longer text of a rule for its current state, if it has one.
+    pub fn overviewFor(self: *const Manager, n: *const Node) []const u8 {
+        const pick = switch (n.state) {
+            .pending => .{ n.alt_neutral_overview, n.info.neutral_overview },
+            .success => .{ n.alt_success_overview, n.info.success_overview },
+            .failed => .{ null, n.info.failure_overview },
+        };
+        if (pick[0]) |t| return t;
+        if (pick[1].len == 0) return "";
+        return self.loc.get(pick[1]) orelse "";
+    }
+
     // ------------------------------------------------------------ vars
 
     pub fn setVar(self: *Manager, key: []const u8, value: []const u8) void {
@@ -330,6 +366,14 @@ pub const Manager = struct {
         const h = self.host;
         const eq = std.mem.eql;
         if (eq(u8, comp, "BFGManager")) {
+            if (eq(u8, method, "BFG_GET_SELECTED_ENTITY")) {
+                if (h.selected(h.ctx)) |id| {
+                    pushEntity(L, id);
+                    return 1;
+                }
+                c.lua_pushnil(L);
+                return 1;
+            }
             const direct = eq(u8, method, "BFG_GET_ENTITIES_DIRECT");
             if (direct or eq(u8, method, "BFG_GET_ENTITIES")) {
                 const kind = l.str(L, 2) orelse "";
@@ -348,6 +392,39 @@ pub const Manager = struct {
                 return 1;
             }
         } else if (eq(u8, comp, "ZTStatus")) {
+            const simple = [_]struct { m: []const u8, n: []const u8 }{
+                .{ .m = "ZT_GET_ZOO_CASH", .n = "cash" },
+                .{ .m = "ZT_GET_ZOO_FAME", .n = "fame" },
+                .{ .m = "ZT_GET_ZOO_INCOME", .n = "income" },
+                .{ .m = "ZT_GET_ZOO_PROFIT", .n = "profit" },
+                .{ .m = "ZT_GET_ADMISSION_PRICE", .n = "admission" },
+                .{ .m = "ZT_GET_SIM_TIME", .n = "simtime" },
+                .{ .m = "ZT_GET_REAL_TIME", .n = "simtime" },
+                .{ .m = "ZT_GET_IS_CAMPAIGN", .n = "is_campaign" },
+                .{ .m = "ZT_GET_LIFETIME_INCOME", .n = "lifetime_income" },
+                .{ .m = "ZT_GET_LIFETIME_USERS", .n = "guests_total" },
+            };
+            for (simple) |sm| if (eq(u8, method, sm.m)) {
+                c.lua_pushnumber(L, h.stat(h.ctx, sm.n));
+                return 1;
+            };
+            if (eq(u8, method, "ZT_GET_IS_FREEFORM")) {
+                c.lua_pushnumber(L, 1 - h.stat(h.ctx, "is_campaign"));
+                return 1;
+            }
+            if (eq(u8, method, "ZT_SET_ZOO_CASH")) {
+                const want = if (c.lua_isnumber(L, 2) != 0) c.lua_tonumber(L, 2) else 0;
+                h.give_cash(h.ctx, want - h.stat(h.ctx, "cash"));
+                return 0;
+            }
+            if (eq(u8, method, "ZT_GET_ALL_ANIMALS_RELEASED") or eq(u8, method, "ZT_GET_ANIMALS_RELEASED") or eq(u8, method, "ZT_GET_ANIMALS_PUTUPFORADOPTION")) {
+                c.lua_newtable(L);
+                return 1;
+            }
+            if (eq(u8, method, "ZT_GET_DONATIONBYANIMALTYPE") or eq(u8, method, "ZT_GET_DONATION_ALLANIMALS") or eq(u8, method, "ZT_GET_DONATION_ENDANGERMENT")) {
+                c.lua_pushnumber(L, h.stat(h.ctx, "donations"));
+                return 1;
+            }
             const stat: ?[]const u8 = if (eq(u8, method, "ZT_GET_FAME_HALFSTARS")) "fame" else if (eq(u8, method, "ZT_GET_CURRENT_MONTH")) "month" else if (eq(u8, method, "ZT_GET_CURRENT_DAYOFMONTH")) "day" else if (eq(u8, method, "ZT_GET_CURRENT_TIMEOFDAY")) "time" else if (eq(u8, method, "ZT_GET_NUM_GUESTS")) "guests" else null;
             if (stat) |name| {
                 c.lua_pushnumber(L, h.stat(h.ctx, name));
@@ -424,21 +501,26 @@ fn apiTimeOfDay(L: ?*c.lua_State) callconv(.c) c_int {
     return 1;
 }
 
-/// `resolveTable(entry.value)` turns an entity handle into an object.
-fn apiResolve(L: ?*c.lua_State) callconv(.c) c_int {
-    if (c.lua_isnumber(L, 1) == 0) {
-        c.lua_pushnil(L);
-        return 1;
-    }
+/// An entity object for a handle: its methods are looked up on demand.
+fn pushEntity(L: ?*c.lua_State, id: u32) void {
     c.lua_newtable(L);
     c.lua_pushstring(L, "__ent");
-    c.lua_pushvalue(L, 1);
+    c.lua_pushnumber(L, @floatFromInt(id));
     c.lua_settable(L, -3);
     c.lua_newtable(L);
     c.lua_pushstring(L, "__index");
     c.lua_pushcclosure(L, entityIndex, 0);
     c.lua_settable(L, -3);
     _ = c.lua_setmetatable(L, -2);
+}
+
+/// `resolveTable(entry.value)` turns an entity handle into an object.
+fn apiResolve(L: ?*c.lua_State) callconv(.c) c_int {
+    if (c.lua_isnumber(L, 1) == 0) {
+        c.lua_pushnil(L);
+        return 1;
+    }
+    pushEntity(L, @intFromFloat(c.lua_tonumber(L, 1)));
     return 1;
 }
 
@@ -491,6 +573,25 @@ fn entityCall(L: ?*c.lua_State) callconv(.c) c_int {
     } else if (eq(u8, method, "BFG_SET_ATTR_FLOAT")) {
         if (c.lua_isnumber(L, 3) != 0) h.set_attr(h.ctx, id, l.str(L, 2) orelse "", c.lua_tonumber(L, 3));
         return 0;
+    } else if (eq(u8, method, "BFG_GET_ATTR_BOOLEAN")) {
+        c.lua_pushboolean(L, @intFromBool(h.attr_bool(h.ctx, id, l.str(L, 2) orelse "")));
+        return 1;
+    } else if (eq(u8, method, "BFG_GET_ATTR_STRING")) {
+        if (h.attr_str(h.ctx, id, l.str(L, 2) orelse "")) |v| l.pushStr(L, v) else c.lua_pushnil(L);
+        return 1;
+    } else if (eq(u8, method, "isKindOf")) {
+        c.lua_pushboolean(L, @intFromBool(h.kind_of(h.ctx, id, l.str(L, 2) orelse "")));
+        return 1;
+    } else if (eq(u8, method, "BFAI_GET_PRESSING_THRESHOLD")) {
+        c.lua_pushnumber(L, 60);
+        return 1;
+    } else if (eq(u8, method, "BFAI_GET_CRITICAL_THRESHOLD")) {
+        c.lua_pushnumber(L, 90);
+        return 1;
+    } else if (eq(u8, method, "BFAI_GET_TRIGGERED")) {
+        const v = h.attr(h.ctx, id, l.str(L, 2) orelse "") orelse 0;
+        c.lua_pushboolean(L, @intFromBool(v >= 60));
+        return 1;
     } else if (eq(u8, method, "BFG_GET_BINDER_TYPE")) {
         l.pushStr(L, h.binder(h.ctx, id));
         return 1;
@@ -545,6 +646,15 @@ fn apiQueryObject(L: ?*c.lua_State) callconv(.c) c_int {
             .{ "BFS_SHOWRULE", mgrShowRule },
             .{ "BFS_HIDERULE", mgrHideRule },
             .{ "BFS_LOCALIZEFLOAT", mgrLocalizeFloat },
+            .{ "BFS_SETRULESTATE", mgrSetRuleState },
+            .{ "BFS_GETRULESTATE", mgrGetRuleState },
+            .{ "BFS_SETALTTEXT", mgrSetAltText },
+            .{ "BFS_SETALTOVERVIEWTEXT", mgrSetAltOverview },
+            .{ "BFS_SETGLOBALVAR", apiSetVar2 },
+            .{ "BFS_GETGLOBALVAR", apiGetVar2 },
+            .{ "BFS_SETUSERVAL", apiSetVar2 },
+            .{ "BFS_GETUSERVAL", apiGetVar2 },
+            .{ "BFS_GETLOCID", mgrLocId },
         }) |m| {
             c.lua_pushstring(L, m[0]);
             c.lua_pushcclosure(L, m[1], 0);
@@ -646,6 +756,74 @@ fn mgrHideRule(L: ?*c.lua_State) callconv(.c) c_int {
     const m = active orelse return 0;
     if (m.find(l.str(L, 2) orelse return 0)) |n| n.hidden = true;
     return 0;
+}
+
+fn mgrSetRuleState(L: ?*c.lua_State) callconv(.c) c_int {
+    const m = active orelse return 0;
+    const n = m.find(l.str(L, 2) orelse return 0) orelse return 0;
+    const v = if (c.lua_isnumber(L, 3) != 0) c.lua_tonumber(L, 3) else 0;
+    n.state = if (v >= 0.5 and v < 1.5) .success else if (v >= 1.5 or v <= -0.5) .failed else .pending;
+    return 0;
+}
+
+fn mgrGetRuleState(L: ?*c.lua_State) callconv(.c) c_int {
+    const m = active orelse return 0;
+    const n = m.find(l.str(L, 2) orelse "") orelse {
+        c.lua_pushnumber(L, 0);
+        return 1;
+    };
+    c.lua_pushnumber(L, switch (n.state) {
+        .pending => 0,
+        .success => 1,
+        .failed => 2,
+    });
+    return 1;
+}
+
+/// `BFS_SETALTTEXT(rule, "neutral"|"success"|"failure", text)`.
+fn mgrSetAltText(L: ?*c.lua_State) callconv(.c) c_int {
+    return setAlt(L, false);
+}
+
+fn mgrSetAltOverview(L: ?*c.lua_State) callconv(.c) c_int {
+    return setAlt(L, true);
+}
+
+fn setAlt(L: ?*c.lua_State, overview: bool) c_int {
+    const m = active orelse return 0;
+    const n = m.find(l.str(L, 2) orelse return 0) orelse return 0;
+    const which = l.str(L, 3) orelse return 0;
+    const text = m.arena.allocator().dupe(u8, l.str(L, 4) orelse return 0) catch return 0;
+    if (std.mem.eql(u8, which, "neutral")) {
+        if (overview) n.alt_neutral_overview = text else n.alt_neutral = text;
+    } else if (std.mem.eql(u8, which, "success")) {
+        if (overview) n.alt_success_overview = text else n.alt_success = text;
+    } else if (std.mem.eql(u8, which, "failure")) n.alt_failure = text;
+    return 0;
+}
+
+fn apiSetVar2(L: ?*c.lua_State) callconv(.c) c_int {
+    const m = active orelse return 0;
+    const k = l.str(L, 2) orelse return 0;
+    m.setVar(k, l.str(L, 3) orelse "");
+    return 0;
+}
+
+fn apiGetVar2(L: ?*c.lua_State) callconv(.c) c_int {
+    const m = active orelse return 0;
+    const k = l.str(L, 2) orelse {
+        c.lua_pushnil(L);
+        return 1;
+    };
+    if (m.getVar(k)) |v| l.pushStr(L, v) else c.lua_pushnil(L);
+    return 1;
+}
+
+fn mgrLocId(L: ?*c.lua_State) callconv(.c) c_int {
+    const m = active orelse return 0;
+    const id = l.str(L, 2) orelse "";
+    l.pushStr(L, m.loc.get(id) orelse id);
+    return 1;
 }
 
 /// 1234567 -> "$1,234,567".
