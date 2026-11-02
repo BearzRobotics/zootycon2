@@ -316,6 +316,8 @@ pub const App = struct {
     save_labels: std.ArrayList([]const u8) = .empty,
     save_arena: std.heap.ArenaAllocator,
     reset_camera: bool = false,
+    /// Where a new zoo's camera looks (the entrance) instead of the map middle.
+    start_focus: ?[2]f32 = null,
     /// Rows of a list menu that fit on screen (set when drawing).
     menu_rows: usize = 8,
 
@@ -1223,6 +1225,8 @@ pub const App = struct {
     const zoo_biomes = [_]u8{ 0, 1, 2, 3, 4, 6, 7, 8, 9, 10 };
 
     /// Starts a flat, empty zoo of the chosen size and biome.
+    const freeform_cash: f64 = 100000;
+
     fn startBlankZoo(self: *App) void {
         const tiles = zoo_sizes[self.nz_size].tiles;
         const biome = zoo_biomes[self.nz_biome];
@@ -1235,7 +1239,31 @@ pub const App = struct {
             return;
         };
         self.custom_len = 0;
+        // Animals cost thousands (an elephant is $20,000), so a freeform zoo starts well funded.
+        self.sim.zoo.income = freeform_cash;
+        self.placeStarterEntrance();
         self.say("new {d}x{d} tile zoo", .{ tiles, tiles });
+    }
+
+    /// A blank zoo opens with a front gate and a short path, as the game's
+    /// freeform start does, so guests can arrive as soon as there is something to see.
+    fn placeStarterEntrance(self: *App) void {
+        const gate = "frontgate_df";
+        const m = viewer.binderModel(self.gpa, &self.reg, gate, "mainObj") orelse return;
+        const t = &self.world.terrain;
+        const cx = snap(t.world_width / 2, 1.5);
+        const gy: f32 = 24;
+        _ = self.world.addPropEx(m.file, self.groundAt(cx, gy), world_mod.yawRotation(0), m.scale, &.{}, gate, -1) catch return;
+        if (self.path_textures.items.len > 0) {
+            var y: f32 = gy + 9;
+            while (y < gy + 9 + 15 * 1.5) : (y += 1.5) {
+                var dx: f32 = -3;
+                while (dx <= 3) : (dx += 1.5) {
+                    _ = self.world.addPath(self.path_textures.items[self.path_i], .{ cx + dx, y }, 6, 6) catch return;
+                }
+            }
+        }
+        self.start_focus = .{ cx, gy + 30 };
     }
 
     fn installWorld(self: *App, fresh: world_mod.World) !void {
@@ -1932,6 +1960,7 @@ pub const App = struct {
         m.host = .{
             .ctx = self,
             .entities = scenEntities,
+            .leaf_types = scenLeaves,
             .attr = scenAttr,
             .set_attr = scenSetAttr,
             .selected = scenSelected,
@@ -1976,6 +2005,26 @@ pub const App = struct {
         for (self.world.props.items) |p| {
             if (p.binder.len == 0 or !self.binderIs(p.binder, kind, direct)) continue;
             out.append(gpa, p.id | prop_handle) catch {};
+        }
+    }
+
+    fn scenLeaves(ctx: *anyopaque, gpa: std.mem.Allocator, kind: []const u8, out: *std.ArrayList([]const u8)) void {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        var it = self.reg.binders.valueIterator();
+        while (it.next()) |bp| {
+            const b = bp.*;
+            if (b.abstract or b.type_path.len == 0) continue;
+            var inside = false;
+            for (b.type_path) |t| if (std.ascii.eqlIgnoreCase(t, kind)) {
+                inside = true;
+            };
+            if (!inside) continue;
+            const leaf = b.type_path[b.type_path.len - 1];
+            var dup = false;
+            for (out.items) |o| if (std.mem.eql(u8, o, leaf)) {
+                dup = true;
+            };
+            if (!dup) out.append(gpa, leaf) catch {};
         }
     }
 
@@ -4857,6 +4906,12 @@ pub const App = struct {
             ctx.cam.center = .{ cx, cy, t.zAt(cx, cy) };
             ctx.cam.radius = @max(t.world_width, t.world_height) / 2;
             ctx.cam.dist = ctx.cam.radius * 1.3;
+            if (self.start_focus) |f| {
+                ctx.cam.center = .{ f[0], f[1], t.zAt(f[0], f[1]) };
+                ctx.cam.radius = 60;
+                ctx.cam.dist = 90;
+                self.start_focus = null;
+            }
             ctx.snap_camera = true;
             self.reset_camera = false;
             self.audio_biome_dirty = true;

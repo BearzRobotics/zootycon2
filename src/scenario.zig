@@ -88,7 +88,11 @@ pub const Host = struct {
     /// (in half stars), `guests`.
     stat: *const fn (ctx: *anyopaque, name: []const u8) f64 = noStat,
     give_cash: *const fn (ctx: *anyopaque, amount: f64) void = noCash,
+    /// Concrete (non-abstract) type names under a category, like `animal`.
+    leaf_types: *const fn (ctx: *anyopaque, gpa: std.mem.Allocator, kind: []const u8, out: *std.ArrayList([]const u8)) void = noLeaves,
 };
+
+fn noLeaves(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: *std.ArrayList([]const u8)) void {}
 
 fn noEntities(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: bool, _: *std.ArrayList(u32)) void {}
 fn noAttr(_: *anyopaque, _: u32, _: []const u8) ?f64 {
@@ -448,6 +452,21 @@ pub const Manager = struct {
                     return 1;
                 }
                 c.lua_pushnil(L);
+                return 1;
+            }
+            if (eq(u8, method, "BFG_GET_DERIVED_LEAF_TYPES")) {
+                var names: std.ArrayList([]const u8) = .empty;
+                defer names.deinit(self.gpa);
+                h.leaf_types(h.ctx, self.gpa, l.str(L, 2) orelse "", &names);
+                c.lua_newtable(L);
+                for (names.items, 1..) |n, i| {
+                    c.lua_pushnumber(L, @floatFromInt(i));
+                    c.lua_newtable(L);
+                    c.lua_pushstring(L, "value");
+                    l.pushStr(L, n);
+                    c.lua_settable(L, -3);
+                    c.lua_settable(L, -3);
+                }
                 return 1;
             }
             const direct = eq(u8, method, "BFG_GET_ENTITIES_DIRECT");
@@ -959,6 +978,8 @@ fn apiQueryObject(L: ?*c.lua_State) callconv(.c) c_int {
             .{ "BFS_ADD_SCENARIO_OBJECT", mgrAddObject },
             .{ "BFS_PICKCHALLENGE", mgrPickChallenge },
             .{ "BFS_GET_CHALLENGE_DELAY", mgrChallengeDelay },
+            .{ "BFS_PROCESS_VINCE", mgrNoop },
+            .{ "BFS_SAVEOPTIONS", mgrNoop },
             .{ "BFS_GETALLCHALLENGES", mgrAllChallenges },
             .{ "UI_DISABLE", mgrUi("UI_DISABLE") },
             .{ "UI_ENABLE", mgrUi("UI_ENABLE") },
@@ -1129,6 +1150,12 @@ fn mgrAllChallenges(L: ?*c.lua_State) callconv(.c) c_int {
 }
 
 /// Months between challenges.
+/// Calls that only drive the original's cut-scene and options plumbing.
+fn mgrNoop(L: ?*c.lua_State) callconv(.c) c_int {
+    _ = L;
+    return 0;
+}
+
 fn mgrChallengeDelay(L: ?*c.lua_State) callconv(.c) c_int {
     c.lua_pushnumber(L, 2);
     return 1;
