@@ -139,7 +139,7 @@ const Campaign = struct {
     entries: []const CampEntry,
 };
 
-const Menu = enum { none, pause, maps, saves, settings, finances, new_zoo, save_as, main, goals, campaigns, scenarios };
+const Menu = enum { none, result, pause, maps, saves, settings, finances, new_zoo, save_as, main, goals, campaigns, scenarios };
 
 const MenuAction = enum {
     close_menu,
@@ -339,6 +339,8 @@ pub const App = struct {
     /// Key of the campaign scenario being played (for saving progress).
     scen_key: [64]u8 = undefined,
     scen_key_len: usize = 0,
+    /// The outcome already announced for the running scenario's goals.
+    scen_result: scenario_mod.Outcome = .running,
     camp_arena: std.heap.ArenaAllocator = undefined,
     camp_ready: bool = false,
     campaigns: std.ArrayList(Campaign) = .empty,
@@ -1943,6 +1945,7 @@ pub const App = struct {
     /// Starts the goals of a scenario (`scenario/goals/*.xml`) on the
     /// current zoo.
     fn startScenario(self: *App, goals: []const u8) void {
+        self.scen_result = .running;
         if (self.scen) |m| {
             m.destroy();
             self.scen = null;
@@ -1961,6 +1964,7 @@ pub const App = struct {
             .ctx = self,
             .entities = scenEntities,
             .leaf_types = scenLeaves,
+            .place = scenPlace,
             .attr = scenAttr,
             .set_attr = scenSetAttr,
             .selected = scenSelected,
@@ -2006,6 +2010,19 @@ pub const App = struct {
             if (p.binder.len == 0 or !self.binderIs(p.binder, kind, direct)) continue;
             out.append(gpa, p.id | prop_handle) catch {};
         }
+    }
+
+    fn scenPlace(ctx: *anyopaque, binder: []const u8, x: f32, y: f32, rot: f32) void {
+        const self: *App = @ptrCast(@alignCast(ctx));
+        const at = self.groundAt(x, y);
+        const rotm = world_mod.yawRotation(rot);
+        if (self.actorDef(binder) != null) {
+            _ = self.world.addActor(binder, at, rotm, &.{}) catch return;
+        } else if (viewer.binderModel(self.gpa, &self.reg, binder, "mainObj")) |m| {
+            const food: f32 = if (self.feederKind(binder) != null) 100 else -1;
+            _ = self.world.addPropEx(m.file, at, rotm, m.scale, &.{}, binder, food) catch return;
+        } else return;
+        self.say("{s} arrives", .{binder});
     }
 
     fn scenLeaves(ctx: *anyopaque, gpa: std.mem.Allocator, kind: []const u8, out: *std.ArrayList([]const u8)) void {
@@ -2864,7 +2881,7 @@ pub const App = struct {
                     switch (self.menu) {
                         .pause => self.openMenu(.none),
                         .main => {},
-                        .goals => self.openMenu(.none),
+                        .goals, .result => self.openMenu(.none),
                         else => self.openMenu(if (self.in_main) .main else .pause),
                     }
                 }
@@ -2921,6 +2938,7 @@ pub const App = struct {
             .new_zoo => "NEW BLANK ZOO",
             .save_as => "SAVE YOUR ZOO",
             .main => "ZOOTYCON2",
+            .result => if (self.scen_result == .won) "SCENARIO COMPLETE!" else "SCENARIO FAILED",
             .none => "",
         };
         if (self.menu == .finances) return self.drawFinances(ui, scale);
@@ -2932,6 +2950,11 @@ pub const App = struct {
         _ = try ui.text((ui.width - tw) / 2, y, tscale, title, .{ 1, 0.92, 0.5, 1 });
         y += 7 * tscale + 14 * scale;
         switch (self.menu) {
+            .result => {
+                y += try self.menuButton(ui, y, scale, "KEEP PLAYING", .{ .menu = .close_menu }, false);
+                y += try self.menuButton(ui, y, scale, "CAMPAIGNS", .{ .menu = .open_campaigns }, false);
+                y += try self.menuButton(ui, y, scale, "MAIN MENU", .{ .menu = .open_main }, false);
+            },
             .pause => {
                 y += try self.menuButton(ui, y, scale, "RESUME", .{ .menu = .close_menu }, false);
                 y += try self.menuButton(ui, y, scale, "SAVE GAME...", .{ .menu = .open_save_as }, false);
@@ -4961,7 +4984,14 @@ pub const App = struct {
                 if (self.scen) |m| {
                     self.syncUiState();
                     m.update(ctx.dt * self.speed);
-                    if (m.roots.items.len > 0 and m.roots.items[0].state == .success) self.markScenarioDone();
+                    if (m.roots.items.len > 0) {
+                        const st = m.roots.items[0].state;
+                        if (st == .success) self.markScenarioDone();
+                        if (self.scen_result == .running and !m.challenge_mode and (st == .success or st == .failed)) {
+                            self.scen_result = if (st == .success) .won else .lost;
+                            self.openMenu(.result);
+                        }
+                    }
                 }
             }
             for (self.actor_ids.items, 0..) |id, i| {

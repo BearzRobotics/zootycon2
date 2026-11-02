@@ -19,9 +19,18 @@ Licensed under MIT (see `LICENSE`; vendored SDL3 keeps its own zlib license
 in `vendor/`). Not affiliated with or endorsed by Microsoft or Blue Fang
 Games; you need your own copy of Zoo Tycoon 2.
 
-Status: an asset pipeline (every model, texture, animation and map in the
-game loads), a renderer, a small simulation, and build tools. It is not yet
-a playable game. It has a basic UI, a budget (purchases cost money, keepers draw salaries) and data-driven animal AI.
+Status: **beta**. Every model, texture, animation and map in the game loads;
+you can start a blank zoo (it opens with a front gate, a short path and
+$100,000), build fences, paths, buildings, shops and habitats, buy animals
+and staff, and run a zoo with a budget, guests with needs, keepers, animal
+AI, day/night, sound, saving and loading. Campaign and challenge scenarios
+run on an embedded Lua 5.0 (the game's own scripts); winning or failing a
+scenario brings up a result panel.
+
+Known gaps: the tutorials need the full original UI (only the first plays
+through), some campaign scenarios rely on features not built yet (crates and
+adoption, shows, research, photo safari), the AI uses only self- and
+feeder-targeted tasks, and several economy and need rates are tuned by guess.
 
 ## Build and run
 

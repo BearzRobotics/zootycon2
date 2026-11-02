@@ -89,9 +89,12 @@ pub const Host = struct {
     stat: *const fn (ctx: *anyopaque, name: []const u8) f64 = noStat,
     give_cash: *const fn (ctx: *anyopaque, amount: f64) void = noCash,
     /// Concrete (non-abstract) type names under a category, like `animal`.
+    /// Puts an entity (by binder name) at a spot, free of charge.
+    place: *const fn (ctx: *anyopaque, binder: []const u8, x: f32, y: f32, rot: f32) void = noPlace,
     leaf_types: *const fn (ctx: *anyopaque, gpa: std.mem.Allocator, kind: []const u8, out: *std.ArrayList([]const u8)) void = noLeaves,
 };
 
+fn noPlace(_: *anyopaque, _: []const u8, _: f32, _: f32, _: f32) void {}
 fn noLeaves(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: *std.ArrayList([]const u8)) void {}
 
 fn noEntities(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: bool, _: *std.ArrayList(u32)) void {}
@@ -512,6 +515,17 @@ pub const Manager = struct {
                 c.lua_pushnil(L);
                 return 1;
             }
+            if (eq(u8, method, "ZT_PLACEOBJECT") and c.lua_type(L, 2) == c.LUA_TTABLE) {
+                // {placementobject=<binder>, x=, y=, z=, r=}: the scenario puts an animal or object in the zoo
+                if (tableStr(L, 2, "placementobject")) |binder| {
+                    const x = tableNum(L, 2, "x") orelse 0;
+                    const y = tableNum(L, 2, "y") orelse 0;
+                    const r = tableNum(L, 2, "r") orelse 0;
+                    h.place(h.ctx, binder, x, y, r);
+                }
+                return 0;
+            }
+            if (eq(u8, method, "ZT_NAME_ENTITY")) return 0;
             if (eq(u8, method, "ZT_GET_BIOME_COUNT")) {
                 var nb: [96]u8 = undefined;
                 const key = std.fmt.bufPrint(&nb, "biome:{s}", .{l.str(L, 2) orelse ""}) catch "biome:";

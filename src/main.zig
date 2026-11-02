@@ -59,7 +59,8 @@ pub fn main(init: std.process.Init) !void {
             try mods.append(init.arena.allocator(), argv[i]);
         } else try pos.append(init.arena.allocator(), argv[i]);
     }
-    if (pos.items.len == 0) return fail(usage);
+    // Started with no command (double-clicked): play.
+    if (pos.items.len == 0) try pos.append(init.arena.allocator(), "play");
     const cmd = pos.items[0];
     const rest = pos.items[1..];
 
