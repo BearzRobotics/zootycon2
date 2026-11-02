@@ -516,7 +516,7 @@ pub const Brain = struct {
         self.clock += dt;
         self.anim_time += dt;
         // Needs grow while time passes.
-        for (&self.needs) |*n| n.* = @min(100, n.* + 0.35 * dt);
+        for (&self.needs) |*n| n.* = @min(100, n.* + 0.2 * dt);
 
         // Progress what is running.
         if (self.queue.items.len > 0) {

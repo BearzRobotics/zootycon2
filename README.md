@@ -27,6 +27,10 @@ AI, day/night, sound, saving and loading. Campaign and challenge scenarios
 run on an embedded Lua 5.0 (the game's own scripts); winning or failing a
 scenario brings up a result panel.
 
+Animals left without food or water die; adults of a species kept together and
+well cared for have young, which grow up after ten minutes; deleting an animal
+adopts it out for half its price.
+
 Known gaps: the tutorials need the full original UI (only the first plays
 through), some campaign scenarios rely on features not built yet (crates and
 adoption, shows, research, photo safari), the AI uses only self- and

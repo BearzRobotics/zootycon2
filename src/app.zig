@@ -341,6 +341,7 @@ pub const App = struct {
     scen_key_len: usize = 0,
     /// The goal the player has been on, and since when (to offer a skip in tutorials).
     scen_tutorial: bool = false,
+    breed_acc: f32 = 0,
     hint_node: ?*const scenario_mod.Node = null,
     hint_since: f64 = 0,
     /// The outcome already announced for the running scenario's goals.
@@ -1048,7 +1049,13 @@ pub const App = struct {
                 break;
             },
             .actor => for (self.world.actors.items) |p| if (p.id == sel.id) {
-                self.undo.append(self.gpa, .{ .removed_actor = p }) catch {};
+                if (sim_mod.classify(p.binder) == .animal) {
+                    // Putting an animal up for adoption: half its price back, and no undo.
+                    const back = self.costOf(p.binder, 100) * 0.5;
+                    self.sim.zoo.earn(.animals, back);
+                    self.sim.zoo.adopted_out += 1;
+                    self.say("{s} adopted out (+${d:.0})", .{ p.binder, back });
+                } else self.undo.append(self.gpa, .{ .removed_actor = p }) catch {};
                 break;
             },
         }
@@ -1234,8 +1241,94 @@ pub const App = struct {
     const freeform_cash: f64 = 100000;
     /// Game seconds an animal survives with hunger or thirst at the limit.
     const starve_secs: f32 = 240;
+    /// Game seconds for a young animal to grow up, and between a female's litters.
+    const young_secs: f32 = 600;
+    const breed_gap: f32 = 900;
 
     /// Animals left without food or water for too long die and are removed.
+    fn lifeTick(self: *App, dt: f32) void {
+        self.checkNeglect(dt);
+        self.breedAndGrow(dt);
+    }
+
+    /// Splits "Giraffe_Adult_F" into its species and age/sex parts.
+    fn animalParts(binder: []const u8) ?struct { species: []const u8, adult: bool, female: bool } {
+        const adult = std.mem.indexOf(u8, binder, "_Adult_");
+        const young = std.mem.indexOf(u8, binder, "_Young_");
+        const at = adult orelse young orelse return null;
+        const tail = binder[at + 7 ..];
+        if (tail.len != 1 or (tail[0] != 'F' and tail[0] != 'M')) return null;
+        return .{ .species = binder[0..at], .adult = adult != null, .female = tail[0] == 'F' };
+    }
+
+    /// Adults of a species that are near each other and well looked after
+    /// have young; young animals grow up after a while.
+    fn breedAndGrow(self: *App, dt: f32) void {
+        self.breed_acc += dt;
+        if (self.breed_acc < 1) return;
+        const step = self.breed_acc;
+        self.breed_acc = 0;
+        var grow: ?u32 = null;
+        var born: ?struct { species: []const u8, pos: [3]f32, id: u32 } = null;
+        var total: usize = 0;
+        for (self.sim.agents.items) |*ag| {
+            if (ag.is_guest or ag.is_keeper or ag.brain == null) continue;
+            total += 1;
+            const parts = animalParts(ag.binder) orelse continue;
+            ag.age += step;
+            if (!parts.adult) {
+                if (ag.age >= young_secs and grow == null) grow = ag.id;
+                continue;
+            }
+            if (!parts.female) continue;
+            ag.breed_cd -= step;
+            if (ag.breed_cd > 0 or born != null) continue;
+            const b = ag.brain.?;
+            if (b.needs[5] > 70 or b.needs[6] > 70 or ag.hab_score < 40) continue;
+            // a male of the species close by
+            for (self.sim.agents.items) |*m| {
+                if (m.brain == null) continue;
+                const mp = animalParts(m.binder) orelse continue;
+                if (!mp.adult or mp.female or !std.mem.eql(u8, mp.species, parts.species)) continue;
+                const dx = m.pos[0] - ag.pos[0];
+                const dy = m.pos[1] - ag.pos[1];
+                if (dx * dx + dy * dy > 45 * 45) continue;
+                born = .{ .species = parts.species, .pos = ag.pos, .id = ag.id };
+                break;
+            }
+        }
+        if (born) |bn| {
+            if (self.sim.agentFor(bn.id)) |f| f.breed_cd = breed_gap;
+            if (total < 150) self.spawnYoung(bn.species, bn.pos);
+        }
+        if (grow) |id| self.growUp(id);
+    }
+
+    fn spawnYoung(self: *App, species: []const u8, pos: [3]f32) void {
+        var nb: [96]u8 = undefined;
+        const sex: u8 = if (self.sim.rng.random().boolean()) 'F' else 'M';
+        const name = std.fmt.bufPrint(&nb, "{s}_Young_{c}", .{ species, sex }) catch return;
+        if (self.reg.get(name) == null or self.actorDef(name) == null) return;
+        const id = self.world.addActor(name, self.groundAt(pos[0] + 1.5, pos[1] + 1.5), world_mod.yawRotation(0), &.{}) catch return;
+        _ = id;
+        self.pushAlert(1, "A {s} WAS BORN", .{species[0..@min(species.len, 30)]});
+        self.sim.zoo.births += 1;
+    }
+
+    fn growUp(self: *App, id: u32) void {
+        const ag = self.sim.agentFor(id) orelse return;
+        const parts = animalParts(ag.binder) orelse return;
+        var nb: [96]u8 = undefined;
+        const name = std.fmt.bufPrint(&nb, "{s}_Adult_{c}", .{ parts.species, @as(u8, if (parts.female) 'F' else 'M') }) catch return;
+        if (self.reg.get(name) == null or self.actorDef(name) == null) {
+            ag.age = -1e9;
+            return;
+        }
+        const pos = ag.pos;
+        _ = self.world.remove(id);
+        _ = self.world.addActor(name, self.groundAt(pos[0], pos[1]), world_mod.yawRotation(0), &.{}) catch return;
+    }
+
     fn checkNeglect(self: *App, dt: f32) void {
         var dead: ?u32 = null;
         for (self.sim.agents.items) |*ag| {
@@ -1480,7 +1573,7 @@ pub const App = struct {
             var t: f32 = 0;
             while (t < secs) : (t += 0.2) {
                 self.sim.advance(&self.world, 0.2);
-                self.checkNeglect(0.2);
+                self.lifeTick(0.2);
                 if (self.scen) |m| {
                     self.syncUiState();
                     m.update(0.2);
@@ -5043,7 +5136,7 @@ pub const App = struct {
             if (!self.paused and self.menu == .none and !pop) {
                 self.sim.advance(&self.world, ctx.dt * self.speed);
                 self.updateFame(ctx.dt * self.speed);
-                self.checkNeglect(ctx.dt * self.speed);
+                self.lifeTick(ctx.dt * self.speed);
                 if (self.scen) |m| {
                     self.syncUiState();
                     m.update(ctx.dt * self.speed);
