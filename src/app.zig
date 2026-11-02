@@ -1232,6 +1232,28 @@ pub const App = struct {
 
     /// Starts a flat, empty zoo of the chosen size and biome.
     const freeform_cash: f64 = 100000;
+    /// Game seconds an animal survives with hunger or thirst at the limit.
+    const starve_secs: f32 = 240;
+
+    /// Animals left without food or water for too long die and are removed.
+    fn checkNeglect(self: *App, dt: f32) void {
+        var dead: ?u32 = null;
+        for (self.sim.agents.items) |*ag| {
+            const b = ag.brain orelse continue;
+            if (ag.is_guest or ag.is_keeper) continue;
+            const hunger = b.needs[5];
+            const thirst = b.needs[6];
+            if (hunger >= 99.5 or thirst >= 99.5) ag.neglect += dt else ag.neglect = @max(0, ag.neglect - dt * 2);
+            if (ag.neglect >= starve_secs and dead == null) dead = ag.id;
+        }
+        const id = dead orelse return;
+        var name: []const u8 = "ANIMAL";
+        if (self.sim.agentFor(id)) |ag| name = ag.binder;
+        self.pushAlert(2, "{s} DIED OF NEGLECT", .{name});
+        self.sim.zoo.deaths += 1;
+        self.fame = @max(1, self.fame - 0.5);
+        _ = self.world.remove(id);
+    }
 
     fn startBlankZoo(self: *App) void {
         const tiles = zoo_sizes[self.nz_size].tiles;
@@ -1458,6 +1480,7 @@ pub const App = struct {
             var t: f32 = 0;
             while (t < secs) : (t += 0.2) {
                 self.sim.advance(&self.world, 0.2);
+                self.checkNeglect(0.2);
                 if (self.scen) |m| {
                     self.syncUiState();
                     m.update(0.2);
@@ -5020,6 +5043,7 @@ pub const App = struct {
             if (!self.paused and self.menu == .none and !pop) {
                 self.sim.advance(&self.world, ctx.dt * self.speed);
                 self.updateFame(ctx.dt * self.speed);
+                self.checkNeglect(ctx.dt * self.speed);
                 if (self.scen) |m| {
                     self.syncUiState();
                     m.update(ctx.dt * self.speed);

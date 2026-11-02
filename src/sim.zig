@@ -179,6 +179,8 @@ pub const Zoo = struct {
     last_month: Ledger = .{},
     total: Ledger = .{},
     months: u32 = 0,
+    /// Animals lost to neglect.
+    deaths: u32 = 0,
     /// Net result of each finished month (oldest first, most recent last).
     history: [24]f64 = @splat(0),
     history_n: u32 = 0,
@@ -244,6 +246,8 @@ pub const Agent = struct {
     /// Habitat requirements (animals), and how the enclosure measures up.
     habitat: ?Habitat = null,
     hab_timer: f32 = 0,
+    /// Seconds an animal has gone without food or water; long enough and it dies.
+    neglect: f32 = 0,
     /// 0..100 overall, and its parts.
     hab_score: f32 = 100,
     hab_biome: f32 = 100,
